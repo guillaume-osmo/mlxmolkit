@@ -91,3 +91,36 @@ def test_fused_butina_end_to_end():
     all_idx = [i for c in res.clusters for i in c]
     assert len(all_idx) == N
     assert len(set(all_idx)) == N
+
+
+def test_native_metal_matches_mlx():
+    """Native Metal (.metallib) gives identical results to MLX compiled and JIT."""
+    from mlxmolkit.native_metal import fused_neighbor_list_native
+
+    rng = np.random.default_rng(99)
+    for N in [100, 500, 2000]:
+        nbytes = 128
+        nwords = 32
+        cutoff = 0.4
+        fp_u8 = rng.integers(0, 256, size=(N, nbytes), dtype=np.uint8)
+        fp_u32_np = fp_u8.view(np.uint32).reshape(N, nwords)
+        fp_u32_mx = fp_uint8_to_uint32(mx.array(fp_u8))
+
+        off_native, idx_native, _ = fused_neighbor_list_native(fp_u32_np, cutoff)
+        off_compiled, idx_compiled = fused_neighbor_list_metal(fp_u32_mx, cutoff, compiled=True)
+        off_jit, idx_jit = fused_neighbor_list_metal(fp_u32_mx, cutoff, compiled=False)
+
+        np.testing.assert_array_equal(
+            np.diff(off_native), np.diff(off_compiled),
+            err_msg=f"N={N}: native vs compiled counts differ",
+        )
+        np.testing.assert_array_equal(
+            np.diff(off_native), np.diff(off_jit),
+            err_msg=f"N={N}: native vs JIT counts differ",
+        )
+        for i in range(N):
+            s_nat = set(idx_native[off_native[i]:off_native[i+1]].tolist())
+            s_comp = set(idx_compiled[off_compiled[i]:off_compiled[i+1]].tolist())
+            s_jit = set(idx_jit[off_jit[i]:off_jit[i+1]].tolist())
+            assert s_nat == s_comp, f"N={N} row {i}: native != compiled"
+            assert s_nat == s_jit, f"N={N} row {i}: native != JIT"
