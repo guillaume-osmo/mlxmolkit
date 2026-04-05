@@ -47,17 +47,22 @@ def batch_smiles_to_cosmo(
     if verbose:
         print(f"Batch COSMO: {N} molecules, method={method}")
 
-    # Step 1: Generate 3D (sequential — RDKit is fast)
-    mol_data = []  # (atoms, coords) for valid mols
+    # Step 1: Generate 3D with dedup cache (RDKit is 40% of total time)
+    _3d_cache = {}
+    mol_data = []
     valid_idx = []
     for i, smi in enumerate(smiles_list):
-        r = _smiles_to_3d(smi, seed=42 + i)
-        if r is None:
-            continue
-        atoms, coords = r
-        if any(z not in PARAMS for z in atoms):
-            continue
-        mol_data.append((atoms, coords))
+        if smi in _3d_cache:
+            atoms, coords = _3d_cache[smi]
+        else:
+            r = _smiles_to_3d(smi, seed=42 + i)
+            if r is None:
+                continue
+            atoms, coords = r
+            if any(z not in PARAMS for z in atoms):
+                continue
+            _3d_cache[smi] = (atoms, coords)
+        mol_data.append((atoms, coords.copy()))
         valid_idx.append(i)
 
     if verbose:

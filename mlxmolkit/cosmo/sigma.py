@@ -26,34 +26,27 @@ def average_sigma(
     σ_av(i) = Σ_j σ_raw(j) · A_j · w(i,j) / Σ_j A_j · w(i,j)
     where w(i,j) = r_av² / (r_seg_i² + r_av²) · exp(-d²_ij / (r_seg_i² + r_av²))
 
-    Matches openCOSMO-RS molecules.py calculate_averaged_sigmas.
+    Uses scipy cdist (C-optimized) for squared distances.
     """
-    n_seg = len(seg_pos)
+    from scipy.spatial.distance import cdist
+
     r_av_sq = r_av * r_av
-
-    # Effective segment radius from area: A = π·r²  →  r² = A/π
     r_seg_sq = seg_area / np.pi
-
-    # 1/(r_seg² + r_av²) for each segment
     inv_rad = 1.0 / (r_seg_sq + r_av_sq)
 
-    # Pairwise squared distances
-    diff = seg_pos[:, np.newaxis, :] - seg_pos[np.newaxis, :, :]  # (n, n, 3)
-    dist_sq = np.sum(diff * diff, axis=2)  # (n, n)
+    # Squared distances via C-optimized cdist
+    dist_sq = cdist(seg_pos, seg_pos, 'sqeuclidean')  # (n, n) — no 3D intermediate
 
-    # Gaussian weights: exp(-d² / (r_seg² + r_av²))
-    # Note: use inv_rad of target segment i (row)
-    exp_arr = np.exp(-dist_sq * inv_rad[:, np.newaxis])  # (n, n)
+    # Gaussian weights
+    exp_arr = np.exp(-dist_sq * inv_rad[:, np.newaxis])
+    weight = (r_av_sq * inv_rad[:, np.newaxis] * exp_arr).T  # transposed for matmul
 
-    # Weight matrix: r_av² · inv_rad · exp
-    weight = r_av_sq * inv_rad[:, np.newaxis] * exp_arr  # (n, n)
+    # Weighted average via matmul
+    sr = seg_sigma_raw * r_seg_sq
+    numerator = sr @ weight
+    denominator = r_seg_sq @ weight
 
-    # Weighted average
-    numerator = (seg_sigma_raw * r_seg_sq) @ weight.T  # (n,)
-    denominator = r_seg_sq @ weight.T  # (n,)
-
-    sigma_av = numerator / (denominator + 1e-30)
-    return sigma_av
+    return numerator / (denominator + 1e-30)
 
 
 def compute_sigma_profile(
@@ -63,35 +56,23 @@ def compute_sigma_profile(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute sigma profile p(σ) = histogram of segment areas by sigma.
 
-    Args:
-        seg_area: (n_seg,) areas in Angstrom²
-        seg_sigma: (n_seg,) averaged sigma in e/Angstrom²
-        sigma_grid: grid of sigma values for binning
-
-    Returns:
-        sigma_grid: (n_bins,) sigma values
-        profile: (n_bins,) area density p(σ) in Angstrom²
+    Vectorized: no Python loops over segments.
     """
     n_bins = len(sigma_grid)
+
+    # Continuous bin positions
+    idx_float = (seg_sigma - sigma_grid[0]) / SIGMA_GRID_STEP
+    idx = np.floor(idx_float).astype(np.int64)
+    frac = idx_float - idx
+
+    # Clamp to valid range
+    idx = np.clip(idx, 0, n_bins - 2)
+    frac = np.clip(frac, 0.0, 1.0)
+
+    # Scatter-add: np.add.at for lower and upper bins
     profile = np.zeros(n_bins)
-
-    # Linear interpolation into nearest bins
-    for k in range(len(seg_sigma)):
-        s = seg_sigma[k]
-        a = seg_area[k]
-
-        # Find position in grid
-        idx_float = (s - sigma_grid[0]) / SIGMA_GRID_STEP
-        idx = int(np.floor(idx_float))
-
-        if idx < 0:
-            profile[0] += a
-        elif idx >= n_bins - 1:
-            profile[-1] += a
-        else:
-            frac = idx_float - idx
-            profile[idx] += a * (1.0 - frac)
-            profile[idx + 1] += a * frac
+    np.add.at(profile, idx, seg_area * (1.0 - frac))
+    np.add.at(profile, idx + 1, seg_area * frac)
 
     return sigma_grid, profile
 
@@ -102,39 +83,18 @@ def classify_segments(
     seg_atom: np.ndarray,
     adjacency: np.ndarray = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Classify segments as HB donor, HB acceptor, or non-HB.
+    """Classify segments as HB donor, HB acceptor, or non-HB. Vectorized."""
+    atoms_arr = np.array(atoms)
+    seg_element = atoms_arr[seg_atom]
+    seg_hb_type = np.zeros(len(seg_sigma), dtype=np.int32)
 
-    Args:
-        atoms: atomic numbers
-        seg_sigma: averaged sigma values
-        seg_atom: atom index per segment
-        adjacency: (n_atoms, n_atoms) bond connectivity (optional)
+    # HB donors: H atoms with negative sigma
+    is_H = np.isin(seg_element, list(HB_DONOR_ELEMENTS))
+    seg_hb_type[is_H & (seg_sigma < 0)] = 1
 
-    Returns:
-        seg_hb_type: (n_seg,) 0=non-HB, 1=HB-donor, 2=HB-acceptor
-        seg_element: (n_seg,) element number (H bonded to O → 108 convention)
-    """
-    n_seg = len(seg_sigma)
-    seg_hb_type = np.zeros(n_seg, dtype=np.int32)
-    seg_element = np.array([atoms[seg_atom[i]] for i in range(n_seg)], dtype=np.int32)
-
-    for i in range(n_seg):
-        z = atoms[seg_atom[i]]
-
-        if z in HB_DONOR_ELEMENTS and seg_sigma[i] < 0:
-            # H atom with negative sigma → HB donor
-            seg_hb_type[i] = 1
-            # Modify element number: H bonded to O → 108, to N → 107
-            if adjacency is not None:
-                atom_idx = seg_atom[i]
-                for j in range(len(atoms)):
-                    if adjacency[atom_idx, j] > 0 and atoms[j] in HB_ACCEPTOR_ELEMENTS:
-                        seg_element[i] = 100 + atoms[j]
-                        break
-
-        elif z in HB_ACCEPTOR_ELEMENTS and seg_sigma[i] > 0:
-            # Electronegative atom with positive sigma → HB acceptor
-            seg_hb_type[i] = 2
+    # HB acceptors: electronegative atoms with positive sigma
+    is_acc = np.isin(seg_element, list(HB_ACCEPTOR_ELEMENTS))
+    seg_hb_type[is_acc & (seg_sigma > 0)] = 2
 
     return seg_hb_type, seg_element
 
