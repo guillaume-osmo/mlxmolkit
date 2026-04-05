@@ -21,6 +21,7 @@ Usage:
 """
 
 from .pipeline import smiles_to_cosmo, activity_coefficients_from_smiles
+from .batch import batch_smiles_to_cosmo, batch_activity_coefficients
 from .cavity import cosmo_surface, build_cavity
 from .sigma import full_sigma_analysis, compute_sigma_profile
 from .cosmors import activity_coefficients, cosmospace
