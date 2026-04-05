@@ -225,15 +225,18 @@ def cosmo_surface_batch(
     molecules: list[tuple[list[int], np.ndarray, np.ndarray]],
     n_points: int = 194,
     epsilon: float = EPSILON_WATER,
+    use_metal: bool = True,
 ) -> list[dict]:
     """Batch COSMO surface for N molecules.
 
-    Builds all A matrices, stacks into block-diagonal, and solves all at once.
+    Metal GPU path: builds A matrices on GPU, solves on CPU (numpy batch).
+    CPU path: sequential vectorized numpy.
 
     Args:
         molecules: list of (atoms, coords, density) tuples
         n_points: Lebedev points per atom
         epsilon: dielectric constant
+        use_metal: try Metal GPU for matrix assembly
 
     Returns:
         list of COSMO result dicts
@@ -243,7 +246,7 @@ def cosmo_surface_batch(
     N = len(molecules)
     f_eps = (epsilon - 1.0) / (epsilon + 0.5)
 
-    # Phase 1: Build all cavities and gather segment data
+    # Phase 1: Build all cavities
     cavities = []
     mulliken_list = []
     for atoms, coords, density in molecules:
@@ -256,79 +259,55 @@ def cosmo_surface_batch(
         cavities.append((seg_pos, seg_area, seg_normal, seg_atom))
         mulliken_list.append(mulliken)
 
-    # Phase 2: Build A matrices and Phi vectors, solve all
-    results = []
-    # Group by segment count for efficient block solve
-    seg_counts = [len(c[0]) for c in cavities]
-    max_seg = max(seg_counts) if seg_counts else 0
+    # Phase 2: Solve COSMO — Metal GPU matrix build + numpy solve
+    seg_charges = [None] * N
 
-    # Padded batch solve: pad all to max_seg, solve as (N, max_seg, max_seg)
-    if max_seg > 0 and N > 1:
-        A_batch = np.zeros((N, max_seg, max_seg))
-        Phi_batch = np.zeros((N, max_seg))
+    if use_metal and N > 1:
+        try:
+            from .cosmo_metal import cosmo_solve_metal
 
+            seg_pos_bohr_list = [c[0] / BOHR_TO_ANG for c in cavities]
+            seg_area_bohr_list = [c[1] / (BOHR_TO_ANG ** 2) for c in cavities]
+            coords_bohr_list = [np.asarray(molecules[k][1]) / BOHR_TO_ANG for k in range(N)]
+
+            seg_charges = cosmo_solve_metal(
+                seg_pos_bohr_list, seg_area_bohr_list,
+                coords_bohr_list, mulliken_list, epsilon=epsilon,
+            )
+            use_metal = True  # success
+        except Exception:
+            use_metal = False
+
+    if not use_metal or N == 1:
+        # Sequential CPU fallback
+        seg_charges = []
         for k in range(N):
-            atoms, coords, density = molecules[k]
+            atoms, coords, _ = molecules[k]
             coords = np.asarray(coords, dtype=np.float64)
             seg_pos, seg_area, _, _ = cavities[k]
-            n_seg = len(seg_pos)
-            mulliken = mulliken_list[k]
+            seg_charges.append(compute_cosmo_charges(
+                atoms, coords, mulliken_list[k], seg_pos, seg_area, epsilon=epsilon
+            ))
 
-            seg_pos_bohr = seg_pos / BOHR_TO_ANG
-            seg_area_bohr = seg_area / (BOHR_TO_ANG ** 2)
-            coords_bohr = coords / BOHR_TO_ANG
-
-            # A matrix
-            diff = seg_pos_bohr[:, None, :] - seg_pos_bohr[None, :, :]
-            dist = np.sqrt(np.sum(diff * diff, axis=2))
-            np.fill_diagonal(dist, 1.0)
-            A = 1.0 / dist
-            np.fill_diagonal(A, 1.07 * np.sqrt(4.0 * np.pi / seg_area_bohr))
-
-            # Phi
-            diff_ac = seg_pos_bohr[:, None, :] - coords_bohr[None, :, :]
-            dist_ac = np.maximum(np.sqrt(np.sum(diff_ac * diff_ac, axis=2)), 1e-10)
-            Phi = (mulliken[None, :] / dist_ac).sum(axis=1)
-
-            A_batch[k, :n_seg, :n_seg] = A
-            Phi_batch[k, :n_seg] = Phi
-            # Pad diagonal for unused rows (identity to avoid singular)
-            for i in range(n_seg, max_seg):
-                A_batch[k, i, i] = 1.0
-
-        # Batch solve: numpy broadcasts over first axis (needs 3D rhs)
-        q_batch = np.linalg.solve(A_batch, -Phi_batch[:, :, np.newaxis])[:, :, 0]
-
+    # Phase 3: Assemble results
+    results = []
     for k in range(N):
-        atoms, coords, density = molecules[k]
+        atoms, coords, _ = molecules[k]
         coords = np.asarray(coords, dtype=np.float64)
         seg_pos, seg_area, seg_normal, seg_atom = cavities[k]
-        n_seg = len(seg_pos)
 
-        if N > 1:
-            seg_charge = f_eps * q_batch[k, :n_seg]
-        else:
-            # Single molecule — direct solve
-            seg_charge = compute_cosmo_charges(
-                atoms, coords, mulliken_list[k], seg_pos, seg_area, epsilon=epsilon
-            )
-
-        seg_sigma = seg_charge / seg_area
+        seg_sigma = seg_charges[k] / seg_area
         cavity_area = np.sum(seg_area)
         r_dot_n = np.sum((seg_pos - np.mean(coords, axis=0)) * seg_normal, axis=1)
         cavity_volume = np.abs(np.sum(r_dot_n * seg_area) / 3.0)
 
         results.append({
-            'seg_pos': seg_pos,
-            'seg_area': seg_area,
-            'seg_charge': seg_charge,
-            'seg_sigma': seg_sigma,
-            'seg_normal': seg_normal,
-            'seg_atom': seg_atom,
+            'seg_pos': seg_pos, 'seg_area': seg_area,
+            'seg_charge': seg_charges[k], 'seg_sigma': seg_sigma,
+            'seg_normal': seg_normal, 'seg_atom': seg_atom,
             'mulliken_charges': mulliken_list[k],
-            'cavity_area': cavity_area,
-            'cavity_volume': cavity_volume,
-            'n_seg': n_seg,
+            'cavity_area': cavity_area, 'cavity_volume': cavity_volume,
+            'n_seg': len(seg_pos),
         })
 
     return results

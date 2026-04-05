@@ -38,7 +38,7 @@ def batch_smiles_to_cosmo(
     from ..rm1.pipeline import _smiles_to_3d
     from ..rm1.scf import rm1_energy_batch
     from ..rm1.methods import get_params
-    from .cavity import cosmo_surface
+    from .cavity import cosmo_surface, cosmo_surface_batch
     from .sigma import full_sigma_analysis
 
     N = len(smiles_list)
@@ -73,33 +73,36 @@ def batch_smiles_to_cosmo(
         n_conv = sum(1 for r in scf_results if r['converged'])
         print(f"  SCF converged: {n_conv}/{len(mol_data)}")
 
-    # Step 3: COSMO cavity + sigma (sequential — each solve is <20ms)
+    # Step 3: COSMO cavity + sigma — Metal GPU batch or sequential CPU
+    cosmo_inputs = []
+    cosmo_map = []
+    for j, idx in enumerate(valid_idx):
+        if scf_results[j]['converged']:
+            atoms, coords = mol_data[j]
+            cosmo_inputs.append((atoms, coords, scf_results[j]['density']))
+            cosmo_map.append((j, idx))
+
     results = [None] * N
     n_cosmo = 0
 
-    for j, idx in enumerate(valid_idx):
-        scf = scf_results[j]
-        if not scf['converged']:
-            continue
-        atoms, coords = mol_data[j]
+    if cosmo_inputs:
         try:
-            cosmo_result = cosmo_surface(
-                atoms, coords, scf['density'],
-                n_points=n_surface_points, epsilon=epsilon,
+            cosmo_results = cosmo_surface_batch(
+                cosmo_inputs, n_points=n_surface_points,
+                epsilon=epsilon, use_metal=use_metal,
             )
-            sigma_result = full_sigma_analysis(cosmo_result, atoms)
-            results[idx] = {
-                'smiles': smiles_list[idx],
-                'atoms': atoms,
-                'coords': coords,
-                'n_atoms': len(atoms),
-                'method': method,
-                'energy_eV': scf['energy_eV'],
-                'heat_of_formation_kcal': scf['heat_of_formation_kcal'],
-                **cosmo_result,
-                **sigma_result,
-            }
-            n_cosmo += 1
+            for k, (j, idx) in enumerate(cosmo_map):
+                atoms, coords = mol_data[j]
+                sigma_result = full_sigma_analysis(cosmo_results[k], atoms)
+                results[idx] = {
+                    'smiles': smiles_list[idx],
+                    'atoms': atoms, 'coords': coords,
+                    'n_atoms': len(atoms), 'method': method,
+                    'energy_eV': scf_results[j]['energy_eV'],
+                    'heat_of_formation_kcal': scf_results[j]['heat_of_formation_kcal'],
+                    **cosmo_results[k], **sigma_result,
+                }
+                n_cosmo += 1
         except Exception:
             pass
 
