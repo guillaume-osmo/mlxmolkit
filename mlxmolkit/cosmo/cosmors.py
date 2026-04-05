@@ -15,9 +15,7 @@ Reference: Klamt, COSMO-RS: From Quantum Chemistry to Fluid Phase
 from __future__ import annotations
 
 import numpy as np
-from .params import (A_EFF, MF_ALPHA, MF_F_CORR, HB_C, HB_C_T,
-                     HB_SIGMA_THRESH, COMB_SG_Z_COORD, COMB_SG_A_STD,
-                     R_GAS, SIGMA_GRID, SIGMA_GRID_STEP)
+from . import params as _P
 
 
 def _compute_interaction_matrices(
@@ -40,13 +38,13 @@ def _compute_interaction_matrices(
 
     # Misfit: A_mf[i,j] = 0.5 · α · a_eff · (σ_i + σ_j)²
     sigma_sum = sigma_arr[:, np.newaxis] + sigma_arr[np.newaxis, :]  # (n, n)
-    A_mf = 0.5 * MF_ALPHA * A_EFF * sigma_sum ** 2
+    A_mf = 0.5 * _P.MF_ALPHA * _P.A_EFF * sigma_sum ** 2
 
     # Hydrogen bonding: donor-acceptor interaction
     A_hb = np.zeros((n, n))
 
     # Temperature-dependent prefactor
-    hb_c_at_T = HB_C * (1.0 - HB_C_T + HB_C_T * (298.15 / T))
+    hb_c_at_T = _P.HB_C * (1.0 - _P.HB_C_T + _P.HB_C_T * (298.15 / T))
 
     # Donor: sigma < 0 (negative charge → positive potential on H)
     # Acceptor: sigma > 0 (positive charge → negative potential on lone pair)
@@ -54,16 +52,16 @@ def _compute_interaction_matrices(
         for j in range(n):
             # Donor i, acceptor j
             if hb_type_arr[i] == 1 and hb_type_arr[j] == 2:
-                del_d = sigma_arr[i] + HB_SIGMA_THRESH  # σ_D + threshold (< 0)
-                del_a = sigma_arr[j] - HB_SIGMA_THRESH  # σ_A - threshold (> 0)
+                del_d = sigma_arr[i] + _P.HB_SIGMA_THRESH  # σ_D + threshold (< 0)
+                del_a = sigma_arr[j] - _P.HB_SIGMA_THRESH  # σ_A - threshold (> 0)
                 if del_d < 0 and del_a > 0:
-                    A_hb[i, j] = hb_c_at_T * A_EFF * del_d * del_a
+                    A_hb[i, j] = hb_c_at_T * _P.A_EFF * del_d * del_a
             # Acceptor i, donor j
             elif hb_type_arr[i] == 2 and hb_type_arr[j] == 1:
-                del_d = sigma_arr[j] + HB_SIGMA_THRESH
-                del_a = sigma_arr[i] - HB_SIGMA_THRESH
+                del_d = sigma_arr[j] + _P.HB_SIGMA_THRESH
+                del_a = sigma_arr[i] - _P.HB_SIGMA_THRESH
                 if del_d < 0 and del_a > 0:
-                    A_hb[i, j] = hb_c_at_T * A_EFF * del_d * del_a
+                    A_hb[i, j] = hb_c_at_T * _P.A_EFF * del_d * del_a
 
     return A_mf, A_hb
 
@@ -129,7 +127,7 @@ def activity_coefficients(
         lng: (n_mol,) logarithmic activity coefficients
     """
     n_mol = len(mol_profiles)
-    sigma_grid = SIGMA_GRID
+    sigma_grid = _P.SIGMA_GRID
     n_bins = len(sigma_grid)
 
     # Build unified segment type list from all molecules
@@ -146,9 +144,9 @@ def activity_coefficients(
         # Assign HB type per sigma bin: donor for σ < -thresh, acceptor for σ > thresh
         for k in range(n_bins):
             s = sigma_grid[k]
-            if s < -HB_SIGMA_THRESH:
+            if s < -_P.HB_SIGMA_THRESH:
                 mol_hb_profiles[m, k] = 1  # potential donor
-            elif s > HB_SIGMA_THRESH:
+            elif s > _P.HB_SIGMA_THRESH:
                 mol_hb_profiles[m, k] = 2  # potential acceptor
 
     # Mixture segment mole fractions
@@ -177,7 +175,7 @@ def activity_coefficients(
     A_int = A_mf + A_hb
 
     # Boltzmann factors
-    tau = np.exp(-A_int / (R_GAS * T))
+    tau = np.exp(-A_int / (_P.R_GAS * T))
 
     # COSMOspace for mixture
     Gamma_mix, n_iter_mix = cosmospace(X, tau)
@@ -192,20 +190,20 @@ def activity_coefficients(
             Gamma_pure, _ = cosmospace(X_pure, tau)
 
             # ln(γ_m) = Σ_k n_k · [ln(Γ_k^mix) - ln(Γ_k^pure)]
-            n_k = mol_area_profiles[m] / (A_EFF + 1e-30)
+            n_k = mol_area_profiles[m] / (_P.A_EFF + 1e-30)
             lng[m] = np.sum(n_k * (np.log(Gamma_mix + 1e-30) - np.log(Gamma_pure + 1e-30)))
     else:
         # COSMO reference state
         for m in range(n_mol):
-            n_k = mol_area_profiles[m] / (A_EFF + 1e-30)
+            n_k = mol_area_profiles[m] / (_P.A_EFF + 1e-30)
             lng[m] = np.sum(n_k * np.log(Gamma_mix + 1e-30))
 
     # Combinatorial contribution (Staverman-Guggenheim)
-    r = total_area_per_mol / COMB_SG_A_STD
+    r = total_area_per_mol / _P.COMB_SG_A_STD
     phi = x * r / (np.sum(x * r) + 1e-30)
     theta = x * total_area_per_mol / (np.sum(x * total_area_per_mol) + 1e-30)
 
-    z_half = COMB_SG_Z_COORD / 2.0
+    z_half = _P.COMB_SG_Z_COORD / 2.0
     lng_comb = np.log(phi / (x + 1e-30) + 1e-30) + 1.0 - phi / (x + 1e-30) \
                - z_half * r * (np.log(phi / (theta + 1e-30) + 1e-30) + 1.0 - phi / (theta + 1e-30))
 

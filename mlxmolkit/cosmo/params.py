@@ -61,9 +61,12 @@ A_EFF = 6.226  # Angstrom^2
 R_AV = 0.5  # Angstrom
 
 # Misfit energy parameters
-MF_ALPHA = 7.579075e6  # J/(mol * Angstrom^2 * e^2)
-MF_F_CORR = 2.4        # sigma_orth correction factor
-MF_R_AV_CORR = 1.0     # averaging radius correction
+# NOTE: For semi-empirical (RM1/PM3) charges, use MF_ALPHA_SE which is ~10x the
+# DFT value to compensate for less polarized Mulliken charges.
+MF_ALPHA_DFT = 7.579075e6   # J/(mol * Angstrom^2 * e^2) — for DFT/ORCA COSMO
+MF_ALPHA = 7.579075e7       # Tuned for semi-empirical (RM1/PM3) Mulliken charges
+MF_F_CORR = 2.4             # sigma_orth correction factor
+MF_R_AV_CORR = 1.0          # averaging radius correction
 
 # Hydrogen bonding parameters
 HB_C = 2.7488747e7     # J/(mol * Angstrom^2 * e^2)
