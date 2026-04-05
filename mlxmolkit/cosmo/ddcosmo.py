@@ -121,6 +121,92 @@ def build_ddcosmo_cavity(
             np.concatenate(all_ui))
 
 
+def _jacobi_diis_solve(
+    A: np.ndarray,
+    rhs: np.ndarray,
+    max_iter: int = 200,
+    tol: float = 1e-8,
+    n_diis: int = 20,
+) -> tuple[np.ndarray, int, bool]:
+    """Jacobi iteration with DIIS extrapolation for A·q = rhs.
+
+    Split A = D + O (diagonal + off-diagonal).
+    Iterate: q_new = D⁻¹ · (rhs - O · q)
+    DIIS: extrapolate from error history for faster convergence.
+
+    O(n²) per iteration (matvec) vs O(n³) for dense solve.
+
+    Args:
+        A: (n, n) coefficient matrix
+        rhs: (n,) right-hand side
+        max_iter: maximum Jacobi iterations
+        tol: convergence tolerance (rms of increment)
+        n_diis: DIIS history size
+
+    Returns:
+        q: (n,) solution
+        n_iter: iterations used
+        converged: whether tolerance was reached
+    """
+    n = len(rhs)
+    D_inv = 1.0 / np.diag(A)  # (n,)
+    O = A.copy()
+    np.fill_diagonal(O, 0.0)   # off-diagonal only
+
+    # Initial guess: D⁻¹ · rhs
+    q = D_inv * rhs
+
+    # DIIS history
+    diis_q = []
+    diis_err = []
+
+    for iteration in range(max_iter):
+        # Jacobi step: q_new = D⁻¹ · (rhs - O · q)
+        residual = rhs - O @ q
+        q_new = D_inv * residual
+
+        # Error = increment
+        dq = q_new - q
+        rms_dq = np.sqrt(np.mean(dq * dq))
+
+        if rms_dq < tol:
+            return q_new, iteration + 1, True
+
+        # DIIS extrapolation (after a few plain Jacobi steps)
+        if iteration >= 2:
+            diis_q.append(q_new.copy())
+            diis_err.append(dq.copy())
+
+            if len(diis_q) > n_diis:
+                diis_q.pop(0)
+                diis_err.pop(0)
+
+            nd = len(diis_q)
+            if nd >= 2:
+                # Build DIIS B matrix: B[i,j] = err_i · err_j
+                B = np.zeros((nd + 1, nd + 1))
+                for i in range(nd):
+                    for j in range(i, nd):
+                        B[i, j] = np.dot(diis_err[i], diis_err[j])
+                        B[j, i] = B[i, j]
+                B[:nd, nd] = -1.0
+                B[nd, :nd] = -1.0
+
+                rhs_diis = np.zeros(nd + 1)
+                rhs_diis[nd] = -1.0
+
+                try:
+                    c = np.linalg.solve(B, rhs_diis)
+                    q_new = sum(c[i] * diis_q[i] for i in range(nd))
+                except np.linalg.LinAlgError:
+                    pass  # Skip DIIS this step, use plain Jacobi
+
+        # SOR-like damped update (omega=0.5 for stability with dense Coulomb)
+        q = 0.5 * q_new + 0.5 * q
+
+    return q, max_iter, False
+
+
 def ddcosmo_charges(
     atoms: list[int],
     coords: np.ndarray,
@@ -129,10 +215,14 @@ def ddcosmo_charges(
     seg_area: np.ndarray,
     seg_ui: np.ndarray,
     epsilon: float = EPSILON_WATER,
+    solver: str = 'auto',
 ) -> np.ndarray:
     """Solve COSMO equation with ddCOSMO-weighted segments.
 
-    Like standard COSMO but segments weighted by switching function ui.
+    Args:
+        solver: 'jacobi' for Jacobi/DIIS iterative,
+                'direct' for np.linalg.solve,
+                'auto' picks based on system size (Jacobi for n>400)
     """
     n_seg = len(seg_pos)
     if n_seg == 0:
@@ -142,23 +232,30 @@ def ddcosmo_charges(
     seg_area_b = seg_area / (BOHR_TO_ANG ** 2)
     coords_b = coords / BOHR_TO_ANG
 
-    # A matrix (vectorized)
+    # A matrix
     dist = cdist(seg_pos_b, seg_pos_b)
     np.fill_diagonal(dist, 1.0)
     A = 1.0 / dist
     np.fill_diagonal(A, 1.07 * np.sqrt(4.0 * np.pi / np.maximum(seg_area_b, 1e-30)))
 
-    # Phi potential (vectorized)
+    # Phi potential
     dist_ac = np.maximum(cdist(seg_pos_b, coords_b), 1e-10)
     Phi = (mulliken_charges[np.newaxis, :] / dist_ac).sum(axis=1)
 
-    # Weight Phi by switching function (ddCOSMO convention)
-    Phi_weighted = Phi * seg_ui
+    # Weighted RHS
+    rhs = -Phi * seg_ui
 
     # Solve
-    q = np.linalg.solve(A, -Phi_weighted)
+    if solver == 'auto':
+        # Direct (numpy Accelerate) is faster for n < 3000 on Apple Silicon
+        # Jacobi/DIIS only for very large systems where O(n³) dominates
+        solver = 'jacobi' if n_seg > 3000 else 'direct'
 
-    # Dielectric scaling
+    if solver == 'jacobi':
+        q, n_iter, converged = _jacobi_diis_solve(A, rhs, max_iter=200, tol=1e-8)
+    else:
+        q = np.linalg.solve(A, rhs)
+
     keps = (epsilon - 1.0) / (epsilon + 0.5)
     return keps * q
 

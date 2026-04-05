@@ -64,7 +64,9 @@ R_AV = 0.5  # Angstrom
 # NOTE: For semi-empirical (RM1/PM3) charges, use MF_ALPHA_SE which is ~10x the
 # DFT value to compensate for less polarized Mulliken charges.
 MF_ALPHA_DFT = 7.579075e6   # J/(mol * Angstrom^2 * e^2) — for DFT/ORCA COSMO
-MF_ALPHA = 7.579075e7       # Tuned for semi-empirical (RM1/PM3) Mulliken charges
+MF_ALPHA_SIMPLE = 7.579075e7  # Tuned for simple COSMO + PM3 charges
+MF_ALPHA_DDCOSMO = 1.0e8      # Tuned for ddCOSMO + PM3 charges
+MF_ALPHA = 1.0e8             # Default: ddCOSMO (best accuracy)
 MF_F_CORR = 2.4             # sigma_orth correction factor
 MF_R_AV_CORR = 1.0          # averaging radius correction
 
