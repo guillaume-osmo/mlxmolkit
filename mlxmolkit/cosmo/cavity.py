@@ -139,42 +139,31 @@ def compute_cosmo_charges(
     n_seg = len(seg_pos)
     n_atoms = len(atoms)
 
-    # Build segment-segment Coulomb matrix A (in atomic units)
-    # Convert to Bohr for the Coulomb integrals
+    # Convert to Bohr for Coulomb integrals
     seg_pos_bohr = seg_pos / BOHR_TO_ANG
     seg_area_bohr = seg_area / (BOHR_TO_ANG ** 2)
     coords_bohr = coords / BOHR_TO_ANG
 
-    # A matrix: 1/|r_i - r_j| in atomic units
-    A = np.zeros((n_seg, n_seg))
-    for i in range(n_seg):
-        for j in range(i + 1, n_seg):
-            d = np.linalg.norm(seg_pos_bohr[i] - seg_pos_bohr[j])
-            if d > 1e-10:
-                A[i, j] = 1.0 / d
-                A[j, i] = 1.0 / d
+    # A matrix: vectorized pairwise 1/|r_i - r_j|
+    diff = seg_pos_bohr[:, np.newaxis, :] - seg_pos_bohr[np.newaxis, :, :]  # (n, n, 3)
+    dist = np.sqrt(np.sum(diff * diff, axis=2))  # (n, n)
+    np.fill_diagonal(dist, 1.0)  # avoid divide by zero
+    A = 1.0 / dist
+    # Diagonal: Klamt self-interaction
+    np.fill_diagonal(A, 1.07 * np.sqrt(4.0 * np.pi / seg_area_bohr))
 
-    # Diagonal: self-interaction (Klamt formula)
-    for i in range(n_seg):
-        A[i, i] = 1.07 * np.sqrt(4.0 * np.pi / seg_area_bohr[i])
-
-    # Electrostatic potential Φ at each segment from Mulliken charges
-    # Φ(r) = Σ_A q_A / |r - R_A| (atomic units)
-    Phi = np.zeros(n_seg)
-    for i in range(n_seg):
-        for a in range(n_atoms):
-            d = np.linalg.norm(seg_pos_bohr[i] - coords_bohr[a])
-            if d > 1e-10:
-                Phi[i] += mulliken_charges[a] / d
+    # Electrostatic potential: vectorized Φ(r_i) = Σ_A q_A / |r_i - R_A|
+    diff_ac = seg_pos_bohr[:, np.newaxis, :] - coords_bohr[np.newaxis, :, :]  # (n_seg, n_atoms, 3)
+    dist_ac = np.sqrt(np.sum(diff_ac * diff_ac, axis=2))  # (n_seg, n_atoms)
+    dist_ac = np.maximum(dist_ac, 1e-10)
+    Phi = (mulliken_charges[np.newaxis, :] / dist_ac).sum(axis=1)  # (n_seg,)
 
     # Solve: A · q = -Φ
     q = np.linalg.solve(A, -Phi)
 
-    # Apply dielectric scaling: q_eff = f(ε) · q
+    # Dielectric scaling: q_eff = f(ε) · q
     f_eps = (epsilon - 1.0) / (epsilon + 0.5)
-    q_eff = f_eps * q
-
-    return q_eff
+    return f_eps * q
 
 
 def cosmo_surface(
