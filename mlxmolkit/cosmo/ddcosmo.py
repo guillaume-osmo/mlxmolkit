@@ -17,6 +17,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from .params import VDW_RADII, CAVITY_SCALING, EPSILON_WATER, BOHR_TO_ANG
 from .lebedev import get_lebedev_grid
+from .spherical_harmonics import real_spherical_harmonics, project_to_harmonics, expand_from_harmonics
 
 
 def _switching_function(t: np.ndarray, eta: float = 0.2) -> np.ndarray:
@@ -260,6 +261,159 @@ def ddcosmo_charges(
     return keps * q
 
 
+def ddcosmo_charges_sh(
+    atoms: list[int],
+    coords: np.ndarray,
+    mulliken_charges: np.ndarray,
+    seg_pos: np.ndarray,
+    seg_area: np.ndarray,
+    seg_normal: np.ndarray,
+    seg_atom: np.ndarray,
+    seg_ui: np.ndarray,
+    epsilon: float = EPSILON_WATER,
+    lmax: int = 6,
+) -> np.ndarray:
+    """Solve COSMO in spherical harmonic basis (xTB-style).
+
+    Instead of n_seg × n_seg dense system, projects onto
+    (lmax+1)² = 49 basis per atom → much smaller system.
+
+    Steps:
+    1. Project Phi onto SH basis per atom: rhs_{lm,A} = Σ_i w_i ui_i Phi_i Y_{lm}(θ_i)
+    2. Build coupling matrix L in SH basis
+    3. Solve L·σ_sh = rhs_sh (direct — matrix is small)
+    4. Expand σ back to segments: σ_i = Σ_{lm} σ_{lm,A} · Y_{lm}(θ_i)
+
+    Args:
+        lmax: max angular momentum (6 → 49 basis per atom)
+    """
+    n_seg = len(seg_pos)
+    if n_seg == 0:
+        return np.zeros(0)
+
+    n_atoms = len(atoms)
+    n_ylm = (lmax + 1) ** 2
+    n_basis_total = n_atoms * n_ylm
+
+    coords = np.asarray(coords, dtype=np.float64)
+    seg_pos_b = seg_pos / BOHR_TO_ANG
+    seg_area_b = seg_area / (BOHR_TO_ANG ** 2)
+    coords_b = coords / BOHR_TO_ANG
+
+    radii = np.array([VDW_RADII.get(z, 2.0) * CAVITY_SCALING for z in atoms])
+
+    # Get Lebedev grid used for cavity
+    sphere_pts, sphere_weights = get_lebedev_grid(194)
+
+    # Compute SH basis for each grid point
+    Y = real_spherical_harmonics(lmax, sphere_pts)  # (n_ylm, n_grid)
+
+    # Phi at each segment
+    dist_ac = np.maximum(cdist(seg_pos_b, coords_b), 1e-10)
+    Phi = (mulliken_charges[np.newaxis, :] / dist_ac).sum(axis=1)
+
+    # --- Project RHS to SH basis per atom ---
+    rhs_sh = np.zeros(n_basis_total)
+
+    # Map segments back to per-atom grid points
+    # We need to know which grid point each segment came from
+    # Since we kept all segments with ui > threshold, we need to track this
+
+    # For now: project Phi * ui weighted by area onto SH per atom
+    for a in range(n_atoms):
+        mask = seg_atom == a
+        if not np.any(mask):
+            continue
+
+        # Local positions → unit vectors on atom's sphere
+        local_pos = seg_pos[mask] - coords[a]
+        local_r = np.linalg.norm(local_pos, axis=1, keepdims=True)
+        local_unit = local_pos / np.maximum(local_r, 1e-30)
+
+        # SH values at these segment positions
+        Y_local = real_spherical_harmonics(lmax, local_unit)  # (n_ylm, n_seg_a)
+
+        # Weighted potential
+        phi_weighted = Phi[mask] * seg_ui[mask]
+        w_local = seg_area_b[mask] / (radii[a] / BOHR_TO_ANG) ** 2  # approximate weights
+
+        # Project: rhs_{lm} = -Σ_i w_i · phi_i · Y_{lm,i}
+        rhs_sh[a * n_ylm:(a + 1) * n_ylm] = -Y_local @ (phi_weighted * w_local)
+
+    # --- Build coupling matrix L in SH basis ---
+    # L_{(a,lm),(b,l'm')} = <Y_{lm}^a | A | Y_{l'm'}^b>
+    # For on-sphere: diagonal = self-interaction
+    # For cross-sphere: Coulomb coupling
+
+    L = np.zeros((n_basis_total, n_basis_total))
+
+    for a in range(n_atoms):
+        # Diagonal block (same atom): self-interaction
+        # L_{aa} ≈ diag(1.07 * sqrt(4π/a_eff)) * delta_{lm,l'm'}
+        # Simplified: use average self-interaction
+        r_a_b = radii[a] / BOHR_TO_ANG
+        a_eff_b = 4.0 * np.pi * r_a_b ** 2 / len(sphere_pts)
+        self_int = 1.07 * np.sqrt(4.0 * np.pi / a_eff_b)
+        for lm in range(n_ylm):
+            L[a * n_ylm + lm, a * n_ylm + lm] = self_int
+
+        # Off-diagonal blocks (atom a ↔ atom b)
+        for b in range(n_atoms):
+            if b == a:
+                continue
+            # Coulomb coupling between SH on atoms a and b
+            # Sample: compute 1/|r_i^a - r_j^b| for Lebedev points, project onto SH
+            mask_a = seg_atom == a
+            mask_b = seg_atom == b
+            if not np.any(mask_a) or not np.any(mask_b):
+                continue
+
+            pos_a_b = seg_pos_b[mask_a]
+            pos_b_b = seg_pos_b[mask_b]
+
+            # Coulomb matrix between a's and b's segments
+            dist_ab = np.maximum(cdist(pos_a_b, pos_b_b), 1e-10)
+            coulomb_ab = 1.0 / dist_ab  # (n_a, n_b)
+
+            # Project: L_{(a,lm),(b,l'm')} = Σ_{i,j} Y_{lm}(i) * w_i * coulomb(i,j) * w_j * Y_{l'm'}(j)
+            local_a = seg_pos[mask_a] - coords[a]
+            r_a = np.linalg.norm(local_a, axis=1, keepdims=True)
+            Y_a = real_spherical_harmonics(lmax, local_a / np.maximum(r_a, 1e-30))
+
+            local_b = seg_pos[mask_b] - coords[b]
+            r_b = np.linalg.norm(local_b, axis=1, keepdims=True)
+            Y_b = real_spherical_harmonics(lmax, local_b / np.maximum(r_b, 1e-30))
+
+            w_a = seg_area_b[mask_a] / (radii[a] / BOHR_TO_ANG) ** 2
+            w_b = seg_area_b[mask_b] / (radii[b] / BOHR_TO_ANG) ** 2
+
+            # L_ab = Y_a · diag(w_a) · coulomb · diag(w_b) · Y_b^T
+            L_ab = (Y_a * w_a[np.newaxis, :]) @ coulomb_ab @ (Y_b * w_b[np.newaxis, :]).T
+
+            L[a * n_ylm:(a + 1) * n_ylm,
+              b * n_ylm:(b + 1) * n_ylm] = L_ab
+
+    # --- Solve L · σ_sh = rhs_sh ---
+    sigma_sh = np.linalg.solve(L, rhs_sh)
+
+    # --- Expand back to segments ---
+    q = np.zeros(n_seg)
+    for a in range(n_atoms):
+        mask = seg_atom == a
+        if not np.any(mask):
+            continue
+
+        local_pos = seg_pos[mask] - coords[a]
+        local_r = np.linalg.norm(local_pos, axis=1, keepdims=True)
+        Y_local = real_spherical_harmonics(lmax, local_pos / np.maximum(local_r, 1e-30))
+
+        coeffs = sigma_sh[a * n_ylm:(a + 1) * n_ylm]
+        q[mask] = expand_from_harmonics(coeffs, Y_local) * seg_ui[mask]
+
+    keps = (epsilon - 1.0) / (epsilon + 0.5)
+    return keps * q
+
+
 def ddcosmo_surface(
     atoms: list[int],
     coords: np.ndarray,
@@ -267,10 +421,17 @@ def ddcosmo_surface(
     n_points: int = 194,
     epsilon: float = EPSILON_WATER,
     eta: float = 0.2,
+    solver: str = 'direct',
+    lmax: int = 6,
 ) -> dict:
     """Complete ddCOSMO surface calculation.
 
-    Like cosmo_surface but with smooth switching function.
+    Args:
+        solver: 'direct' (dense np.linalg.solve on segments),
+                'sh' (spherical harmonic basis — smaller matrix),
+                'jacobi' (iterative on segments),
+                'auto' (picks best for system size)
+        lmax: max angular momentum for SH basis (6→49 per atom)
     """
     from .cavity import _mulliken_charges
     from ..rm1.params import RM1_PARAMS
@@ -284,9 +445,17 @@ def ddcosmo_surface(
     n_basis_per = [RM1_PARAMS[z].n_basis for z in atoms]
     mulliken = _mulliken_charges(atoms, density, n_basis_per)
 
-    seg_charge = ddcosmo_charges(
-        atoms, coords, mulliken, seg_pos, seg_area, seg_ui, epsilon=epsilon,
-    )
+    if solver == 'sh':
+        seg_charge = ddcosmo_charges_sh(
+            atoms, coords, mulliken, seg_pos, seg_area,
+            seg_normal, seg_atom, seg_ui,
+            epsilon=epsilon, lmax=lmax,
+        )
+    else:
+        seg_charge = ddcosmo_charges(
+            atoms, coords, mulliken, seg_pos, seg_area, seg_ui,
+            epsilon=epsilon, solver=solver,
+        )
 
     seg_sigma = np.zeros_like(seg_charge)
     nonzero = seg_area > 1e-30
