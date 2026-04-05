@@ -73,7 +73,7 @@ def batch_smiles_to_cosmo(
         n_conv = sum(1 for r in scf_results if r['converged'])
         print(f"  SCF converged: {n_conv}/{len(mol_data)}")
 
-    # Step 3: COSMO cavity + sigma (per molecule, numpy)
+    # Step 3: COSMO cavity + sigma (sequential — each solve is <20ms)
     results = [None] * N
     n_cosmo = 0
 
@@ -81,7 +81,6 @@ def batch_smiles_to_cosmo(
         scf = scf_results[j]
         if not scf['converged']:
             continue
-
         atoms, coords = mol_data[j]
         try:
             cosmo_result = cosmo_surface(
@@ -89,7 +88,6 @@ def batch_smiles_to_cosmo(
                 n_points=n_surface_points, epsilon=epsilon,
             )
             sigma_result = full_sigma_analysis(cosmo_result, atoms)
-
             results[idx] = {
                 'smiles': smiles_list[idx],
                 'atoms': atoms,
