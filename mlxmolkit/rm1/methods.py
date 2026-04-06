@@ -420,13 +420,17 @@ for _z, _p in PM6_SP_PARAMS.items():
     _p.eisol = _compute_eisol(_p)
 
 
+# PM6 full with d-orbitals
+from .pm6_params import PM6_FULL_PARAMS
+
+
 # Method registry
 METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'RM1': RM1_PARAMS,
     'AM1': AM1_PARAMS,
     'PM3': PM3_PARAMS,
-    'PM6': PM6_SP_PARAMS,
-    'PM6_SP': PM6_SP_PARAMS,
+    'PM6': PM6_FULL_PARAMS,      # Full PM6 with d-orbitals (9 basis)
+    'PM6_SP': PM6_SP_PARAMS,     # PM6 sp-only (4 basis, no d)
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }

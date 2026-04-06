@@ -16,10 +16,10 @@ from typing import Dict
 
 @dataclass
 class ElementParams:
-    """RM1 parameters for one element."""
+    """NDDO parameters for one element (sp or spd basis)."""
     Z: int              # atomic number
     symbol: str
-    n_basis: int        # number of basis functions (1 for H, 4 for C/N/O/etc)
+    n_basis: int        # 1 (H), 4 (sp), or 9 (spd)
 
     # One-electron one-center integrals (eV)
     Uss: float          # s orbital
@@ -44,7 +44,6 @@ class ElementParams:
     alpha: float
 
     # Gaussian correction terms: K, L, M for up to 4 Gaussians
-    # E_core_core += Σ K * exp(-L * (R - M)^2)
     gauss_K: list       # [K1, K2, K3, K4]
     gauss_L: list       # [L1, L2, L3, L4]
     gauss_M: list       # [M1, M2, M3, M4]
@@ -55,9 +54,16 @@ class ElementParams:
     # Derived: electron heat of formation (kcal/mol)
     eheat: float = 0.0
 
-    # Isolated atom electronic energy (eV) — from MOPAC
-    # E_isol = Uss * n_s + Upp * n_p + one-center integrals
+    # Isolated atom electronic energy (eV)
     eisol: float = 0.0
+
+    # --- d-orbital parameters (PM6 full) ---
+    Udd: float = 0.0         # d orbital one-electron integral (eV)
+    zeta_d: float = 0.0      # d orbital Slater exponent (Bohr^-1)
+    beta_d: float = 0.0      # d orbital resonance integral (eV)
+    F0SD: float = 0.0        # Slater-Condon F0 for s-d interaction
+    G2SD: float = 0.0        # Slater-Condon G2 for s-d interaction
+    has_d: bool = False       # True if element uses d-orbitals in PM6
 
 
 # RM1 parameters from MOPAC (Apache 2.0)

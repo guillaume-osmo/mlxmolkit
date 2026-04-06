@@ -102,14 +102,17 @@ def _build_core_hamiltonian(atoms, coords, info):
 
     H = np.zeros((n_basis, n_basis))
 
-    # Diagonal: one-electron one-center
+    # Diagonal: one-electron one-center (Uss, Upp, Udd)
     for mu in range(n_basis):
         i = b2a[mu]
         p = params[i]
         if btype[mu] == 0:
             H[mu, mu] = p.Uss
-        else:
+        elif btype[mu] <= 3:
             H[mu, mu] = p.Upp
+        else:
+            # d-orbital (types 4-8)
+            H[mu, mu] = p.Udd
 
     # Off-diagonal: resonance integrals using proper Slater overlap
     # H_μν = 0.5 * (beta_μ + beta_ν) * S_μν  (Wolfsberg-Helmholz)
@@ -119,33 +122,71 @@ def _build_core_hamiltonian(atoms, coords, info):
             pA = params[i]
             pB = params[j]
 
-            # Proper Slater overlap in molecular frame
-            S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
+            # Overlap — sp block from overlap_molecular_frame, pad for d-orbitals
+            nA = pA.n_basis
+            nB = pB.n_basis
+            nA_sp = min(nA, 4)
+            nB_sp = min(nB, 4)
 
-            for mu_off in range(pA.n_basis):
+            # sp overlap (handles qnA/qnB swap internally)
+            S_sp = overlap_molecular_frame(pA, pB, coords[i], coords[j])
+
+            # Pad to full (nA, nB) if d-orbitals present
+            if nA > 4 or nB > 4:
+                S_ij = np.zeros((nA, nB))
+                S_ij[:S_sp.shape[0], :S_sp.shape[1]] = S_sp
+                # d-d overlap (both atoms have d)
+                if nA == 9 and nB == 9 and pA.zeta_d > 0 and pB.zeta_d > 0:
+                    R = np.linalg.norm(coords[i] - coords[j])
+                    R_b = R * ANG_TO_BOHR
+                    rho = 0.5 * (pA.zeta_d + pB.zeta_d) * R_b
+                    if rho < 20:
+                        sd = np.exp(-rho) * (1.0 + rho + 0.4*rho**2)
+                        for k in range(5):
+                            S_ij[4+k, 4+k] = sd * max(0.5 - 0.1*k, 0.05)
+            else:
+                S_ij = S_sp
+
+            for mu_off in range(nA):
                 mu = starts[i] + mu_off
-                beta_mu = pA.beta_s if btype[mu] == 0 else pA.beta_p
+                if btype[mu] == 0:
+                    beta_mu = pA.beta_s
+                elif btype[mu] <= 3:
+                    beta_mu = pA.beta_p
+                else:
+                    beta_mu = pA.beta_d
 
-                for nu_off in range(pB.n_basis):
+                for nu_off in range(nB):
                     nu = starts[j] + nu_off
-                    beta_nu = pB.beta_s if btype[nu] == 0 else pB.beta_p
+                    if btype[nu] == 0:
+                        beta_nu = pB.beta_s
+                    elif btype[nu] <= 3:
+                        beta_nu = pB.beta_p
+                    else:
+                        beta_nu = pB.beta_d
 
                     H[mu, nu] = 0.5 * (beta_mu + beta_nu) * S_ij[mu_off, nu_off]
                     H[nu, mu] = H[mu, nu]
 
     # Electron-nuclear attraction using properly rotated integrals
+    # Note: rotate_integrals works on sp (4×4) block only
     for i in range(n_atoms):
         for j in range(n_atoms):
             if i == j:
                 continue
-            # e1b[μ_i, ν_i] = attraction of electrons on atom i by nucleus j
             _, e1b_ij, _ = rotate_integrals_to_molecular_frame(
                 params[i], params[j], coords[i], coords[j],
             )
-            nA = params[i].n_basis
-            for mu_a in range(nA):
-                for nu_a in range(nA):
+            # e1b is (min(nA,4), min(nA,4)) — only sp block
+            nA_sp = min(params[i].n_basis, 4)
+            for mu_a in range(nA_sp):
+                for nu_a in range(nA_sp):
                     H[starts[i] + mu_a, starts[i] + nu_a] += e1b_ij[mu_a, nu_a]
+            # d-orbital nuclear attraction: approximate with (ss|ss) diagonal
+            if params[i].n_basis == 9:
+                ssss = e1b_ij[0, 0]  # s-orbital attraction as proxy
+                for k in range(5):
+                    H[starts[i] + 4 + k, starts[i] + 4 + k] += ssss * 0.8
 
     return H
 
@@ -209,6 +250,22 @@ def _build_fock(H, P, info, atoms, coords):
                     F[pk, pl] += P[pk, pl] * pp_fac_off
                     F[pl, pk] += P[pl, pk] * pp_fac_off
 
+            # d-orbital one-center (PM6 with has_d)
+            if p.n_basis == 9 and len(idx) >= 9:
+                Pdd_total = sum(P[idx[4+k], idx[4+k]] for k in range(5))
+                # d-d self-interaction (simplified: F0SD=G2SD=0 for main-group)
+                gdd = 0.3 * p.gss  # approximate d-d repulsion
+                for k in range(5):
+                    dk = idx[4 + k]
+                    F[dk, dk] += (P[dk, dk] * gdd * 0.5
+                                  + Pss * (p.gsp - 0.5 * p.hsp) * 0.5
+                                  + Ppp_total * pp_fac_d * 0.5)
+                # s-d cross terms
+                for k in range(5):
+                    dk = idx[4 + k]
+                    F[s, dk] += P[s, dk] * sp_fac_2 * 0.3
+                    F[dk, s] += P[dk, s] * sp_fac_2 * 0.3
+
     # === Two-center contribution with proper rotation ===
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
@@ -231,22 +288,37 @@ def _build_fock(H, P, info, atoms, coords):
             # Coulomb on B from A:  F[λ_B, σ_B] += Σ_{μν on A} P[μ,ν] * (μν|λσ)
             # Exchange A-B:         F[μ_A, λ_B] -= 0.5 * Σ_{νσ} P[ν_A,σ_B] * (μν|λσ)
             #
-            for mu_a in range(nA):
-                for nu_a in range(nA):
+            # w tensor is 4×4×4×4 (sp block only)
+            # d-orbital two-center integrals are zero in this approximation
+            nA_sp = min(nA, 4)
+            nB_sp = min(nB, 4)
+            for mu_a in range(nA_sp):
+                for nu_a in range(nA_sp):
                     mu = sA + mu_a
                     nu = sA + nu_a
-                    for lam_b in range(nB):
-                        for sig_b in range(nB):
+                    for lam_b in range(nB_sp):
+                        for sig_b in range(nB_sp):
                             lam = sB + lam_b
                             sig = sB + sig_b
                             wval = w[mu_a, nu_a, lam_b, sig_b]
-                            # Coulomb on A from B's density
                             F[mu, nu] += P[lam, sig] * wval
-                            # Coulomb on B from A's density
                             F[lam, sig] += P[mu, nu] * wval
-                            # Exchange A-B (both triangles)
                             F[mu, lam] -= 0.5 * P[nu, sig] * wval
                             F[lam, mu] -= 0.5 * P[sig, nu] * wval
+
+            # d-orbital two-center: Coulomb approximation using (ss|ss)
+            if nA == 9 or nB == 9:
+                ssss = w[0, 0, 0, 0]  # (ss|ss) integral
+                # d-orbitals on A feel Coulomb from B's total charge
+                if nA == 9:
+                    PB_total = sum(P[sB + k, sB + k] for k in range(nB_sp))
+                    for k in range(5):
+                        F[sA + 4 + k, sA + 4 + k] += PB_total * ssss * 0.8
+                # d-orbitals on B feel Coulomb from A's total charge
+                if nB == 9:
+                    PA_total = sum(P[sA + k, sA + k] for k in range(nA_sp))
+                    for k in range(5):
+                        F[sB + 4 + k, sB + 4 + k] += PA_total * ssss * 0.8
 
     return F
 
