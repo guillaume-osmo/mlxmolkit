@@ -200,8 +200,7 @@ def overlap_d_molecular_frame(
 
     R_bohr = R * ANG_TO_BOHR
     v = R_vec / R
-    rot = _rotation_matrix(v)  # 3×3 rotation
-    r0, r1, r2 = rot[0], rot[1], rot[2]  # sigma, pi_x, pi_y
+    rot = _rotation_matrix(v)  # 3×3 rotation matrix
 
     # Quantum numbers
     qnA = 1 if pA.Z <= 2 else 2
@@ -216,44 +215,47 @@ def overlap_d_molecular_frame(
         R_bohr, qnA, qnB, qnD_A, qnD_B,
     )
 
-    # d-s block: d on A, s on B (or vice versa)
-    if nA == 9 and nB >= 1:
-        Sds = d_ovlp['S_ds_sigma']
-        if abs(Sds) > 1e-15:
-            # d_σ overlaps s: project dz² along bond → c0 = r0
-            # S[dz², s] = Sds * r0[k] (rotation to molecular frame)
-            # In the 5 d-orbital basis: dz²=4, dxz=5, dyz=6, dx²-y²=7, dxy=8
-            # Only dσ (dz² in local frame) has nonzero overlap with s
-            for k in range(3):
-                # dz² → molecular frame via d-orbital rotation matrix
-                # Simplified: dσ projects as r0[k]² * √(3) factor
-                pass  # TODO: proper d-orbital rotation (5×5 Wigner matrix)
-            # For now: approximate d-s overlap using bond direction
-            S[4, 0] = Sds  # dz² - s along bond
+    # Import Wigner D-matrix for proper d-orbital rotation
+    from .wigner_d import rotate_ds_overlap, rotate_dp_overlap, rotate_d_overlap
 
-    # d-p block: d on A, p on B
+    # d-s block: S[d_A, s_B] — 5 d-orbitals overlapping 1 s-orbital
+    if nA == 9 and nB >= 1 and abs(d_ovlp['S_ds_sigma']) > 1e-15:
+        S[4:9, 0] = rotate_ds_overlap(d_ovlp['S_ds_sigma'], rot)
+
+    # s-d block: S[s_A, d_B]
+    if nB == 9 and nA >= 1 and qnD_B > 0:
+        d_ovlp_rev = overlap_d_local(
+            pB.zeta_s, pB.zeta_p, getattr(pB, 'zeta_d', 0.0),
+            pA.zeta_s, pA.zeta_p, getattr(pA, 'zeta_d', 0.0),
+            R_bohr, qnB, qnA, qnD_B, qnD_A,
+        )
+        if abs(d_ovlp_rev['S_ds_sigma']) > 1e-15:
+            S[0, 4:9] = -rotate_ds_overlap(d_ovlp_rev['S_ds_sigma'], rot)
+
+    # d-p block: S[d_A, p_B] — 5×3 overlap
     if nA == 9 and nB >= 4:
         Sdp_s = d_ovlp['S_dp_sigma']
         Sdp_p = d_ovlp['S_dp_pi']
-        # dσ-pσ and dπ-pπ overlaps
         if abs(Sdp_s) > 1e-15 or abs(Sdp_p) > 1e-15:
-            S[4, 1] = Sdp_s * r0[0]  # dz²-px (approximate)
-            S[4, 2] = Sdp_s * r0[1]
-            S[4, 3] = Sdp_s * r0[2]
+            S[4:9, 1:4] = rotate_dp_overlap(Sdp_s, Sdp_p, rot)
 
-    # d-d block
+    # p-d block: S[p_A, d_B]
+    if nB == 9 and nA >= 4 and qnD_B > 0:
+        d_ovlp_rev = overlap_d_local(
+            pB.zeta_s, pB.zeta_p, getattr(pB, 'zeta_d', 0.0),
+            pA.zeta_s, pA.zeta_p, getattr(pA, 'zeta_d', 0.0),
+            R_bohr, qnB, qnA, qnD_B, qnD_A,
+        )
+        Sdp_s = d_ovlp_rev['S_dp_sigma']
+        Sdp_p = d_ovlp_rev['S_dp_pi']
+        if abs(Sdp_s) > 1e-15 or abs(Sdp_p) > 1e-15:
+            S[1:4, 4:9] = -rotate_dp_overlap(Sdp_s, Sdp_p, rot).T
+
+    # d-d block: S[d_A, d_B] — 5×5 overlap
     if nA == 9 and nB == 9:
-        Sdd_s = d_ovlp['S_dd_sigma']
-        Sdd_p = d_ovlp['S_dd_pi']
-        Sdd_d = d_ovlp['S_dd_delta']
-        # Diagonal: each d-orbital overlaps itself
-        S[4, 4] = Sdd_s    # dz²-dz² (sigma)
-        S[5, 5] = Sdd_p    # dxz-dxz (pi)
-        S[6, 6] = Sdd_p    # dyz-dyz (pi)
-        S[7, 7] = Sdd_d    # dx²-y² (delta)
-        S[8, 8] = Sdd_d    # dxy-dxy (delta)
+        S[4:9, 4:9] = rotate_d_overlap(d_ovlp, rot)
 
-    # Symmetrize for B-A block
+    # Handle B-A ordering
     if nB == 9 and nA < 9:
         S_BA = overlap_d_molecular_frame(pB, pA, coordB, coordA)
         return S_BA.T

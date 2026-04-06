@@ -206,16 +206,44 @@ def _build_fock(H, P, info, atoms, coords):
         Pss = P[s, s]
 
         if p.n_basis == 9 and getattr(p, 'has_d', False) and len(idx) >= 9:
-            # PM6 d-orbital atom: use W integrals for FULL 9×9 one-center
-            # W integrals encode ALL one-center two-electron physics (sp + d)
+            # PM6 d-orbital atom: sp formulas for 4×4 block + W for d cross-terms
+            px, py, pz = idx[1], idx[2], idx[3]
+            Pss = P[s, s]
+            Ppp_total = P[px, px] + P[py, py] + P[pz, pz]
+
+            # Standard sp one-center (same as non-d atoms)
+            F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
+            sp_fac_1 = p.gsp - 0.5 * p.hsp
+            sp_fac_2 = 1.5 * p.hsp - 0.5 * p.gsp
+            pp_fac_d = 1.25 * p.gp2 - 0.25 * p.gpp
+            pp_fac_off = 0.75 * p.gpp - 1.25 * p.gp2
+
+            for k in range(1, 4):
+                pk = idx[k]
+                F[pk, pk] += (Pss * sp_fac_1
+                              + P[pk, pk] * p.gpp * 0.5
+                              + (Ppp_total - P[pk, pk]) * pp_fac_d)
+            for k in range(1, 4):
+                pk = idx[k]
+                F[s, pk] += P[s, pk] * sp_fac_2
+                F[pk, s] += P[pk, s] * sp_fac_2
+            for k in range(1, 4):
+                for l in range(k + 1, 4):
+                    pk, pl = idx[k], idx[l]
+                    F[pk, pl] += P[pk, pl] * pp_fac_off
+                    F[pl, pk] += P[pl, pk] * pp_fac_off
+
+            # d-orbital cross terms via W integrals
             from .w_integrals import compute_w_integrals
-            from .fock_d import fock_d_one_center
+            from .fock_d import fock_d_one_center, TRIL_I, TRIL_J
             qn_sp = 3 if p.Z > 10 else 2
             W = compute_w_integrals(
                 p.zeta_s, p.zeta_p, p.zeta_d,
                 qn_sp, 3,
                 getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
             )
+            # W integrals: ADDITIVE d-orbital contribution on top of sp formulas
+            # W encodes s-d, p-d, and d-d cross-terms (NOT sp-sp replacement)
             F = fock_d_one_center(F, P, W, starts[i], n_basis=9)
 
         elif p.n_basis == 1:
@@ -288,19 +316,31 @@ def _build_fock(H, P, info, atoms, coords):
                             F[mu, lam] -= 0.5 * P[nu, sig] * wval
                             F[lam, mu] -= 0.5 * P[sig, nu] * wval
 
-            # d-orbital two-center: Coulomb approximation using (ss|ss)
+            # d-orbital two-center: NDDO monopole Coulomb
+            # In NDDO, d-orbitals interact with other atoms through
+            # the monopole (ss|ss) integral only (diagonal approximation)
             if nA == 9 or nB == 9:
-                ssss = w[0, 0, 0, 0]  # (ss|ss) integral
-                # d-orbitals on A feel Coulomb from B's total charge
+                ssss = w[0, 0, 0, 0]  # monopole Coulomb integral
+
                 if nA == 9:
+                    # Coulomb: d on A from total density on B
                     PB_total = sum(P[sB + k, sB + k] for k in range(nB_sp))
                     for k in range(5):
-                        F[sA + 4 + k, sA + 4 + k] += PB_total * ssss * 0.8
-                # d-orbitals on B feel Coulomb from A's total charge
+                        F[sA + 4 + k, sA + 4 + k] += PB_total * ssss
+
+                    # Exchange: d on A with s on B (only ss type survives NDDO)
+                    if nB >= 1:
+                        for k in range(5):
+                            F[sA + 4 + k, sB] -= 0.5 * P[sA + 4 + k, sB] * ssss
+
                 if nB == 9:
                     PA_total = sum(P[sA + k, sA + k] for k in range(nA_sp))
                     for k in range(5):
-                        F[sB + 4 + k, sB + 4 + k] += PA_total * ssss * 0.8
+                        F[sB + 4 + k, sB + 4 + k] += PA_total * ssss
+
+                    if nA >= 1:
+                        for k in range(5):
+                            F[sB + 4 + k, sA] -= 0.5 * P[sB + 4 + k, sA] * ssss
 
     return F
 
@@ -418,8 +458,25 @@ def rm1_energy(
                 except np.linalg.LinAlgError:
                     pass  # fall back to un-extrapolated F
 
+        # Level shifting for d-orbital convergence
+        # Add shift to virtual orbitals to prevent oscillation
+        has_d = any(p.n_basis > 4 for p in params)
+        _delta = delta if iteration > 0 else 1.0
+        if has_d and iteration < 50 and _delta > 0.01:
+            level_shift = 2.0  # eV shift for virtual orbitals
+        else:
+            level_shift = 0.0
+
         # Diagonalize
         eigenvalues, C = np.linalg.eigh(F)
+
+        # Apply level shift to virtual orbitals (helps d-orbital convergence)
+        if level_shift > 0 and n_occ < n_basis:
+            for k in range(n_occ, n_basis):
+                eigenvalues[k] += level_shift
+            # Rebuild F with shifted eigenvalues
+            F_shifted = C @ np.diag(eigenvalues) @ C.T
+            eigenvalues, C = np.linalg.eigh(F_shifted)
 
         # Build new density matrix
         P_new = np.zeros((n_basis, n_basis))
@@ -437,12 +494,17 @@ def rm1_energy(
             P = P_new
             break
 
-        # Density mixing (only before DIIS kicks in)
-        if iteration < 2:
+        # Adaptive density mixing — always mix, stronger damping for d-orbitals
+        has_d = any(p.n_basis > 4 for p in params)
+        if iteration < 3:
+            mix = 0.3 if has_d else 0.5
+        elif delta > 0.1:
+            mix = 0.2 if has_d else 0.4  # heavy damping when oscillating
+        elif delta > 0.01:
             mix = 0.5
-            P = mix * P_new + (1.0 - mix) * P
         else:
-            P = P_new
+            mix = 0.8  # light damping near convergence
+        P = mix * P_new + (1.0 - mix) * P
 
     # Final Fock with converged density
     F = _fock(H, P)
