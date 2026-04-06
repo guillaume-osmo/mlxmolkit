@@ -24,6 +24,7 @@ from .integrals import (
 from .two_center_integrals import two_center_integrals
 from .rotation import rotate_integrals_to_molecular_frame
 from .overlap import overlap_molecular_frame
+from .overlap_d import overlap_d_molecular_frame
 
 
 def _build_basis_info(atoms: list[int], param_dict=None):
@@ -122,30 +123,15 @@ def _build_core_hamiltonian(atoms, coords, info):
             pA = params[i]
             pB = params[j]
 
-            # Overlap — sp block from overlap_molecular_frame, pad for d-orbitals
+            # Overlap — uses d-orbital overlap for PM6, sp overlap otherwise
             nA = pA.n_basis
             nB = pB.n_basis
-            nA_sp = min(nA, 4)
-            nB_sp = min(nB, 4)
 
-            # sp overlap (handles qnA/qnB swap internally)
-            S_sp = overlap_molecular_frame(pA, pB, coords[i], coords[j])
-
-            # Pad to full (nA, nB) if d-orbitals present
             if nA > 4 or nB > 4:
-                S_ij = np.zeros((nA, nB))
-                S_ij[:S_sp.shape[0], :S_sp.shape[1]] = S_sp
-                # d-d overlap (both atoms have d)
-                if nA == 9 and nB == 9 and pA.zeta_d > 0 and pB.zeta_d > 0:
-                    R = np.linalg.norm(coords[i] - coords[j])
-                    R_b = R * ANG_TO_BOHR
-                    rho = 0.5 * (pA.zeta_d + pB.zeta_d) * R_b
-                    if rho < 20:
-                        sd = np.exp(-rho) * (1.0 + rho + 0.4*rho**2)
-                        for k in range(5):
-                            S_ij[4+k, 4+k] = sd * max(0.5 - 0.1*k, 0.05)
+                # Full d-orbital overlap (proper Slater integrals)
+                S_ij = overlap_d_molecular_frame(pA, pB, coords[i], coords[j])
             else:
-                S_ij = S_sp
+                S_ij = overlap_molecular_frame(pA, pB, coords[i], coords[j])
 
             for mu_off in range(nA):
                 mu = starts[i] + mu_off
@@ -219,7 +205,20 @@ def _build_fock(H, P, info, atoms, coords):
         s = idx[0]
         Pss = P[s, s]
 
-        if p.n_basis == 1:
+        if p.n_basis == 9 and getattr(p, 'has_d', False) and len(idx) >= 9:
+            # PM6 d-orbital atom: use W integrals for FULL 9×9 one-center
+            # W integrals encode ALL one-center two-electron physics (sp + d)
+            from .w_integrals import compute_w_integrals
+            from .fock_d import fock_d_one_center
+            qn_sp = 3 if p.Z > 10 else 2
+            W = compute_w_integrals(
+                p.zeta_s, p.zeta_p, p.zeta_d,
+                qn_sp, 3,
+                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
+            )
+            F = fock_d_one_center(F, P, W, starts[i], n_basis=9)
+
+        elif p.n_basis == 1:
             F[s, s] += Pss * p.gss * 0.5
         else:
             px, py, pz = idx[1], idx[2], idx[3]
@@ -227,7 +226,6 @@ def _build_fock(H, P, info, atoms, coords):
 
             F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
 
-            # PYSEQM-verified one-center factors (fock.py _one_center):
             sp_fac_1 = p.gsp - 0.5 * p.hsp
             sp_fac_2 = 1.5 * p.hsp - 0.5 * p.gsp
             pp_fac_d = 1.25 * p.gp2 - 0.25 * p.gpp
@@ -249,22 +247,6 @@ def _build_fock(H, P, info, atoms, coords):
                     pk, pl = idx[k], idx[l]
                     F[pk, pl] += P[pk, pl] * pp_fac_off
                     F[pl, pk] += P[pl, pk] * pp_fac_off
-
-            # d-orbital one-center (PM6 with has_d)
-            if p.n_basis == 9 and len(idx) >= 9:
-                Pdd_total = sum(P[idx[4+k], idx[4+k]] for k in range(5))
-                # d-d self-interaction (simplified: F0SD=G2SD=0 for main-group)
-                gdd = 0.3 * p.gss  # approximate d-d repulsion
-                for k in range(5):
-                    dk = idx[4 + k]
-                    F[dk, dk] += (P[dk, dk] * gdd * 0.5
-                                  + Pss * (p.gsp - 0.5 * p.hsp) * 0.5
-                                  + Ppp_total * pp_fac_d * 0.5)
-                # s-d cross terms
-                for k in range(5):
-                    dk = idx[4 + k]
-                    F[s, dk] += P[s, dk] * sp_fac_2 * 0.3
-                    F[dk, s] += P[dk, s] * sp_fac_2 * 0.3
 
     # === Two-center contribution with proper rotation ===
     for i in range(n_atoms):
