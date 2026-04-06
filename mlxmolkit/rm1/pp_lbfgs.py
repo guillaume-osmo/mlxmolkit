@@ -252,29 +252,22 @@ class PPLBFGSOptimizer:
         return grad_rms
 
     def _compute_direction(self) -> np.ndarray:
-        """L-BFGS direction with sparse Hessian preconditioning."""
+        """L-BFGS direction with sparse Hessian preconditioning.
+
+        Exact port of Cuby4 PP-LBFGS direction() method:
+        1. Forward L-BFGS loop: compute alphas
+        2. Solve sparse preconditioned system: (H0 + beta*I) * z = q
+        3. Increase beta until direction is descent (angle < 90°)
+        4. Backward L-BFGS loop: apply corrections
+        """
         g = self.gradient
         m = min(len(self.old_grads) - 1, self.lbfgs_n) if self.old_grads else 0
 
-        if m == 0:
-            # First step: use preconditioned steepest descent
-            H0_csr = csr_matrix(self.H0)
-            # Add diagonal regularization (beta * I)
-            beta = 1.0 / 5000.0  # initial Hessian diagonal estimate
-            H0_reg = H0_csr + beta * csr_matrix(np.eye(self.n_vars))
-            try:
-                z = spsolve(H0_reg, g)
-            except Exception:
-                z = g / 5000.0
-            return -z
-
-        # L-BFGS two-loop recursion with sparse preconditioning
+        # Forward L-BFGS loop
         q = g.copy()
         s_list, y_list, rho_list, alpha_list = [], [], [], []
 
-        for i in range(1, m + 1):
-            if i >= len(self.old_vecs):
-                break
+        for i in range(1, min(m + 1, len(self.old_vecs))):
             s = self.old_vecs[i-1] - self.old_vecs[i]
             y = self.old_grads[i-1] - self.old_grads[i]
             sy = y.dot(s)
@@ -288,31 +281,41 @@ class PPLBFGSOptimizer:
             rho_list.append(rho)
             alpha_list.append(alpha)
 
-        # Preconditioning: solve H0 * z = q
-        if self.cycle > 0:
-            s_last = self.old_vecs[0] - self.old_vecs[1] if len(self.old_vecs) > 1 else np.ones(self.n_vars)
-            y_last = self.old_grads[0] - self.old_grads[1] if len(self.old_grads) > 1 else np.ones(self.n_vars)
+        # Compute beta_I (non-bonded Hessian approximation)
+        if self.cycle > 0 and len(self.old_vecs) > 1:
+            s_last = self.old_vecs[0] - self.old_vecs[1]
+            y_last = self.old_grads[0] - self.old_grads[1]
             h0_s = self.H0 @ s_last
             beta_I = np.linalg.norm(y_last - h0_s) / (np.linalg.norm(s_last) + 1e-30)
         else:
-            beta_I = 1.0 / 5000.0
+            beta_I = 0.0002  # Default from Cuby4: 0.0002 Å/kcal·mol
 
+        # Solve (H0 + beta*I) * z = q with increasing beta until descent
         H0_csr = csr_matrix(self.H0)
-        H0_reg = H0_csr.copy()
-        # Add beta*I to diagonal
-        for i in range(self.n_vars):
-            H0_reg[i, i] += beta_I
+        for attempt in range(10):
+            H0_reg = H0_csr.copy()
+            diag = np.zeros(self.n_vars)
+            diag[:] = beta_I
+            H0_reg += csr_matrix(np.diag(diag))
 
-        try:
-            z = spsolve(csr_matrix(H0_reg), q)
-        except Exception:
-            z = q * beta_I
+            try:
+                z = spsolve(H0_reg, q)
+            except Exception:
+                z = q * (1.0 / (beta_I + 1e-30))
+                break
 
-        # Check direction is descent
-        if z.dot(g) < 0:
-            z = q * beta_I  # Fallback to scaled gradient
+            # Check angle between z and gradient (must be < 90° for descent)
+            z_norm = np.linalg.norm(z)
+            g_norm = np.linalg.norm(g)
+            if z_norm < 1e-30 or g_norm < 1e-30:
+                break
+            cos_angle = z.dot(g) / (z_norm * g_norm)
+            if cos_angle > 0:  # Descent direction (z and g point same way → -z is descent)
+                break
+            # Not descent: increase beta (make more like steepest descent)
+            beta_I *= 1.602  # Cuby4 scaling factor
 
-        # Second loop
+        # Backward L-BFGS loop
         for i in range(len(s_list) - 1, -1, -1):
             beta = rho_list[i] * y_list[i].dot(z)
             z += s_list[i] * (alpha_list[i] - beta)
