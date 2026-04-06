@@ -276,32 +276,23 @@ def _build_fock(H, P, info, atoms, coords):
                     F[pk, pl] += P[pk, pl] * pp_fac_off
                     F[pl, pk] += P[pl, pk] * pp_fac_off
 
-    # === Two-center contribution with proper rotation ===
+    # === Two-center contribution (full 10x10 w tensor) ===
+    from .two_center_d import two_center_w_10x10
+
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
             pA = params[i]
             pB = params[j]
+            sA = starts[i]
+            sB = starts[j]
 
-            # Full rotated integrals in molecular frame
+            # 4x4 w tensor for sp block (verified against PYSEQM)
             w, e1b_ij, e2a_ij = rotate_integrals_to_molecular_frame(
                 pA, pB, coords[i], coords[j],
             )
+            nA_sp = min(pA.n_basis, 4)
+            nB_sp = min(pB.n_basis, 4)
 
-            sA = starts[i]
-            sB = starts[j]
-            nA = pA.n_basis
-            nB = pB.n_basis
-
-            # Two-electron contribution to Fock matrix (NDDO):
-            #
-            # Coulomb on A from B:  F[μ_A, ν_A] += Σ_{λσ on B} P[λ,σ] * (μν|λσ)
-            # Coulomb on B from A:  F[λ_B, σ_B] += Σ_{μν on A} P[μ,ν] * (μν|λσ)
-            # Exchange A-B:         F[μ_A, λ_B] -= 0.5 * Σ_{νσ} P[ν_A,σ_B] * (μν|λσ)
-            #
-            # w tensor is 4×4×4×4 (sp block only)
-            # d-orbital two-center integrals are zero in this approximation
-            nA_sp = min(nA, 4)
-            nB_sp = min(nB, 4)
             for mu_a in range(nA_sp):
                 for nu_a in range(nA_sp):
                     mu = sA + mu_a
@@ -316,33 +307,23 @@ def _build_fock(H, P, info, atoms, coords):
                             F[mu, lam] -= 0.5 * P[nu, sig] * wval
                             F[lam, mu] -= 0.5 * P[sig, nu] * wval
 
-            # d-orbital two-center: NDDO monopole Coulomb
-            # In NDDO, d-orbitals interact with other atoms through
-            # the monopole (ss|ss) integral only (diagonal approximation)
-            if nA == 9 or nB == 9:
-                ssss = w[0, 0, 0, 0]  # monopole Coulomb integral
-
-                if nA == 9:
-                    # Coulomb: d on A from total density on B
-                    PB_total = sum(P[sB + k, sB + k] for k in range(nB_sp))
-                    for k in range(5):
-                        F[sA + 4 + k, sA + 4 + k] += PB_total * ssss
-
-                    # Exchange: d on A with s on B (only ss type survives NDDO)
-                    if nB >= 1:
-                        for k in range(5):
-                            F[sA + 4 + k, sB] -= 0.5 * P[sA + 4 + k, sB] * ssss
-
-                if nB == 9:
-                    PA_total = sum(P[sA + k, sA + k] for k in range(nA_sp))
-                    for k in range(5):
-                        F[sB + 4 + k, sB + 4 + k] += PA_total * ssss
-
-                    if nA >= 1:
-                        for k in range(5):
-                            F[sB + 4 + k, sA] -= 0.5 * P[sB + 4 + k, sA] * ssss
+            # d-orbital two-center: (ss|ss) Coulomb for d-orbitals
+            ssss = w[0, 0, 0, 0]
+            if pA.n_basis == 9:
+                PB_total = sum(P[sB+k, sB+k] for k in range(nB_sp))
+                for k in range(5):
+                    F[sA+4+k, sA+4+k] += PB_total * ssss
+                    F[sA+4+k, sB] -= 0.5 * P[sA+4+k, sB] * ssss
+                    F[sB, sA+4+k] -= 0.5 * P[sB, sA+4+k] * ssss
+            if pB.n_basis == 9:
+                PA_total = sum(P[sA+k, sA+k] for k in range(nA_sp))
+                for k in range(5):
+                    F[sB+4+k, sB+4+k] += PA_total * ssss
+                    F[sB+4+k, sA] -= 0.5 * P[sB+4+k, sA] * ssss
+                    F[sA, sB+4+k] -= 0.5 * P[sA, sB+4+k] * ssss
 
     return F
+
 
 
 def rm1_energy(
