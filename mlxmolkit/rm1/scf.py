@@ -483,8 +483,12 @@ def rm1_energy(
     # Electronic energy
     E_elec = 0.5 * np.sum(P * (H + F))
 
-    # Nuclear repulsion
-    E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
+    # Nuclear repulsion — PM6 uses PWCCT, others use AM1-style
+    if method in ('PM6', 'PM6_SP'):
+        from .pwcct import pm6_nuclear_repulsion
+        E_nuc = pm6_nuclear_repulsion(atoms, coords, PARAMS)
+    else:
+        E_nuc = compute_nuclear_repulsion(atoms, coords, param_dict=PARAMS)
 
     # Total energy
     E_total = E_elec + E_nuc

@@ -429,8 +429,9 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'RM1': RM1_PARAMS,
     'AM1': AM1_PARAMS,
     'PM3': PM3_PARAMS,
-    'PM6': PM6_FULL_PARAMS,      # Full PM6 with d-orbitals (9 basis)
-    'PM6_SP': PM6_SP_PARAMS,     # PM6 sp-only (4 basis, no d)
+    'PM6': PM6_SP_PARAMS,        # PM6 (sp-only, matches PYSEQM/MOPAC)
+    'PM6_SP': PM6_SP_PARAMS,     # PM6 sp-only (alias)
+    'PM6_D': PM6_FULL_PARAMS,    # PM6 with d-orbitals (experimental)
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }
