@@ -307,59 +307,10 @@ def _build_fock(H, P, info, atoms, coords):
                             F[mu, lam] -= 0.5 * P[nu, sig] * wval
                             F[lam, mu] -= 0.5 * P[sig, nu] * wval
 
-            # d-orbital two-center with proper rho-based Coulomb
+            # d-orbital two-center: proper rho3-6 based multipole integrals
             if pA.n_basis == 9 or pB.n_basis == 9:
-                from .d_charge_sep import compute_d_charge_separations
-                R_bohr = np.linalg.norm(coords[i] - coords[j]) * ANG_TO_BOHR
-
-                dA = compute_d_charge_separations(pA) if pA.n_basis == 9 else \
-                     {'rho3': 0, 'rho4': 0, 'rho5': 0, 'rho6': 0}
-                dB = compute_d_charge_separations(pB) if pB.n_basis == 9 else \
-                     {'rho3': 0, 'rho4': 0, 'rho5': 0, 'rho6': 0}
-
-                # sp additive terms
-                da_sp, qa_sp, rho0A, rho1A, rho2A = _compute_multipole_params(pA)
-                db_sp, qb_sp, rho0B, rho1B, rho2B = _compute_multipole_params(pB)
-
-                # d-d Coulomb: ev / sqrt(R² + (rho3A + rho3B)²)
-                # This is the d-orbital monopole repulsion
-                rho3A, rho3B = dA['rho3'], dB['rho3']
-                if rho3A > 0 or rho3B > 0:
-                    dd_coulomb = EV / np.sqrt(R_bohr**2 + (rho3A + rho3B)**2)
-                else:
-                    dd_coulomb = w[0, 0, 0, 0]  # fallback to ssss
-
-                # d-s Coulomb: ev / sqrt(R² + (rho3A + rho0B)²) for d on A, s on B
-                ds_coulomb_AB = EV / np.sqrt(R_bohr**2 + (rho3A + rho0B)**2) if rho3A > 0 else w[0,0,0,0]
-                ds_coulomb_BA = EV / np.sqrt(R_bohr**2 + (rho0A + rho3B)**2) if rho3B > 0 else w[0,0,0,0]
-
-                # Coulomb: d on A from ALL density on B (s, p, and d)
-                if pA.n_basis == 9:
-                    # B's s density
-                    PBs = P[sB, sB]
-                    # B's p density
-                    PBp = sum(P[sB+k, sB+k] for k in range(1, nB_sp))
-                    # B's d density (if B has d)
-                    PBd = sum(P[sB+4+k, sB+4+k] for k in range(5)) if pB.n_basis == 9 else 0
-                    PB_all = PBs + PBp + PBd
-
-                    for k in range(5):
-                        # Full Coulomb from ALL of B's density
-                        F[sA+4+k, sA+4+k] += PB_all * ds_coulomb_AB
-                        # Exchange: d on A with s on B
-                        F[sA+4+k, sB] -= 0.5 * P[sA+4+k, sB] * ds_coulomb_AB
-                        F[sB, sA+4+k] -= 0.5 * P[sB, sA+4+k] * ds_coulomb_AB
-
-                if pB.n_basis == 9:
-                    PAs = P[sA, sA]
-                    PAp = sum(P[sA+k, sA+k] for k in range(1, nA_sp))
-                    PAd = sum(P[sA+4+k, sA+4+k] for k in range(5)) if pA.n_basis == 9 else 0
-                    PA_all = PAs + PAp + PAd
-
-                    for k in range(5):
-                        F[sB+4+k, sB+4+k] += PA_all * ds_coulomb_BA
-                        F[sB+4+k, sA] -= 0.5 * P[sB+4+k, sA] * ds_coulomb_BA
-                        F[sA, sB+4+k] -= 0.5 * P[sA, sB+4+k] * ds_coulomb_BA
+                from .d_two_center import d_two_center_fock
+                F = d_two_center_fock(F, P, pA, pB, sA, sB, coords[i], coords[j])
 
     return F
 
