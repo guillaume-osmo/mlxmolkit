@@ -127,48 +127,101 @@ def d_two_center_fock(
 ) -> np.ndarray:
     """Add d-orbital two-center contributions to Fock matrix.
 
-    Uses proper rho3-rho6 based Coulomb integrals for d-orbital
-    interactions with all orbital types on the other atom.
+    For YY pairs (both have d): uses full 2025 riYY integrals.
+    For YX/XY pairs: uses monopole Coulomb approximation.
     """
+    from .yy_integrals import compute_yy_integrals
+
     R = np.linalg.norm(coordB - coordA)
     R_bohr = R * ANG_TO_BOHR
     nA_sp = min(pA.n_basis, 4)
     nB_sp = min(pB.n_basis, 4)
 
+    # YY case: both atoms have d-orbitals → full 2025 integrals
+    if pA.n_basis == 9 and pB.n_basis == 9:
+        da_A, qa_A, rho0A, rho1A, rho2A = _compute_multipole_params(pA)
+        da_B, qa_B, rho0B, rho1B, rho2B = _compute_multipole_params(pB)
+        dA = compute_d_charge_separations(pA)
+        dB = compute_d_charge_separations(pB)
+
+        riYY = compute_yy_integrals(
+            R_bohr, da_A, da_B, qa_A, qa_B,
+            dA['dp'], dB['dp'], dA['ds'], dB['ds'],
+            dA['dorbdorb'], dB['dorbdorb'],
+            rho0A, rho0B, rho1A, rho1B, rho2A, rho2B,
+            dA['rho3'], dB['rho3'], dA['rho4'], dB['rho4'],
+            dA['rho5'], dB['rho5'], dA['rho6'], dB['rho6'],
+        )
+
+        # The 2025 riYY are indexed as 45×45 packed (9-orbital lower triangle)
+        # Pack: (0,0)=0, (1,0)=1, (1,1)=2, ..., (8,8)=44
+        # riYY[(i*(i+1)/2+j) * 45 + (k*(k+1)/2+l)] = (ij|kl) where i>=j, k>=l
+
+        # Apply to Fock: Coulomb + Exchange for the full 9×9 basis
+        for i_bra in range(45):
+            # Unpack (i_bra) → (mu, nu) where mu >= nu
+            mu_off = 0
+            for m in range(9):
+                if m * (m + 1) // 2 + 0 <= i_bra <= m * (m + 1) // 2 + m:
+                    mu_off = m
+                    nu_off = i_bra - m * (m + 1) // 2
+                    break
+
+            mu = sA + mu_off
+            nu = sA + nu_off
+
+            for i_ket in range(45):
+                wval = riYY[i_bra * 45 + i_ket]
+                if abs(wval) < 1e-12:
+                    continue
+
+                # Unpack i_ket → (lam, sig) where lam >= sig
+                lam_off = 0
+                for m in range(9):
+                    if m * (m + 1) // 2 + 0 <= i_ket <= m * (m + 1) // 2 + m:
+                        lam_off = m
+                        sig_off = i_ket - m * (m + 1) // 2
+                        break
+
+                lam = sB + lam_off
+                sig = sB + sig_off
+
+                # Coulomb
+                F[mu, nu] += P[lam, sig] * wval
+                if lam_off != sig_off:
+                    F[mu, nu] += P[sig, lam] * wval
+                if mu_off != nu_off:
+                    F[nu, mu] += P[lam, sig] * wval
+                    if lam_off != sig_off:
+                        F[nu, mu] += P[sig, lam] * wval
+
+                F[lam, sig] += P[mu, nu] * wval
+                if mu_off != nu_off:
+                    F[lam, sig] += P[nu, mu] * wval
+                if lam_off != sig_off:
+                    F[sig, lam] += P[mu, nu] * wval
+                    if mu_off != nu_off:
+                        F[sig, lam] += P[nu, mu] * wval
+
+                # Exchange
+                F[mu, lam] -= 0.5 * P[nu, sig] * wval
+                F[lam, mu] -= 0.5 * P[sig, nu] * wval
+        return F
+
+    # YX/XY case: one has d, other doesn't → monopole Coulomb
     d_int = compute_d_two_center(pA, pB, R_bohr)
 
-    # d on A ← density on B
     if pA.n_basis == 9:
-        # Total density on B: s + p + d
-        PBs = P[sB, sB]
-        PBp = sum(P[sB+k, sB+k] for k in range(1, nB_sp))
-        PBd = sum(P[sB+4+k, sB+4+k] for k in range(5)) if pB.n_basis == 9 else 0
-
-        # Coulomb: d on A from s on B → (dd|ss)
+        PB_total = sum(P[sB+k, sB+k] for k in range(nB_sp))
         for k in range(5):
-            F[sA+4+k, sA+4+k] += PBs * d_int['dd_ss']
-            F[sA+4+k, sA+4+k] += PBp * d_int['dd_pp_sigma']
-            if pB.n_basis == 9:
-                F[sA+4+k, sA+4+k] += PBd * d_int['dd_dd']
-
-        # Exchange: d on A with s on B
-        for k in range(5):
+            F[sA+4+k, sA+4+k] += PB_total * d_int['dd_ss']
             F[sA+4+k, sB] -= 0.5 * P[sA+4+k, sB] * d_int['dd_ss']
             F[sB, sA+4+k] -= 0.5 * P[sB, sA+4+k] * d_int['dd_ss']
 
-    # d on B ← density on A
     if pB.n_basis == 9:
-        PAs = P[sA, sA]
-        PAp = sum(P[sA+k, sA+k] for k in range(1, nA_sp))
-        PAd = sum(P[sA+4+k, sA+4+k] for k in range(5)) if pA.n_basis == 9 else 0
-
+        PA_total = sum(P[sA+k, sA+k] for k in range(nA_sp))
         for k in range(5):
-            F[sB+4+k, sB+4+k] += PAs * d_int['ss_dd']
-            F[sB+4+k, sB+4+k] += PAp * d_int['pp_dd_sigma']
-            if pA.n_basis == 9:
-                F[sB+4+k, sB+4+k] += PAd * d_int['dd_dd']
-
-        for k in range(5):
+            F[sB+4+k, sB+4+k] += PA_total * d_int['ss_dd']
             F[sB+4+k, sA] -= 0.5 * P[sB+4+k, sA] * d_int['ss_dd']
             F[sA, sB+4+k] -= 0.5 * P[sA, sB+4+k] * d_int['ss_dd']
 
