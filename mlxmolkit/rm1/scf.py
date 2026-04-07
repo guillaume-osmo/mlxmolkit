@@ -363,8 +363,11 @@ def rm1_energy(
     # Core Hamiltonian
     H = _build_core_hamiltonian(atoms, coords, info)
 
-    # Initial density: zero
+    # Initial density: core Hamiltonian eigendecomposition (much better than P=0)
+    eigvals0, C0 = np.linalg.eigh(H)
     P = np.zeros((n_basis, n_basis))
+    for k in range(n_occ):
+        P += 2.0 * np.outer(C0[:, k], C0[:, k])
 
     # Prepare Metal Fock kernel inputs (precompute once)
     if use_metal:
@@ -386,96 +389,67 @@ def rm1_energy(
             )
         return _build_fock(H, P, info, atoms, coords)
 
-    # DIIS (Direct Inversion in the Iterative Subspace) storage
-    diis_max = 6
-    diis_F_list = []  # stored Fock matrices
-    diis_e_list = []  # stored error vectors (FPS - SPF)
+    # ──────────────────────────────────────────────────────────────────
+    # SCF as fixed-point problem: x_{k+1} = G(x_k)
+    # where x = density P, G = build_fock → diag → build_density
+    # Accelerated with portable SCFMixer (Anderson/Pulay/DIIS)
+    # ──────────────────────────────────────────────────────────────────
+    from ..solvers.mixer import SCFMixer, MixerConfig
 
-    # SCF loop
+    has_d = any(p.n_basis > 4 for p in params)
+    mixer = SCFMixer(MixerConfig(
+        method="anderson",
+        beta=0.5 if has_d else 0.7,
+        history_size=8,
+        pulay_period=2,
+        start_after=2,
+        ridge=1e-10,
+        max_step_factor=3.0,
+        restart_threshold=2.0,
+        symmetrize=True,
+    ))
+
+    delta = 1.0
     converged = False
     for iteration in range(max_iter):
-        # Build Fock matrix
+        # ── SCF map G(P): Fock → diag → density ──
         F = _fock(H, P)
 
-        # DIIS extrapolation (after first few iterations)
-        if iteration >= 2:
-            # Error vector: e = F @ P - P @ F (commutator, should be zero at convergence)
-            e = F @ P - P @ F
-            diis_F_list.append(F.copy())
-            diis_e_list.append(e.copy())
-
-            # Keep only last diis_max entries
-            if len(diis_F_list) > diis_max:
-                diis_F_list.pop(0)
-                diis_e_list.pop(0)
-
-            nd = len(diis_F_list)
-            if nd >= 2:
-                # Build DIIS B matrix: B[i,j] = Tr(e_i @ e_j)
-                B = np.zeros((nd + 1, nd + 1))
-                for i in range(nd):
-                    for j in range(nd):
-                        B[i, j] = np.sum(diis_e_list[i] * diis_e_list[j])
-                B[nd, :nd] = -1.0
-                B[:nd, nd] = -1.0
-                B[nd, nd] = 0.0
-
-                rhs = np.zeros(nd + 1)
-                rhs[nd] = -1.0
-
-                try:
-                    coeffs = np.linalg.solve(B, rhs)
-                    F = sum(coeffs[i] * diis_F_list[i] for i in range(nd))
-                except np.linalg.LinAlgError:
-                    pass  # fall back to un-extrapolated F
-
-        # Level shifting for d-orbital convergence
-        # Add shift to virtual orbitals to prevent oscillation
-        has_d = any(p.n_basis > 4 for p in params)
-        _delta = delta if iteration > 0 else 1.0
-        if has_d and iteration < 50 and _delta > 0.01:
-            level_shift = 2.0  # eV shift for virtual orbitals
+        # Adaptive level shifting for d-orbitals (gradual reduction)
+        if has_d and iteration < 60:
+            shift_scale = min(1.0, max(0.0, delta / 0.01))
+            level_shift = 2.0 * shift_scale
         else:
             level_shift = 0.0
 
-        # Diagonalize
         eigenvalues, C = np.linalg.eigh(F)
 
-        # Apply level shift to virtual orbitals (helps d-orbital convergence)
         if level_shift > 0 and n_occ < n_basis:
             for k in range(n_occ, n_basis):
                 eigenvalues[k] += level_shift
-            # Rebuild F with shifted eigenvalues
             F_shifted = C @ np.diag(eigenvalues) @ C.T
             eigenvalues, C = np.linalg.eigh(F_shifted)
 
-        # Build new density matrix
         P_new = np.zeros((n_basis, n_basis))
         for k in range(n_occ):
             P_new += 2.0 * np.outer(C[:, k], C[:, k])
 
-        # Check convergence
-        delta = np.sqrt(np.mean((P_new - P) ** 2))
+        # ── Mixer: accelerated update of P ──
+        P_mixed, mix_info = mixer.step(P, P_new)
+        delta = mix_info["rnorm"]
+
         if verbose:
+            tag = f" [{mix_info['method_used']}]" if mix_info['method_used'] != 'linear' else ''
+            restart = ' RESTART' if mix_info.get('restarted') else ''
             E_elec = 0.5 * np.sum(P_new * (H + F))
-            print(f"  iter {iteration:3d}: dP={delta:.2e}, E_elec={E_elec:.6f} eV")
+            print(f"  iter {iteration:3d}: dP={delta:.2e}, E_elec={E_elec:.6f} eV{tag}{restart}")
 
         if delta < conv_tol:
             converged = True
-            P = P_new
+            P = P_new  # use unmixed converged density
             break
 
-        # Adaptive density mixing — always mix, stronger damping for d-orbitals
-        has_d = any(p.n_basis > 4 for p in params)
-        if iteration < 3:
-            mix = 0.3 if has_d else 0.5
-        elif delta > 0.1:
-            mix = 0.2 if has_d else 0.4  # heavy damping when oscillating
-        elif delta > 0.01:
-            mix = 0.5
-        else:
-            mix = 0.8  # light damping near convergence
-        P = mix * P_new + (1.0 - mix) * P
+        P = P_mixed
 
     # Final Fock with converged density
     F = _fock(H, P)
