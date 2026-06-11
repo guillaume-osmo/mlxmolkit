@@ -421,3 +421,39 @@ class TestFullPipeline:
         assert result.n_batches >= 2
         for m in result.molecules:
             assert len(m.positions_3d) == 4
+
+    def test_run_mmff_with_embed_failing_molecule(self):
+        """run_mmff=True must not crash when a molecule fails RDKit embedding.
+
+        Regression: the MMFF param-extraction pass embedded each mol via
+        AllChem.EmbedMolecule and then called mol.GetConformer(0). For molecules
+        whose single-seed embedding fails (e.g. the strained polyyne below) the mol
+        stayed conformer-less and GetConformer(0) raised "Bad Conformer Id", killing
+        the whole batch. The pipeline already has GPU coords, so it now builds an
+        empty conformer to hold them instead of embedding.
+        """
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        from mlxmolkit.conformer_pipeline_v2 import generate_conformers_nk
+
+        bad = "C1#CC#CC#CC#CC1"   # single-seed ETKDG embedding fails for this one
+        m = Chem.AddHs(Chem.MolFromSmiles(bad))
+        assert AllChem.EmbedMolecule(m, randomSeed=42) == -1, "test molecule must fail embedding"
+
+        result = generate_conformers_nk(
+            smiles_list=["CCO", bad, "c1ccccc1"],
+            n_confs_per_mol=2,
+            dg_max_iters=300,
+            etk_max_iters=150,
+            run_mmff=True,
+            mmff_max_iters=200,
+        )
+        assert result.total_conformers == 6
+        for mol_res in result.molecules:
+            assert len(mol_res.positions_3d) == 2
+            for p in mol_res.positions_3d:
+                assert np.all(np.isfinite(p))

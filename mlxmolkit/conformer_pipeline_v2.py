@@ -282,7 +282,7 @@ def _process_chunk(
     # ---- Stage 4: MMFF94 optimization (3D) ----
     mmff_e = np.zeros(C, dtype=np.float32)
     if run_mmff and mols_list is not None:
-        from rdkit.Chem import AllChem
+        from rdkit import Chem
         chunk_mmff = []
         # Use first conformer of each molecule for MMFF param extraction
         conf_cursor = 0
@@ -291,8 +291,13 @@ def _process_chunk(
             n_a = dg_params_list[mol_idx].n_atoms
             s3 = int(batch3.conf_atom_starts[conf_cursor]) * 3
             conf_pos = pos3[s3:s3 + n_a * 3].reshape(n_a, 3)
+            # The mol carries no conformer (built via AddHs(MolFromSmiles)); we only
+            # need a conformer object to hold the GPU-produced coords (set just below).
+            # Build an empty one rather than embedding: AllChem.EmbedMolecule can fail
+            # and leave the mol conformer-less, which made GetConformer(0) raise
+            # "Bad Conformer Id" and killed the whole batch.
             if mol.GetNumConformers() == 0:
-                AllChem.EmbedMolecule(mol, randomSeed=42)
+                mol.AddConformer(Chem.Conformer(mol.GetNumAtoms()), assignId=True)
             conf = mol.GetConformer(0)
             for a_idx in range(n_a):
                 conf.SetAtomPosition(a_idx, conf_pos[a_idx].astype(float).tolist())
