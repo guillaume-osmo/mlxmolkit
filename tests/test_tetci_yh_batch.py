@@ -91,3 +91,27 @@ def test_the_block_is_symmetric():
 def test_an_empty_pair_list_is_allowed():
     """An sp-only batch reaches this with nothing to do."""
     assert yh_e1b_batch([], []).shape == (0, 9, 9)
+
+
+def test_poij_deduplication_matches_the_per_element_search():
+    """POIJ's golden-section search is deduplicated; it must not change answers.
+
+    The search depends only on (L, d^2, fg) — element parameters, never on
+    geometry — so `POIJ` now solves each distinct pair once and indexes the
+    result back. This re-runs the original per-element loop directly and
+    compares, including the fg == 0 branch that zeroes the result and the
+    repeated values the deduplication collapses.
+    """
+    from mlxmolkit.nddo._pyseqm_port.cal_par_np import POIJ, _poij_one
+
+    rng = np.random.default_rng(3)
+    for L in (1, 2):
+        d = np.abs(rng.normal(size=40)) + 0.05
+        fg = np.abs(rng.normal(size=40)) + 0.01
+        d[:8] = d[0]                       # duplicates: what dedup collapses
+        fg[:8] = fg[0]
+        fg[9] = 0.0                        # the zeroing branch
+        got = POIJ(L, d, fg)
+        want = np.array([_poij_one(L, float(a * a), float(b)) for a, b in zip(d, fg)])
+        assert np.array_equal(got, want)
+        assert got[9] == 0.0

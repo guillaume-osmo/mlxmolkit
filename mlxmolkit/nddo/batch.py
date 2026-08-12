@@ -284,17 +284,29 @@ def prepare_batch(
     # Only the direction whose *first* atom carries d orbitals takes that path.
     from .tetci_yh import yh_e1b_batch
     _att_keys, _att_pp, _att_pc = [], [], []
+    # The other direction of a mixed pair — the sp atom seen by the d atom's
+    # nucleus — took the scalar sp rotation instead, 5000 calls and the largest
+    # cost left once the d side was batched. It is the same rotate_pairs the
+    # sp-only path already uses, and e1b is a slice of what it returns.
+    _sp_att_keys, _sp_att_params, _sp_att_coords = [], [], []
     for (mol_idx, i, j), (pA, pB, rA, rB) in zip(_d_keys, _d_specs):
-        if pA.n_basis == 9:
-            _att_keys.append((mol_idx, i, j, 0))
-            _att_pp.append((pA, pB))
-            _att_pc.append((rA, rB))
-        if pB.n_basis == 9:
-            _att_keys.append((mol_idx, i, j, 1))
-            _att_pp.append((pB, pA))
-            _att_pc.append((rB, rA))
+        for slot, (pX, pY, rX, rY) in enumerate(((pA, pB, rA, rB), (pB, pA, rB, rA))):
+            if pX.n_basis == 9:
+                _att_keys.append((mol_idx, i, j, slot))
+                _att_pp.append((pX, pY))
+                _att_pc.append((rX, rY))
+            else:
+                _sp_att_keys.append((mol_idx, i, j, slot))
+                _sp_att_params.append((pX, pY))
+                _sp_att_coords.append((rX, rY))
     pair_attraction = (dict(zip(_att_keys, yh_e1b_batch(_att_pp, _att_pc)))
                        if _att_keys else {})
+    if _sp_att_keys:
+        _w = rotate_pairs(_sp_att_params, _sp_att_coords)
+        for k, key in enumerate(_sp_att_keys):
+            nX = _sp_att_params[k][0].n_basis
+            pair_attraction[key] = (
+                -float(_sp_att_params[k][1].n_valence) * _w[k][:nX, :nX, 0, 0])
 
     # Resonance overlaps for the sp pairs, which are the bulk of any organic
     # batch. overlap_pairs routes anything its table does not cover — d
