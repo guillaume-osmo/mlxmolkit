@@ -302,16 +302,59 @@ def nddo_optimize_batch(
     return results
 
 
+def _optimize_result(result, coords, energy, grad, g_rms, converged, n_iter, method):
+    """Assemble nddo_optimize's return dict.
+
+    The SCF `result` is merged **first** so the optimizer's own keys win. It
+    used to be splatted last, which let the SCF's `converged`, `n_iter` and
+    `method` overwrite the optimizer's — so a geometry optimization that ran
+    out of iterations still reported `converged=True`, because that was the
+    SCF's flag for the final single-point. The SCF's values are kept under
+    `scf_*` rather than dropped.
+
+    `converged`/`n_iter` describe the **optimization**, which is what a caller
+    of a function named `optimize` means by them. `opt_converged`/`opt_n_iter`
+    are retained as explicit aliases.
+    """
+    out = {k: v for k, v in result.items() if k != 'coords'}
+    if 'converged' in out:
+        out['scf_converged'] = out['converged']
+    if 'n_iter' in out:
+        out['scf_n_iter'] = out['n_iter']
+    out.update(
+        coords=coords,
+        energy_eV=energy,
+        heat_of_formation_kcal=result['heat_of_formation_kcal'],
+        gradient=grad,
+        grad_rms=g_rms,
+        converged=converged,
+        opt_converged=converged,
+        n_iter=n_iter,
+        opt_n_iter=n_iter,
+        method=method,
+    )
+    return out
+
+
 def nddo_optimize(
     atoms: list[int],
     coords: np.ndarray,
-    max_iter: int = 50,
+    # 200, not 50. The loop returns as soon as g_rms < grad_tol, so this is a
+    # bound on the work rather than a cost: chlorobenzene still exits at 16.
+    # At 50, menthol ran out of iterations at g_rms=0.014 — 3x the tolerance —
+    # while its energy was still falling, and then reported success because of
+    # the key collision above. It converges at 94. See #28.
+    max_iter: int = 200,
     grad_tol: float = 0.005,
     method: str = 'RM1',
     verbose: bool = False,
     molecular_charge: float = 0.0,
 ) -> dict:
-    """L-BFGS geometry optimization using analytical gradient."""
+    """L-BFGS geometry optimization using analytical gradient.
+
+    Returns a dict whose `converged` and `n_iter` refer to the geometry
+    optimization; the SCF's own values are under `scf_converged`/`scf_n_iter`.
+    """
     from .anal_grad import analytical_gradient
 
     coords = np.asarray(coords, dtype=np.float64).copy()
@@ -336,13 +379,9 @@ def nddo_optimize(
             print(f"  opt {iteration:3d}: E={energy:.6f}, Hf={result['heat_of_formation_kcal']:.2f}, |g|={g_rms:.5f}")
 
         if g_rms < grad_tol:
-            return {
-                'coords': coords, 'energy_eV': energy,
-                'heat_of_formation_kcal': result['heat_of_formation_kcal'],
-                'gradient': grad, 'grad_rms': g_rms,
-                'opt_converged': True, 'opt_n_iter': iteration + 1, 'converged': True,
-                'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
-            }
+            return _optimize_result(result, coords, energy, grad, g_rms,
+                                    converged=True, n_iter=iteration + 1,
+                                    method=method)
 
         # L-BFGS direction
         q = grad_flat.copy()
@@ -406,13 +445,10 @@ def nddo_optimize(
             if len(s_hist) > m:
                 s_hist.pop(0); y_hist.pop(0); rho_hist.pop(0)
 
-    return {
-        'coords': coords, 'energy_eV': energy,
-        'heat_of_formation_kcal': result['heat_of_formation_kcal'],
-        'gradient': grad, 'grad_rms': np.sqrt(np.mean(grad_flat ** 2)),
-        'opt_converged': False, 'opt_n_iter': max_iter, 'converged': True,
-        'method': method, **{k: v for k, v in result.items() if k not in ('coords',)},
-    }
+    # Ran out of iterations. This used to hardcode 'converged': True.
+    return _optimize_result(result, coords, energy, grad,
+                            np.sqrt(np.mean(grad_flat ** 2)),
+                            converged=False, n_iter=max_iter, method=method)
 
 
 # Backward-compatible aliases
