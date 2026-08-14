@@ -126,3 +126,55 @@ def test_easy_molecule_still_exits_early():
 
     assert res["converged"] is True
     assert res["n_iter"] < 50, f"took {res['n_iter']} of a 200 cap"
+
+
+def test_single_and_batch_agree_on_the_same_molecule():
+    """One molecule, two entry points, one answer.
+
+    nddo_optimize_batch defaulted to max_iter=50 while nddo_optimize used 200,
+    so menthol came out 0.385 kcal/mol apart depending on which you called —
+    9x the MOPAC agreement #28 requires be preserved. The batch path is not
+    approximate: it runs the same L-BFGS per molecule and skips a molecule
+    once it converges, so the only thing that differed was the budget.
+    """
+    from mlxmolkit.nddo.gradient import nddo_optimize_batch
+
+    atoms, coords = geometry("CCO")
+    single = nddo_optimize(atoms, coords.copy())
+    batch = nddo_optimize_batch([(atoms, coords.copy())])[0]
+
+    assert single["converged"] is True
+    assert batch["opt_converged"] is True
+    assert abs(single["heat_of_formation_kcal"]
+               - batch["heat_of_formation_kcal"]) < 0.042, (
+        "single and batch disagree by more than the MOPAC agreement tolerance"
+    )
+
+
+def test_optimizer_defaults_match_across_entry_points():
+    """A third set of defaults is how the paths drifted apart in the first
+    place — the deprecated alias used to hardcode 100 / 0.01."""
+    import inspect
+
+    from mlxmolkit.nddo.gradient import nddo_optimize_batch
+    from mlxmolkit.nddo.pipeline import rm1_from_smiles
+
+    single = inspect.signature(nddo_optimize).parameters
+    batch = inspect.signature(nddo_optimize_batch).parameters
+    pipeline = inspect.signature(rm1_from_smiles).parameters
+
+    assert single["max_iter"].default == batch["max_iter"].default
+    assert single["grad_tol"].default == batch["grad_tol"].default
+    assert pipeline["opt_max_iter"].default == single["max_iter"].default
+    assert pipeline["opt_grad_tol"].default == single["grad_tol"].default
+
+
+def test_deprecated_alias_delegates_its_defaults():
+    """rm1_optimize hardcoded grad_tol=0.01, twice as loose as either path."""
+    import inspect
+
+    from mlxmolkit.nddo.gradient import rm1_optimize
+
+    params = inspect.signature(rm1_optimize).parameters
+    assert params["max_iter"].default is None
+    assert params["grad_tol"].default is None
