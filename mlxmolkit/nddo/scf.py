@@ -341,6 +341,42 @@ def _pair_resonance_block(pA, pB, rA, rB, overlap=None):
     return block
 
 
+def _beta_vectors(plist, n_basis):
+    """Resonance parameters for every orbital of each atom, shape (g, n_basis).
+
+    Beta depends only on which shell an orbital sits in, so a group of atoms
+    that share an orbital count share the whole layout: one column read per
+    shell rather than `_beta_for_orbital` per orbital per atom.
+    """
+    out = np.empty((len(plist), n_basis))
+    out[:, 0] = [p.beta_s for p in plist]
+    if n_basis > 1:
+        out[:, 1:min(n_basis, 4)] = np.asarray([p.beta_p for p in plist])[:, None]
+    if n_basis > 4:
+        out[:, 4:] = np.asarray([p.beta_d for p in plist])[:, None]
+    return out
+
+
+def _pair_resonance_blocks(pA_list, pB_list, S):
+    """:func:`_pair_resonance_block` for a group of pairs of one orbital shape.
+
+    H_uv = 0.5 (beta_u + beta_v) S_uv is a pure broadcast over the group, but
+    the scalar form runs an nA x nB Python loop per pair. A cholesterol
+    gradient calls it once per pair per displacement — 16k times, each doing
+    16 iterations with two function calls apiece.
+
+    Args:
+        pA_list, pB_list: the group's atom parameters, length g.
+        S: stacked overlaps, shape (g, nA, nB).
+
+    Returns:
+        Blocks of shape (g, nA, nB).
+    """
+    betaA = _beta_vectors(pA_list, S.shape[1])
+    betaB = _beta_vectors(pB_list, S.shape[2])
+    return 0.5 * (betaA[:, :, None] + betaB[:, None, :]) * S
+
+
 def _pair_core_attraction(pA, pB, rA, rB):
     """Electron-nuclear attraction on atom A from nucleus B, shape (nA, nA).
 
