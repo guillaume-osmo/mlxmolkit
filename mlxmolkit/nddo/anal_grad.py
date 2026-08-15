@@ -110,6 +110,88 @@ def _pair_terms_many(params, coords, pairs, starts, P, n_basis):
     return out
 
 
+def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
+    """Each pair's scalar contribution to `sum(P * (2H + T))`.
+
+    A pair's dH and dT are exactly zero outside its four blocks — [sA,sA],
+    [sB,sB], [sA,sB], [sB,sA] — for the d path as well as sp, so its whole
+    effect on the electronic energy collapses to one number. Returning that
+    number instead of two (n_basis, n_basis) matrices means a displaced
+    geometry costs a few float subtractions rather than a full-matrix copy
+    and 2(N-1) full-matrix adds carrying 4x4 changes.
+
+    The sp path builds the blocks directly and never allocates a full matrix.
+    d pairs go through :func:`_pair_terms` and are reduced afterwards; they are
+    rare, and the point here is to stop paying n_basis**2 for every sp pair.
+    """
+    from .scf import (_pair_resonance_block, _pair_fock_twocentre,
+                      _pair_core_attraction)
+    from .rotation_batch import rotate_pairs
+    from .d_two_center import _ROT_CACHE, _pair_key
+
+    sp, dd = [], []
+    for i, j in pairs:
+        (sp if params[i].n_basis <= 4 and params[j].n_basis <= 4
+         else dd).append((i, j))
+
+    out: dict[tuple[int, int], float] = {}
+
+    if sp:
+        ws = None
+        if _ROT_CACHE is not None:
+            ws = [_ROT_CACHE.get(_pair_key(params[i], params[j],
+                                           coords[i], coords[j])) for i, j in sp]
+            if any(w is None for w in ws):
+                ws = None
+        if ws is None:
+            ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
+                              [(coords[i], coords[j]) for i, j in sp])
+
+        for k, (i, j) in enumerate(sp):
+            pA, pB = params[i], params[j]
+            sA, sB = starts[i], starts[j]
+            nA, nB = pA.n_basis, pB.n_basis
+            w = ws[k]
+            w_sp = w[:nA, :nA, :nB, :nB]
+
+            P_AA = P[sA:sA + nA, sA:sA + nA]
+            P_BB = P[sB:sB + nB, sB:sB + nB]
+            P_AB = P[sA:sA + nA, sB:sB + nB]
+            P_BA = P[sB:sB + nB, sA:sA + nA]
+
+            h_ab = _pair_resonance_block(pA, pB, coords[i], coords[j])
+            h_aa = -float(pB.n_valence) * w[:nA, :nA, 0, 0]
+            h_bb = -float(pA.n_valence) * w[0, 0, :nB, :nB]
+
+            t_aa = np.einsum('abcd,cd->ab', w_sp, P_BB)
+            t_bb = np.einsum('abcd,ab->cd', w_sp, P_AA)
+            t_ab = -0.5 * np.einsum('abcd,bd->ac', w_sp, P_AB)
+
+            out[(i, j)] = float(
+                np.sum(P_AA * (2.0 * h_aa + t_aa))
+                + np.sum(P_BB * (2.0 * h_bb + t_bb))
+                + np.sum(P_AB * (2.0 * h_ab + t_ab))
+                + np.sum(P_BA * (2.0 * h_ab.T + t_ab.T))
+            )
+
+    for i, j in dd:
+        dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
+        sA, nA = starts[i], params[i].n_basis
+        sB, nB = starts[j], params[j].n_basis
+        total = 0.0
+        for rows, cols in (
+            (slice(sA, sA + nA), slice(sA, sA + nA)),
+            (slice(sB, sB + nB), slice(sB, sB + nB)),
+            (slice(sA, sA + nA), slice(sB, sB + nB)),
+            (slice(sB, sB + nB), slice(sA, sA + nA)),
+        ):
+            total += float(np.sum(P[rows, cols]
+                                  * (2.0 * dH[rows, cols] + dT[rows, cols])))
+        out[(i, j)] = total
+
+    return out
+
+
 def analytical_gradient(
     atoms: list[int],
     coords: np.ndarray,
@@ -207,18 +289,20 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
     nuc_ref = {(i, j): pair_repulsion_for_method(atoms, coords, i, j, PARAMS, method)
                for i in range(n_atoms) for j in range(i + 1, n_atoms)}
 
+    # E_elec = 0.5 * sum(P * (H + F)) with F = H + G_one + T, so it is
+    # 0.5 * sum(P * (2H + G_one + T)). G_one and the one-centre part of H do
+    # not move, so a displaced geometry differs from the reference only by the
+    # pairs that changed — and each pair's whole contribution is one scalar.
+    E_elec_ref = 0.5 * float(np.sum(P * (H_ref + F_ref)))
+    pair_energy_ref = _pair_energy_many(params, coords, all_pairs, starts, P,
+                                        n_basis)
+
     def energy_with_atom_moved(a: int, shifted: np.ndarray) -> float:
-        H = H_ref.copy()
-        T = T_ref.copy()
         dirty = [((a, j) if a < j else (j, a)) for j in range(n_atoms) if j != a]
-        fresh = _pair_terms_many(params, shifted, dirty, starts, P, n_basis)
-        for key in dirty:
-            old_H, old_T = pair_ref[key]
-            new_H, new_T = fresh[key]
-            H += new_H - old_H
-            T += new_T - old_T
-        F = H + G_one + T
-        E_elec = 0.5 * np.sum(P * (H + F))
+        fresh = _pair_energy_many(params, shifted, dirty, starts, P, n_basis)
+
+        E_elec = E_elec_ref + 0.5 * sum(fresh[key] - pair_energy_ref[key]
+                                        for key in dirty)
 
         E_nuc = E_nuc_ref
         for j in range(n_atoms):
