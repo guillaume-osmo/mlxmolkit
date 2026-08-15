@@ -357,6 +357,26 @@ def _beta_vectors(plist, n_basis):
     return out
 
 
+def _stacked_overlaps(specs):
+    """Overlaps for a list of sp pair specs, in spec order.
+
+    Served from the pair cache when the caller declared these geometries — the
+    gradient's path, where recomputing them would undo the cache — and from one
+    batched `overlap_pairs` call otherwise. sp only: `overlap_pairs` falls back
+    to `overlap_molecular_frame` for shapes its table misses, which is not the
+    routine the d resonance block uses.
+    """
+    from .d_two_center import _OVERLAP_CACHE, _pair_key
+
+    if _OVERLAP_CACHE is not None:
+        hits = [_OVERLAP_CACHE.get(_pair_key(*spec)) for spec in specs]
+        if all(hit is not None for hit in hits):
+            return hits
+
+    from .overlap_batch import overlap_pairs
+    return overlap_pairs(specs)
+
+
 def _pair_resonance_blocks(pA_list, pB_list, S):
     """:func:`_pair_resonance_block` for a group of pairs of one orbital shape.
 
@@ -419,15 +439,50 @@ def _build_core_hamiltonian(atoms, coords, info):
             # d-orbital (types 4-8)
             H[mu, mu] = p.Udd
 
-    # Off-diagonal: resonance integrals using proper Slater overlap
+    # Off-diagonal: resonance integrals using proper Slater overlap.
+    #
+    # sp pairs go through the batch: one `overlap_pairs` call for all of them,
+    # then one broadcast per orbital shape, then a fancy-indexed scatter into
+    # H. The scalar loop was 2701 calls of `_pair_resonance_block` on
+    # cholesterol, each running its own nA x nB Python loop, and it is the
+    # largest line in an SCF profile after the eigendecomposition.
+    #
+    # d pairs stay scalar. `overlap_pairs` falls back to
+    # `overlap_molecular_frame` for shapes its table does not cover, but
+    # `_pair_resonance_block` uses `overlap_d_molecular_frame` for those —
+    # different routines, so batching them together would silently change the
+    # d overlap.
     n_atoms = len(atoms)
+    sp_res, d_res = [], []
     for i in range(n_atoms):
         for j in range(i + 1, n_atoms):
-            block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
-            si, sj = starts[i], starts[j]
-            nA, nB = params[i].n_basis, params[j].n_basis
-            H[si:si + nA, sj:sj + nB] = block
-            H[sj:sj + nB, si:si + nA] = block.T
+            (sp_res if params[i].n_basis <= 4 and params[j].n_basis <= 4
+             else d_res).append((i, j))
+
+    for i, j in d_res:
+        block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
+        si, sj = starts[i], starts[j]
+        H[si:si + block.shape[0], sj:sj + block.shape[1]] = block
+        H[sj:sj + block.shape[1], si:si + block.shape[0]] = block.T
+
+    if sp_res:
+        S_all = _stacked_overlaps([(params[i], params[j], coords[i], coords[j])
+                                   for i, j in sp_res])
+        shapes: dict[tuple[int, int], list[int]] = {}
+        for k, (i, j) in enumerate(sp_res):
+            shapes.setdefault((params[i].n_basis, params[j].n_basis),
+                              []).append(k)
+        for (nA, nB), ks in shapes.items():
+            blocks = _pair_resonance_blocks(
+                [params[sp_res[k][0]] for k in ks],
+                [params[sp_res[k][1]] for k in ks],
+                np.stack([S_all[k] for k in ks]))
+            rows_a = (np.asarray([starts[sp_res[k][0]] for k in ks])[:, None]
+                      + np.arange(nA))
+            rows_b = (np.asarray([starts[sp_res[k][1]] for k in ks])[:, None]
+                      + np.arange(nB))
+            H[rows_a[:, :, None], rows_b[:, None, :]] = blocks
+            H[rows_b[:, :, None], rows_a[:, None, :]] = np.swapaxes(blocks, 1, 2)
 
     # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
     # attraction on i from j *and* on j from i, so the unordered loop below
