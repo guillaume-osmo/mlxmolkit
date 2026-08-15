@@ -587,7 +587,63 @@ def precompute_pair_w(atoms, coords, info):
     return {pair: ws[k] for k, pair in enumerate(sp)}
 
 
-def _build_fock(H, P, info, atoms, coords, pair_w=None):
+def _fock_plan(info, atoms, coords, pair_w=None):
+    """The parts of a Fock build that depend on geometry but not on density.
+
+    An SCF sits at one geometry for ~18 iterations and rebuilt all of this on
+    every one of them: the sp/d triage over N(N-1)/2 pairs — 48,618 loop
+    iterations per cholesterol SCF — the stacked rotation tensors, the
+    basis-row index arrays and the flat scatter indices. Only the three
+    density contractions actually differ between iterations.
+
+    `precompute_pair_w` already hoisted the rotations themselves; this hoists
+    everything built around them.
+    """
+    params = info['params']
+    starts = info['atom_basis_start']
+    n_basis = info['n_basis']
+    n_atoms = len(atoms)
+
+    idx_by_atom = [np.where(info['basis_to_atom'] == i)[0]
+                   for i in range(n_atoms)]
+
+    d_pairs = []
+    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            pA, pB = params[i], params[j]
+            if pA.n_basis == 9 or pB.n_basis == 9 or (
+                    pair_w is not None and pair_w.get((i, j)) is None):
+                d_pairs.append((i, j))
+            else:
+                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
+                                       []).append((i, j))
+
+    groups = []
+    for (nA, nB), pairs in sp_by_shape.items():
+        if pair_w is not None:
+            W = np.stack([pair_w[(i, j)] for i, j in pairs])
+        else:
+            from .rotation_batch import rotate_pairs
+            W = np.stack(rotate_pairs(
+                [(params[i], params[j]) for i, j in pairs],
+                [(coords[i], coords[j]) for i, j in pairs]))
+        W = W[:, :nA, :nA, :nB, :nB]
+
+        ia = np.asarray([starts[i] for i, _ in pairs])
+        ib = np.asarray([starts[j] for _, j in pairs])
+        rows_a = ia[:, None] + np.arange(nA)
+        rows_b = ib[:, None] + np.arange(nB)
+        flat = np.concatenate([
+            (rows[:, :, None] * n_basis + cols[:, None, :]).ravel()
+            for rows, cols in ((rows_a, rows_a), (rows_b, rows_b),
+                               (rows_a, rows_b), (rows_b, rows_a))])
+        groups.append((W, rows_a, rows_b, flat))
+
+    return {'idx_by_atom': idx_by_atom, 'd_pairs': d_pairs, 'groups': groups}
+
+
+def _build_fock(H, P, info, atoms, coords, pair_w=None, plan=None):
     """Build Fock matrix F = H + G(P).
 
     Two contributions:
@@ -604,11 +660,12 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
     starts = info['atom_basis_start']
 
     F = H.copy()
+    if plan is None:
+        plan = _fock_plan(info, atoms, coords, pair_w)
 
     # === One-center two-electron contributions ===
     for i, p in enumerate(params):
-        mask = (b2a == i)
-        idx = np.where(mask)[0]
+        idx = plan['idx_by_atom'][i]
         if len(idx) == 0:
             continue
 
@@ -701,38 +758,16 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
     # this loop ran 2701 times per SCF iteration and 20 iterations per energy,
     # 54k calls each doing three 4x4x4x4 einsums on arrays far too small to
     # cover numpy's per-call overhead.
-    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            pA, pB = params[i], params[j]
-            if pA.n_basis == 9 or pB.n_basis == 9 or (
-                    pair_w is not None and pair_w.get((i, j)) is None):
-                F = _pair_fock_twocentre(
-                    F, P, pA, pB, starts[i], starts[j], coords[i], coords[j],
-                    w=None if pair_w is None else pair_w.get((i, j)))
-            else:
-                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
-                                       []).append((i, j))
+    for i, j in plan['d_pairs']:
+        F = _pair_fock_twocentre(
+            F, P, params[i], params[j], starts[i], starts[j],
+            coords[i], coords[j],
+            w=None if pair_w is None else pair_w.get((i, j)))
 
-    if sp_by_shape:
-        from .rotation_batch import rotate_pairs
-
+    if plan['groups']:
         flat_idx: list[np.ndarray] = []
         flat_val: list[np.ndarray] = []
-        for (nA, nB), pairs in sp_by_shape.items():
-            if pair_w is not None:
-                W = np.stack([pair_w[(i, j)] for i, j in pairs])
-            else:
-                W = np.stack(rotate_pairs(
-                    [(params[i], params[j]) for i, j in pairs],
-                    [(coords[i], coords[j]) for i, j in pairs]))
-            W = W[:, :nA, :nA, :nB, :nB]
-
-            ia = np.asarray([starts[i] for i, _ in pairs])
-            ib = np.asarray([starts[j] for _, j in pairs])
-            rows_a = ia[:, None] + np.arange(nA)
-            rows_b = ib[:, None] + np.arange(nB)
-
+        for W, rows_a, rows_b, flat in plan['groups']:
             P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
             P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
             P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
@@ -741,15 +776,10 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None):
             t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
             t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
 
-            for rows, cols, vals in (
-                (rows_a, rows_a, t_aa),
-                (rows_b, rows_b, t_bb),
-                (rows_a, rows_b, t_ab),
-                (rows_b, rows_a, np.swapaxes(t_ab, 1, 2)),
-            ):
-                flat_idx.append(
-                    (rows[:, :, None] * n_basis + cols[:, None, :]).ravel())
-                flat_val.append(vals.ravel())
+            flat_idx.append(flat)
+            flat_val.append(np.concatenate([
+                t_aa.ravel(), t_bb.ravel(), t_ab.ravel(),
+                np.swapaxes(t_ab, 1, 2).ravel()]))
 
         # One accumulation rather than per-pair `+=`: several pairs land on the
         # same atom's diagonal block, so the scatter has to add rather than
@@ -1187,11 +1217,14 @@ def _nddo_energy_at_geometry(
                 atom_starts_metal, ssss.astype(np.float32),
                 n_basis, n_atoms,
             )
-        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w)
+        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w,
+                           plan=_fock_plan_)
 
     # The two-centre rotations are fixed for this geometry, so they are
-    # built once here instead of at every iteration of the loop below.
+    # built once here instead of at every iteration of the loop below — as is
+    # everything else the Fock build derives from them.
     _pair_w = precompute_pair_w(atoms, coords, info)
+    _fock_plan_ = _fock_plan(info, atoms, coords, _pair_w)
 
     # DIIS (Direct Inversion in the Iterative Subspace) storage
     diis_max = 6
