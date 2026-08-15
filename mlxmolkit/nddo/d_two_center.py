@@ -131,10 +131,18 @@ def pair_cache(pair_specs):
             e1b[_pair_key(*spec)] = blk
 
     if sp_specs:
-        directed = sp_specs + [(b, a, d, c) for a, b, c, d in sp_specs]
-        for spec, S in zip(directed, overlap_pairs(directed)):
-            if S is not None:
-                overlaps[_pair_key(*spec)] = S
+        # S(B, A) is exactly S(A, B) transposed — <v|u> = <u|v>, and the
+        # direction-vector sign flips that worry p and d blocks cancel because
+        # both the orbital and the frame flip with it. Verified against the
+        # scalar routine for s, p and d shapes. Storing the view instead of
+        # computing the reversed ordering halves the overlap batch, which is
+        # the largest non-SCF item in a gradient.
+        for spec, S in zip(sp_specs, overlap_pairs(sp_specs)):
+            if S is None:
+                continue
+            pA, pB, cA, cB = spec
+            overlaps[_pair_key(pA, pB, cA, cB)] = S
+            overlaps[_pair_key(pB, pA, cB, cA)] = S.T
         ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
                           [(c, d) for _a, _b, c, d in sp_specs])
         for spec, w in zip(sp_specs, ws):
