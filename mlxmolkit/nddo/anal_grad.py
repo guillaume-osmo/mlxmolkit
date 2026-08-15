@@ -147,32 +147,51 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis):
             ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
                               [(coords[i], coords[j]) for i, j in sp])
 
+        # Grouped by orbital shape so the contractions run once per shape
+        # rather than once per pair. A displaced geometry touches N-1 pairs
+        # and each was doing three 4x4x4x4 einsums plus four reductions —
+        # ~97k tiny numpy calls per gradient on cholesterol, where the arrays
+        # are far too small to cover the per-call overhead.
+        shapes: dict[tuple[int, int], list[int]] = {}
         for k, (i, j) in enumerate(sp):
-            pA, pB = params[i], params[j]
-            sA, sB = starts[i], starts[j]
-            nA, nB = pA.n_basis, pB.n_basis
-            w = ws[k]
-            w_sp = w[:nA, :nA, :nB, :nB]
+            shapes.setdefault((params[i].n_basis, params[j].n_basis),
+                              []).append(k)
 
-            P_AA = P[sA:sA + nA, sA:sA + nA]
-            P_BB = P[sB:sB + nB, sB:sB + nB]
-            P_AB = P[sA:sA + nA, sB:sB + nB]
-            P_BA = P[sB:sB + nB, sA:sA + nA]
+        for (nA, nB), ks in shapes.items():
+            sel = np.asarray(ks)
+            ia = np.asarray([starts[sp[k][0]] for k in ks])
+            ib = np.asarray([starts[sp[k][1]] for k in ks])
+            rows_a = ia[:, None] + np.arange(nA)
+            rows_b = ib[:, None] + np.arange(nB)
 
-            h_ab = _pair_resonance_block(pA, pB, coords[i], coords[j])
-            h_aa = -float(pB.n_valence) * w[:nA, :nA, 0, 0]
-            h_bb = -float(pA.n_valence) * w[0, 0, :nB, :nB]
+            W = np.stack([ws[k] for k in ks])[:, :nA, :nA, :nB, :nB]
+            P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
+            P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
+            P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
+            P_BA = P[rows_b[:, :, None], rows_a[:, None, :]]
 
-            t_aa = np.einsum('abcd,cd->ab', w_sp, P_BB)
-            t_bb = np.einsum('abcd,ab->cd', w_sp, P_AA)
-            t_ab = -0.5 * np.einsum('abcd,bd->ac', w_sp, P_AB)
+            h_ab = np.stack([
+                _pair_resonance_block(params[sp[k][0]], params[sp[k][1]],
+                                      coords[sp[k][0]], coords[sp[k][1]])
+                for k in ks])
+            val_b = np.asarray([float(params[sp[k][1]].n_valence) for k in ks])
+            val_a = np.asarray([float(params[sp[k][0]].n_valence) for k in ks])
+            h_aa = -val_b[:, None, None] * W[:, :, :, 0, 0]
+            h_bb = -val_a[:, None, None] * W[:, 0, 0, :, :]
 
-            out[(i, j)] = float(
-                np.sum(P_AA * (2.0 * h_aa + t_aa))
-                + np.sum(P_BB * (2.0 * h_bb + t_bb))
-                + np.sum(P_AB * (2.0 * h_ab + t_ab))
-                + np.sum(P_BA * (2.0 * h_ab.T + t_ab.T))
+            t_aa = np.einsum('gabcd,gcd->gab', W, P_BB)
+            t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
+            t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
+
+            totals = (
+                np.sum(P_AA * (2.0 * h_aa + t_aa), axis=(1, 2))
+                + np.sum(P_BB * (2.0 * h_bb + t_bb), axis=(1, 2))
+                + np.sum(P_AB * (2.0 * h_ab + t_ab), axis=(1, 2))
+                + np.sum(P_BA * (2.0 * np.swapaxes(h_ab, 1, 2)
+                                 + np.swapaxes(t_ab, 1, 2)), axis=(1, 2))
             )
+            for pos, k in enumerate(ks):
+                out[sp[k]] = float(totals[pos])
 
     for i, j in dd:
         dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
