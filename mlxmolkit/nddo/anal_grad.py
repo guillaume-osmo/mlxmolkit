@@ -363,11 +363,15 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
         if _pm6_core_core:
             return np.asarray(pm6_pair_repulsion_batch(
                 zi, zj, None, coords_i, coords_j, param_dict=PARAMS))
+        # The two-element atom list matters: passing the full `atoms` with
+        # indices 0 and 1 silently gives every pair the parameters of the
+        # first two atoms, which leaves the gradient wrong for every method
+        # that is not on the PM6 core-core path.
         return np.asarray([
             pair_repulsion_for_method(
-                atoms, np.stack([coords_i[k], coords_j[k]]), 0, 1,
-                PARAMS, method)
-            for k in range(len(all_pairs))])
+                [atoms[i], atoms[j]],
+                np.stack([coords_i[k], coords_j[k]]), 0, 1, PARAMS, method)
+            for k, (i, j) in enumerate(all_pairs)])
 
     def pair_energies(delta):
         """Every pair's total energy with its second atom shifted by delta."""
