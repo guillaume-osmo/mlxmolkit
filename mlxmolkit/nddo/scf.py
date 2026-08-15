@@ -1289,10 +1289,12 @@ def _nddo_energy_at_geometry(
             F_shifted = C @ np.diag(eigenvalues) @ C.T
             eigenvalues, C = np.linalg.eigh(F_shifted)
 
-        # Build new density matrix
-        P_new = np.zeros((n_basis, n_basis))
-        for k in range(n_occ):
-            P_new += 2.0 * np.outer(C[:, k], C[:, k])
+        # Build new density matrix. One GEMM, not n_occ rank-1 updates: the
+        # loop's cost was never the outer products but the n_occ full-matrix
+        # accumulations into P_new — 80 x 194^2 element-adds per iteration on
+        # cholesterol, against 194^2 x 80 multiply-adds for the matmul.
+        C_occ = C[:, :n_occ]
+        P_new = 2.0 * (C_occ @ C_occ.T)
 
         # Check convergence
         delta = np.sqrt(np.mean((P_new - P) ** 2))
