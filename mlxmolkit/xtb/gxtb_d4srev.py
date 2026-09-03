@@ -33,14 +33,14 @@ from scipy.special import erf
 
 ANG_TO_BOHR = 1.8897261246204404
 
-#: `__const` 0x74a490..0x74a4a8, and s6/s8 as measured from the live cache.
+#: and s6/s8 as measured from the live cache.
 D4S_A1 = 0.0
 D4S_A2 = 8.5302496868
 D4S_ALP = 0.5395219242
 D4S_BETA = 0.654
 D4S_S6 = 1.0
 D4S_S8 = 0.0
-#: `mctc_ncoord_erf`'s steepness, `__const` 0x74a4b8.
+#: `mctc_ncoord_erf`'s steepness.
 D4S_KCN = 7.5
 #: `sqrt(tiny)`, the guard `weight_references` uses on the normalisation.
 _SQRT_TINY = 1.4916681462400413e-154

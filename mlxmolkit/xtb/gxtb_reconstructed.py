@@ -22,11 +22,11 @@ from .gxtb_cpp import (
 )
 from .mctc_vdwrad import mctc_vdw_pair_matrix_bohr
 from .mctc_ncoord import erf_coordination_number
-from .params_gxtb import GXTB_PARAMS, GXTB_REPULSION_LITERAL_BY_ADDR
+from .params_gxtb import GXTB_PARAMS, GXTB_REPULSION_LITERALS
 
 
 ANG_TO_BOHR = 1.8897261246204404
-#: the erf coordination number's steepness, `__const` 0x73B270
+#: the erf coordination number's steepness
 GXTB_CN_K = 2.068
 
 
@@ -87,17 +87,17 @@ def repulsion_constants_from_binary() -> GXTBReconstructedRepulsionConstants:
       and arithmetic (ID 0, for pair coefficient matrices).
     """
 
-    lit = GXTB_REPULSION_LITERAL_BY_ADDR
+    lit = GXTB_REPULSION_LITERALS
     return GXTBReconstructedRepulsionConstants(
-        stored_scalar_1p5=lit[0x73B268],
-        exp_power_1=lit[0x73B268],
-        exp_power_2=lit[0x73B278],
-        exp2_scale=lit[0x73B280],
-        exp2_weight=lit[0x73B288],
-        cubic_coeff=lit[0x73B298],
-        quartic_coeff=lit[0x73B290],
-        light_pair_coeff=lit[0x73B2A0],
-        heavy_pair_coeff=lit[0x73B2A8],
+        stored_scalar_1p5=lit["exp_power_1"],
+        exp_power_1=lit["exp_power_1"],
+        exp_power_2=lit["exp_power_2"],
+        exp2_scale=lit["exp2_scale"],
+        exp2_weight=lit["exp2_weight"],
+        cubic_coeff=lit["cubic_coeff"],
+        quartic_coeff=lit["quartic_coeff"],
+        light_pair_coeff=lit["light_pair_coeff"],
+        heavy_pair_coeff=lit["heavy_pair_coeff"],
     )
 
 
@@ -168,9 +168,8 @@ def _gxtb_erf_coordination_number(
 ) -> np.ndarray:
     """Binary-guided g-xTB ``mctc_ncoord`` ERF coordination number.
 
-    ``new_gxtb_calculator`` passes count type ID 3 to ``new_ncoord``. The
-    dispatcher maps ID 3 to ``new_erf_ncoord`` and passes the literal at
-    ``0x73b270`` as the ERF steepness. The recovered pair formula is:
+    ``new_gxtb_calculator`` selects the erf coordination number, whose
+    steepness is ``GXTB_CN_K``. The recovered pair formula is:
 
     ``0.5 * (1 + erf(-k * (r - r0) / r0**power))``.
     """

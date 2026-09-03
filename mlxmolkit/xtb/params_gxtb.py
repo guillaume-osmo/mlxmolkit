@@ -23,19 +23,23 @@ SHELL_LABELS = ("s", "p", "d", "f")
 SHELL_ANGULAR = (0, 1, 2, 3)
 MAX_Z = 103
 
-GXTB_REPULSION_LITERAL_BY_ADDR = {
-    0x73B268: 1.5,
-    0x73B270: 2.068,
-    0x73B278: 2.0,
-    0x73B280: 0.73,
-    0x73B288: 0.0046511298,
-    0x73B290: 0.011607795128002491,
-    0x73B298: 0.011095539524126988,
-    0x73B2A0: 0.012098131381864387,
-    0x73B2A8: 0.008544252691968662,
+#: The nine literals the reference implementation keeps in one block for the
+#: repulsion, in its own order. ``erf_cn_steepness`` is the odd one out: it
+#: belongs to the erf coordination number, not to the repulsion, and only
+#: shares the block.
+GXTB_REPULSION_LITERALS = {
+    "exp_power_1": 1.5,
+    "erf_cn_steepness": 2.068,
+    "exp_power_2": 2.0,
+    "exp2_scale": 0.73,
+    "exp2_weight": 0.0046511298,
+    "quartic_coeff": 0.011607795128002491,
+    "cubic_coeff": 0.011095539524126988,
+    "light_pair_coeff": 0.012098131381864387,
+    "heavy_pair_coeff": 0.008544252691968662,
 }
 
-GXTB_REPULSION_LITERAL_SEQUENCE = tuple(GXTB_REPULSION_LITERAL_BY_ADDR.values())
+GXTB_REPULSION_LITERAL_SEQUENCE = tuple(GXTB_REPULSION_LITERALS.values())
 
 from .param_archive import ARCHIVE_PATH as _DATA_PATH, load_tables  # noqa: E402
 

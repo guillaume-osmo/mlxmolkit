@@ -31,7 +31,7 @@ GXTB_TB3_KX = 1.3
 GXTB_TB3_REXP = 0.2093327496
 # 4th-order onsite hardness Gamma4_sh = shell_fourth * K4TH_SCALE, where
 # shell_fourth = pg_tb4_kshell[l] (NO pa_tb3_hubbard_derivs factor; see gxtb_basis).
-# Binary-exact: add_coulomb 0x41a0b4 loads DAT_005dbbe8 = 0.036 and multiplies
+# Exact against the reference implementation: add_coulomb scales by 0.036 and multiplies
 # pg_tb4_kshell directly -- no per-element hubbard factor. Energy = sum q^4 Gamma4/24,
 # potential = q^3 Gamma4/6 (the /6 and /24 below are the only divisors).
 GXTB_K4TH_SCALE = 0.036
@@ -41,7 +41,7 @@ GXTB_TB1_KS = 0.666666666
 GXTB_TB1_CN_EPS = 1.0e-12
 # Mulliken-Fock-exchange range-separation scalars. VERIFIED against the released
 # g-xTB binary: the exact constants new_exchange_fock receives are baked at
-# libxtb __const 0x73b4d8.. = {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
+# {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
 # NB: the public gp3.f90 source declares fock_omega=0.300, but that branch is STALE;
 # the released binary uses omega=0.2 (this value). Binary is authoritative.
 GXTB_MFX_FR_SCALE = 0.15

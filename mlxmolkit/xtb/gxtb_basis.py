@@ -59,7 +59,7 @@ class GXTBQVSZPBasis:
 
 
 #: Softening of the coordination-number square root, read out of the released
-#: g-xTB v2.0.1 binary's literal pool (0x10052d1c0 and 0x10051cff0):
+#: g-xTB v2.0.1 constants:
 #: ``sqrt(cn) -> sqrt(cn + QEFF_CN_EPS) - QEFF_CN_DELTA`` with
 #: ``QEFF_CN_DELTA == sqrt(QEFF_CN_EPS)`` exactly, so the term is still zero at
 #: cn == 0 while d/dcn stays finite there.  This is the *only* model difference
@@ -228,7 +228,7 @@ def build_gxtb_qvszp_basis(
                 * float(GXTB_PARAMS["pg_tb3_kshell"][l])
             )
             # 4th-order onsite hardness Gamma4_sh = pg_tb4_kshell[l] * K4TH (=0.036).
-            # Binary-exact (add_coulomb 0x41a0b4: ldr d25,[x1,0xbe8]=0.036 ; fmul on
+            # Exact against the reference implementation: add_coulomb scales by 0.036 on
             # pg_tb4_kshell): the per-element pa_tb3_hubbard_derivs factor is NOT
             # present here. The 0.036 lives in scf_gxtb.GXTB_K4TH_SCALE, so this table
             # holds pg_tb4_kshell[l] alone.
