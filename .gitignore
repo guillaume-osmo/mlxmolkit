@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.so
+.DS_Store
+outputs/
+*.npz
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.oeb
+!data/gxtb_onecxints_extracted.npz
+
+# g-xTB oracle comparison run artifacts (regenerate with tools/gxtb_charge_oracle.py)
+gxtb_charge_run/
+
+# Model data tables are part of the package, not build output.
+# The blanket *.npz rule above hid d4srev_tables.npz, which made the D4Srev
+# path unusable from a fresh clone.
+!mlxmolkit/**/data/*.npz
+!mlxmolkit/xtb/params/*.npz
