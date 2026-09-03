@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.so
+.DS_Store
+outputs/
+*.npz
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.oeb
+!data/gxtb_onecxints_extracted.npz
+
+# g-xTB oracle comparison run artifacts (regenerate with tools/gxtb_charge_oracle.py)
+gxtb_charge_run/

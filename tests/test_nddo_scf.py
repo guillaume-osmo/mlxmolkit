@@ -1,0 +1,216 @@
+"""
+Unit tests for RM1/AM1/PM6 SCF engine.
+
+Validates against PYSEQM reference values (exact to < 0.001 eV).
+"""
+import sys; sys.path.insert(0, '.')
+import numpy as np
+import pytest
+import mlx.core as mx
+
+from mlxmolkit.nddo import scf as scf_mod
+from mlxmolkit.nddo.scf import nddo_energy, nddo_energy_batch
+
+
+# Test geometries (Angstrom)
+MOLS = {
+    'H2':  ([1,1], np.array([[0,0,0],[0.74,0,0.0]])),
+    'H2O': ([8,1,1], np.array([[0,0,0],[0.9584,0,0],[-0.2396,0.9275,0.0]])),
+    'CH4': ([6,1,1,1,1], np.array([[0,0,0],[.6276,.6276,.6276],[.6276,-.6276,-.6276],[-.6276,.6276,-.6276],[-.6276,-.6276,.6276]])),
+    'NH3': ([7,1,1,1], np.array([[0,0,0],[.9377,-.3816,0],[-.4689,.8119,0],[-.4689,-.4303,.8299]])),
+}
+
+# PYSEQM reference values (exact)
+PYSEQM_REF = {
+    'RM1': {
+        'H2':  {'E_elec': -42.279154, 'E_nuc': 13.780913, 'E_tot': -28.498242},
+        'H2O': {'E_elec': -488.951381, 'E_nuc': 143.380852, 'E_tot': -345.570528},
+        'CH4': {'E_elec': -391.804076, 'E_nuc': 209.044867, 'E_tot': -182.759209},
+        'NH3': {'E_elec': -439.119959, 'E_nuc': 186.812105, 'E_tot': -252.307854},
+    },
+    'AM1': {
+        'H2':  {'E_elec': -40.847729, 'E_nuc': 13.376394, 'E_tot': -27.471336},
+        'H2O': {'E_elec': -493.546003, 'E_nuc': 144.984542, 'E_tot': -348.561461},
+        'CH4': {'E_elec': -386.849762, 'E_nuc': 203.668120, 'E_tot': -183.181642},
+        'NH3': {'E_elec': -433.776574, 'E_nuc': 185.943634, 'E_tot': -247.832940},
+    },
+    'PM6': {
+        'H2':  {'E_elec': -43.504671, 'E_nuc': 15.391764, 'E_tot': -28.112907},
+        'H2O': {'E_elec': -457.613320, 'E_nuc': 138.540585, 'E_tot': -319.072734},
+        'CH4': {'E_elec': -393.765398, 'E_nuc': 216.596686, 'E_tot': -177.168712},
+        'NH3': {'E_elec': -409.149911, 'E_nuc': 189.328518, 'E_tot': -219.821393},
+    },
+}
+
+
+@pytest.mark.parametrize("method", ["RM1", "AM1", "PM6"])
+@pytest.mark.parametrize("mol_name", ["H2", "H2O", "CH4", "NH3"])
+def test_energy_vs_pyseqm(method, mol_name):
+    """Test that energies match PYSEQM to < 0.001 eV."""
+    atoms, coords = MOLS[mol_name]
+    ref = PYSEQM_REF[method][mol_name]
+
+    result = nddo_energy(list(atoms), coords, method=method, max_iter=200, conv_tol=1e-8)
+
+    assert result['converged'], f"{method} {mol_name} did not converge"
+    assert abs(result['electronic_eV'] - ref['E_elec']) < 0.001, \
+        f"{method} {mol_name} E_elec: {result['electronic_eV']:.6f} vs {ref['E_elec']:.6f}"
+    assert abs(result['nuclear_eV'] - ref['E_nuc']) < 0.001, \
+        f"{method} {mol_name} E_nuc: {result['nuclear_eV']:.6f} vs {ref['E_nuc']:.6f}"
+    assert abs(result['energy_eV'] - ref['E_tot']) < 0.001, \
+        f"{method} {mol_name} E_tot: {result['energy_eV']:.6f} vs {ref['E_tot']:.6f}"
+
+
+def test_batch_matches_single():
+    """Test that batch SCF gives same results as single molecule."""
+    mol_list = [(list(a), c) for a, c in MOLS.values()]
+    batch_results = nddo_energy_batch(mol_list, method='RM1', use_metal=False)
+
+    # 1e-8 eV, not bit-equality. The two paths reach the same energy by
+    # different float orderings: the single path's core Hamiltonian takes the
+    # batched Slater overlap, which differs from the scalar one by a single ULP
+    # (2.2e-16 measured), and an SCF amplifies that to ~7e-10 eV on a -183 eV
+    # total. The bound is still an order of magnitude under the SCF's own
+    # conv_tol, and any real divergence — a wrong parameter, a mispaired atom —
+    # lands at 1e-3 or worse.
+    for i, (name, (atoms, coords)) in enumerate(MOLS.items()):
+        single = nddo_energy(list(atoms), coords, method='RM1')
+        assert abs(batch_results[i]['energy_eV'] - single['energy_eV']) < 1e-8, \
+            f"Batch vs single mismatch for {name}"
+
+
+def test_all_methods_converge():
+    """Test that all 7 methods converge for water."""
+    atoms, coords = MOLS['H2O']
+    for method in ['RM1', 'AM1', 'PM3', 'PM6', 'AM1_STAR', 'RM1_STAR']:
+        result = nddo_energy(list(atoms), coords, method=method, max_iter=200)
+        assert result['converged'], f"{method} did not converge for H2O"
+
+
+def test_density_trace():
+    """Test that Tr(P) = n_electrons for all methods."""
+    atoms, coords = MOLS['H2O']
+    for method in ['RM1', 'AM1', 'PM6']:
+        result = nddo_energy(list(atoms), coords, method=method)
+        P = result['density']
+        n_elec = 8  # O(6) + H(1) + H(1)
+        assert abs(np.trace(P) - n_elec) < 0.01, \
+            f"{method} Tr(P) = {np.trace(P):.4f} != {n_elec}"
+
+
+def test_molecular_charge_sets_electron_count_for_anions():
+    """Charged closed-shell molecules must not use neutral atom electron counts."""
+    atoms = [8, 1]
+    coords = np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]])
+
+    for method in ['RM1', 'AM1', 'PM3', 'PM6', 'PM6_D', 'AM1_STAR', 'RM1_STAR']:
+        result = nddo_energy(atoms, coords, method=method, molecular_charge=-1, max_iter=200)
+        assert result['converged'], f"{method} did not converge for OH-"
+        assert result['n_electrons'] == 8
+        assert np.isclose(np.trace(result['density']), 8.0, atol=1e-6)
+        assert np.isclose(np.sum(result['charges']), -1.0, atol=1e-6)
+
+
+def test_batch_molecular_charges_match_single():
+    atoms = [8, 1]
+    coords = np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0]])
+
+    single = nddo_energy(atoms, coords, method='AM1', molecular_charge=-1)
+    batch = nddo_energy_batch([(atoms, coords)], method='AM1', molecular_charges=[-1], use_metal=False)[0]
+
+    assert batch['n_electrons'] == single['n_electrons']
+    assert np.isclose(np.sum(batch['charges']), -1.0, atol=1e-6)
+    assert np.allclose(batch['charges'], single['charges'], atol=1e-6)
+
+
+def test_batched_symmetric_eigh_uses_mlx_addons_hook(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_batched_eigh(matrix):
+        calls["n"] += 1
+        return mx.linalg.eigh(matrix, stream=mx.cpu)
+
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_LOOKED_UP", True)
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_FN", fake_batched_eigh)
+
+    matrix = mx.array(np.array([[[2.0, 0.2], [0.2, 1.0]]], dtype=np.float32))
+    eigvals, eigvecs = scf_mod._batched_symmetric_eigh(matrix)
+    mx.eval(eigvals, eigvecs)
+
+    assert calls["n"] == 1
+    np.testing.assert_allclose(np.asarray(eigvals), np.linalg.eigvalsh(np.asarray(matrix)), atol=1e-5)
+
+
+def test_batched_symmetric_eigh_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_LOOKED_UP", True)
+    monkeypatch.setattr(scf_mod, "_BATCHED_EIGH_FN", None)
+
+    matrix = mx.array(np.array([[[2.0, 0.2], [0.2, 1.0]]], dtype=np.float32))
+    eigvals, eigvecs = scf_mod._batched_symmetric_eigh(matrix)
+    mx.eval(eigvals, eigvecs)
+
+    np.testing.assert_allclose(np.asarray(eigvals), np.linalg.eigvalsh(np.asarray(matrix)), atol=1e-5)
+
+
+def test_metal_batch_path_reports_eigh_backend():
+    atoms, coords = MOLS['H2O']
+
+    result = nddo_energy_batch([(list(atoms), coords)], method='AM1', use_metal=True, max_iter=100)[0]
+
+    assert result['converged']
+    assert result['eigh_backend'] == "mx.linalg.eigh(cpu)" or result['eigh_backend'].startswith(
+        "mlx_addons.linalg.batched_eigh"
+    )
+
+
+def test_sign_density_solver_matches_eigh():
+    """Forced 'sign' solver reproduces eigh charges/energies on known geometries."""
+    mols = [(list(MOLS[k][0]), MOLS[k][1]) for k in ('H2O', 'CH4', 'NH3')]
+
+    res_eigh = scf_mod.rm1_energy_batch_mlx(
+        mols, method='AM1', max_iter=120, conv_tol=1e-6, density_solver='eigh')
+    res_sign = scf_mod.rm1_energy_batch_mlx(
+        mols, method='AM1', max_iter=120, conv_tol=1e-6, density_solver='sign')
+
+    for r_e, r_s in zip(res_eigh, res_sign):
+        assert r_e['converged'] and r_s['converged']
+        assert r_e['density_solver'] == 'eigh'
+        assert r_s['density_solver'] in ('sign', 'eigh(sign_fallback)')
+        np.testing.assert_allclose(r_s['charges'], r_e['charges'], atol=2e-4)
+        assert abs(r_s['energy_eV'] - r_e['energy_eV']) < 5e-3
+
+
+def test_density_solver_auto_dispatch():
+    """'auto' keeps eigh below the GPU Jacobi limit and switches to sign above it."""
+    small = [(list(MOLS['H2O'][0]), MOLS['H2O'][1])]
+    r_small = scf_mod.rm1_energy_batch_mlx(small, method='AM1', max_iter=50)[0]
+    assert r_small['density_solver'] == 'eigh'
+
+    large_atoms = [6] * 9 + [1] * 20
+    large_coords = np.array([[float(i), 0.0, 0.0] for i in range(len(large_atoms))])
+    r_large = scf_mod.rm1_energy_batch_mlx(
+        [(large_atoms, large_coords)], method='AM1', max_iter=3)[0]
+    assert r_large['density_solver'] == 'sign'
+
+
+def test_metal_batch_buckets_by_basis_size():
+    small_atoms, small_coords = MOLS['H2O']
+    large_atoms = [6] * 9 + [1] * 20
+    large_coords = np.array([[float(i), 0.0, 0.0] for i in range(len(large_atoms))])
+
+    results = nddo_energy_batch(
+        [(list(small_atoms), small_coords), (large_atoms, large_coords)],
+        method='AM1',
+        use_metal=True,
+        max_iter=3,
+    )
+
+    assert len(results) == 2
+    assert results[0]['batch_bucket_count'] == 2
+    assert results[1]['batch_bucket_count'] == 2
+    assert results[0]['batch_bucket_max_basis'] <= 32
+    assert results[1]['batch_bucket_max_basis'] > 32
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
