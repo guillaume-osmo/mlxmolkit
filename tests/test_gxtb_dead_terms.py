@@ -73,9 +73,11 @@ def test_previously_dead_term_runs(flag):
 def test_previously_dead_term_actually_changes_the_density(flag):
     """A term that runs but moves nothing would be dead in a subtler way.
 
-    ``use_aniso_h0`` is deliberately excluded: on water it shifts q(O) by only
-    ~0.002 e, which is real but too small to assert as a guard.
+    ⚠️ Switched around: these terms are ON in the default configuration now,
+    so enabling them is a no-op and the question is whether DISABLING them
+    moves anything. ``use_aniso_h0`` stays excluded: on water it shifts q(O)
+    by only ~0.002 e, which is real but too small to assert as a guard.
     """
     base = _q()
-    with_term = _q(**{flag: True})
-    assert np.abs(with_term - base).max() > 1e-3
+    without_term = _q(**{flag: False})
+    assert np.abs(without_term - base).max() > 1e-3

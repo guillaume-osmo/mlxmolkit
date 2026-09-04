@@ -40,6 +40,16 @@ D4S_ALP = 0.5395219242
 D4S_BETA = 0.654
 D4S_S6 = 1.0
 D4S_S8 = 0.0
+#: Three-body (Axilrod-Teller-Muto) scale. Read from the live parameter block
+#: of the reference implementation, and confirmed independently: with s9 = 1
+#: the three-body energy falls short of the reference's by exactly this
+#: factor on every one of 13 molecules, constant to 2e-11.
+D4S_S9 = 1.826410691
+#: Real-space cutoff of the three-body sum, in Bohr. The calculator hands the
+#: constructor 40, and the constructor overwrites it with 25; the sum reads the
+#: overwritten value. At 40 the largest molecules come out 1e-3 high, at 25
+#: they agree to 4e-14.
+D4S_CUTOFF3 = 25.0
 #: `mctc_ncoord_erf`'s steepness.
 D4S_KCN = 7.5
 #: `sqrt(tiny)`, the guard `weight_references` uses on the normalisation.

@@ -444,7 +444,7 @@ def _first_order_offsite(
     return energy, potential
 
 
-def gxtb_energy(
+def _gxtb_energy_legacy(
     atomic_numbers: list[int] | np.ndarray,
     coords_ang: np.ndarray,
     *,
@@ -900,3 +900,19 @@ def gxtb_energy_gradient(
         **energy_kwargs,
     )
     return res
+
+
+# ---------------------------------------------------------------------------
+# The g-xTB solver proper lives in `gxtb_scf`. The entry point below keeps
+# this module's public name and applies the validated configuration as its
+# defaults; any keyword the caller passes takes precedence.
+# ---------------------------------------------------------------------------
+from . import gxtb_scf as _gxtb_scf  # noqa: E402
+
+
+def gxtb_energy(atomic_numbers, coords_ang, **kwargs):
+    """g-xTB single point. See :func:`gxtb_scf.gxtb_energy` for the keywords."""
+
+    cfg = dict(_gxtb_scf.SOLVE_KWARGS)
+    cfg.update(kwargs)
+    return _gxtb_scf.gxtb_energy(atomic_numbers, coords_ang, **cfg)
