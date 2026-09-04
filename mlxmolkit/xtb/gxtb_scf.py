@@ -61,8 +61,7 @@ KCAL_PER_HARTREE = 627.5094740631
 # The recovered multipole model, OFF until its `vat` is wired correctly.
 #
 # The chain itself is exact -- `gxtb_aes_recovered` matches the binary's own
-# container to 1e-17 on H2O, CH3SH and benzene (gxtb-recovery
-# probes/audit/port_divergence.py stage 8c) -- but switching it on here blows
+# container to 1e-17 on H2O, CH3SH and benzene -- but switching it on blows
 # the benchmark up (max_abs_dq 0.249 -> 7.69), because `pot%vat` is NOT the
 # port's `vs`:
 #
@@ -89,7 +88,7 @@ GXTB_TB3_KX = 1.3
 GXTB_TB3_REXP = 0.2093327496
 # 4th-order onsite hardness Gamma4_sh = shell_fourth * K4TH_SCALE, where
 # shell_fourth = pg_tb4_kshell[l] (NO pa_tb3_hubbard_derivs factor; see gxtb_basis).
-# Binary-exact: add_coulomb 0x41a0b4 loads DAT_005dbbe8 = 0.036 and multiplies
+# Binary-exact: add_coulomb loads DAT_005dbbe8 = 0.036 and multiplies
 # pg_tb4_kshell directly -- no per-element hubbard factor. Energy = sum q^4 Gamma4/24,
 # potential = q^3 Gamma4/6 (the /6 and /24 below are the only divisors).
 GXTB_K4TH_SCALE = 0.036
@@ -99,51 +98,51 @@ GXTB_TB1_KS = 0.666666666
 GXTB_TB1_CN_EPS = 1.0e-12
 # Mulliken-Fock-exchange range-separation scalars. VERIFIED against the released
 # g-xTB binary: the exact constants new_exchange_fock receives are baked at
-# libxtb __const 0x73b4d8.. = {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
+# the model record = {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
 # NB: the public gp3.f90 source declares fock_omega=0.300, but that branch is STALE;
 # the released binary uses omega=0.2 (this value). Binary is authoritative.
 GXTB_MFX_FR_SCALE = 0.15
-# DECODED, 2026-08-27.  `get_mulliken_kmatrix` passes the envelope scalars to
+# Established, 2026-08-27.  `get_mulliken_kmatrix` passes the envelope scalars to
 # `get_gmulliken_0d` as lVar6+0x10 / +0x18 / +0x20, dereferenced in the omp body
 # as FR, OM and LR (offsite envelope = *pdVar18 + erf(R * *pdVar36) * *pdVar19).
-# The g-xTB exchange record is the __const block at libxtb vm 0x74a2d0, where
-# +0x10 = 0.15 (FR), +0x18 = 0.2 (OM), +0x28 = 1.3826597204 (GE) and
-# +0x30 = 0.05 (pg_fock_offdiag_l) all match constants this port had already
+# The g-xTB exchange record is the model record, where
+# +, 0.15 (FR), +, 0.2 (OM), +, 1.3826597204 (GE) and
+# +, 0.05 (pg_fock_offdiag_l) all match constants this port had already
 # verified independently -- four confirmations that it is the right record.
 # ⚠️ The line that used to stand here claimed "+0x20 holds **1.0**, not the
 # 0.85 taken from the tblite/GFN2 block", justified by "worth 1.7006 -> 1.2293
 # eV on the H-L gap". That was a FIT wearing a decode's clothes, and it is
 # wrong. Two independent checks say 0.85:
 #
-#   * `recovered/xtb_gxtb/add_exchange.f90` -- which has a passing differential
+#   * `add_exchange` -- which has a passing differential
 #     test against the binary -- declares `fock_lrscale = 0.85_wp` and passes
 #     (fock_alpha, fock_omega, fock_lrscale) = (0.15, 0.2, 0.85) to
 #     `new_exchange_fock`.
 #   * Reading the exchange container OUT OF A LIVE CALCULATOR (calc + 0x600)
-#     gives +0x10 = 0.15, +0x18 = 0.2, +0x20 = 0.85.
+#     gives +, 0.15, +, 0.2, +, 0.85.
 #
 # and 0.15 + 0.85 = 1.0 is the short-range/long-range split, as it should be.
 # Reading a static __const record is not the same as reading the object the
 # constructor actually built.
 GXTB_MFX_LR_SCALE = 0.85
 GXTB_MFX_OMEGA = 0.2
-# 🔑 __const 0x73b4d8 is `onsite`, NOT gexp. The block base and slots 1-3
+# 🔑 the record is `onsite`, NOT gexp. The block base and slots 1-3
 # (lrscale 0.85, omega 0.2, frscale 0.15) were read correctly; only the NAME on
-# slot 0 was wrong. The real gexp is 1.0 at 0x73b500 (new_exchange_fock arg 13
+# slot 0 was wrong. The real gexp is 1.0 (new_exchange_fock arg 13
 # -> container +0x2d0). Verified three ways, including a 0-ulp ctypes drive of
 # the shipped get_gmulliken_0d over five (onsite, gexp) pairs: gexp acts ONLY
 # off-site, `onsite` ONLY on the shell diagonal, so they cannot substitute.
 GXTB_MFX_GEXP = 1.0
-#: __const 0x73b4d8 -> new_exchange_fock arg 7 -> container +0x230. Replaces
+#: the record -> new_exchange_fock arg 7 -> container +0x230. Replaces
 #: `favg` on the on-site shell DIAGONAL: kmat(ii+ish,ii+ish) = gam*onsite*alpha.
 GXTB_MFX_ONSITE_SCALE = 1.3826597204
 # Distance damping on the averaged shell hardness inside the MFX kernel.
-# DECODED: `get_gmulliken_0d._omp_fn.0` computes
+# Established: `get_gmulliken_0d` computes
 #     damp = exp(-(R * (c0 + xi*c1)));   pair = favg / damp
 # and `add_exchange` passes the two constants adjacently to new_exchange_fock
-# (0x73b2e8 = 0.01851153839, 0x73b2f0 = -0.2960502355).
+# (0.01851153839, -0.2960502355).
 # Verified against the binary's own H2 exchange gamma, which is recoverable
-# exactly by inverting its two printed eigenvalues (probes/h2_gamma.py):
+# exactly by inverting its two printed eigenvalues:
 #     target gamma_offsite = 0.282920   this form gives 0.28270  (0.07 %)
 # The port previously used `favg * frscale` with no damping, giving 0.145317.
 #: Set to a callable to override the MFX damping for an experiment; None = shipped
@@ -172,14 +171,14 @@ _MFX_DAMP_HOOK = None
 # 🔑 The two constants had their ROLES EXCHANGED and c0 had lost its sign. In
 # the __const block the coefficient sits at the LOWER address and the additive
 # term at the higher, so naming them in address order swaps them; the CALL SITE
-# disambiguates (add_exchange 0x418f18 passes 0x73b510 as arg 10 -> the fmadd
+# disambiguates (add_exchange passes as arg 10 -> the fmadd
 # ADDEND). The multiplicand is the vdW PAIR RADIUS, not xi: `exp` is called once
-# per ATOM PAIR at 0x34ad2c and the shell loops do not open until 0x34ae10, so a
+# per ATOM PAIR and the shell loops do not open until, so a
 # per-shell quantity is structurally incapable of entering the damping.
 #   damp = exp(-(r * (c0 + rad(izp,jzp)*c1)))     pair term = favg/damp
-#: __const 0x73b510 -> new_exchange_fock arg 10 -> container +0x2c0
+#: the record -> new_exchange_fock arg 10 -> container +0x2c0
 GXTB_MFX_DAMP_C0 = -0.2960502355
-#: __const 0x73b508 -> new_exchange_fock arg 11 -> container +0x2c8.
+#: the record -> new_exchange_fock arg 11 -> container +0x2c8.
 #: Full double: the old 0.01851153839 was a 10-digit truncation.
 GXTB_MFX_DAMP_C1 = 0.018511538388678535
 GXTB_HALIDE_INCREMENT_CORRECTION = {
@@ -316,8 +315,8 @@ def _h0_effective_overlap_cao(atoms: np.ndarray, basis, power: float = 1.0) -> n
 
 # --------------------------------------------- second-order hardness CN form
 #
-# DECODED from `___tblite_coulomb_charge_effective_MOD_get_amat_0d._omp_fn.0`
-# (Ghidra). The effective shell hardness the Coulomb A-matrix uses is
+# Read off `get_amat_0d`
+#. The effective shell hardness the Coulomb A-matrix uses is
 #
 #     eta = eta_base * (1 + cn_slope * (sqrt(cn + 1e-12) - 1e-6))
 #
@@ -346,8 +345,8 @@ def _corrected_shell_hardness(atoms: np.ndarray, basis) -> np.ndarray:
 
 # ------------------------------------------------ H0 distance factor (shpoly)
 #
-# DECODED from `___tblite_xtb_h0_MOD_get_hamiltonian._omp_fn.0` plus
-# `___tblite_xtb_gxtb_MOD_get_shpoly2` / `get_shpoly4`.
+# Read off `get_hamiltonian` plus
+# `get_shpoly2` / `get_shpoly4`.
 #
 # tblite's H0 off-diagonal carries a THREE-term distance polynomial per shell:
 #
@@ -357,7 +356,7 @@ def _corrected_shell_hardness(atoms: np.ndarray, basis) -> np.ndarray:
 #
 # For g-xTB:
 #   * `get_shpoly` is NOT overridden -- the base
-#     `___tblite_xtb_calculator_MOD_get_shpoly` writes 0, so the sqrt term
+#     `get_shpoly` writes 0, so the sqrt term
 #     VANISHES. That is precisely the term the port implements.
 #   * `get_shpoly2` = pg_h0_shpoly2[l] * 2*pa_h0_shpoly2[Z]      (`dVar18+dVar18`)
 #   * `get_shpoly4` = the same, times 0.0402348406.
@@ -365,7 +364,7 @@ def _corrected_shell_hardness(atoms: np.ndarray, basis) -> np.ndarray:
 # So the port's `1 + pa*pg*sqrt(R/rcov)` is wrong three ways: the wrong power,
 # a missing factor 2, and a missing quadratic term.
 GXTB_SHPOLY4_SCALE = 0.0402348406
-# `get_rad` (0x417308) is
+# `get_rad` is
 #     mctc_data_covrad::get_covalent_rad_num(Z) * 1.889725949
 # and mctc defines `covalent_rad_d3 = 4/3 * covalent_rad_2009` (Pyykko).
 #
@@ -379,7 +378,7 @@ GXTB_SHPOLY4_SCALE = 0.0402348406
 # Both numbers are definitions, not fits.
 GXTB_RCOV_SCALE = (4.0 / 3.0) / ANG_TO_BOHR
 
-# ...and both were wrong. `recovered/xtb_gxtb/get_rad.f90` (differential test vs
+# ...and both were wrong. `get_rad` (differential test vs
 # the binary) says:
 #
 #     rad = get_covalent_rad_num(Z) * 0.75 / 1.8897261246204404 * 1.889725949
@@ -402,7 +401,7 @@ GXTB_RAD_OVERRIDE = {
 
 # ------------------------------------------- the diatomic frame, for real
 #
-# `recovered/tblite_integral_diat_trafo/diat_trafo.f90` + `scale_diatomic_frame`
+# `diat_trafo` + `scale_diatomic_frame`
 # (both differential-tested against the binary). `get_hamiltonian` calls it on
 # the WHOLE atom-pair block of the H0-basis overlap, in the cumulative
 # real-spherical layout sdim(l) = (l+1)**2, BEFORE multiplying by hij:
@@ -423,7 +422,7 @@ GXTB_RAD_OVERRIDE = {
 # one sign flip, because `cao_to_sao_transform` defines z2 as 0.5(xx+yy) - zz
 # = -d_z2). The map was not guessed: it is the UNIQUE choice out of all 3!*2^2
 # x 5!*2^4 permutation/sign combinations that makes a real S block m-diagonal
-# in the diatomic frame -- probes/diat_trafo_np.py, residual 1.4e-16.
+# in the diatomic frame -- a differential test, residual 1.4e-16.
 
 _DIAT_PERM = {0: ([0], [1.0]),
               1: ([1, 2, 0], [1.0, 1.0, 1.0]),
@@ -595,7 +594,7 @@ def build_hcore_gxtb(
     """Frozen H0 builder, vectorised, with the decoded shpoly polynomial.
 
     `decoded_shpoly=False` reproduces the frozen builder exactly (pinned by
-    probes/check_hcore.py).
+    a differential test).
     """
     if not decoded_shpoly:
         return _frozen_build_hcore_gxtb(
@@ -656,8 +655,8 @@ def build_hcore_gxtb(
 
 # ------------------------------------------- charge-dependent SCF repulsion
 #
-# DECODED from `___tblite_repulsion_gxtb_MOD_get_scaled_zeff` and
-# `___tblite_repulsion_gxtb_MOD_get_potential`:
+# Read off `get_scaled_zeff` and
+# `get_potential`:
 #
 #     zeff_i = (1 - q_i * pa_rep_q[Z_i]) * pa_rep_zeff[Z_i]
 #     V_i   -= (dE/dzeff_i) * pa_rep_zeff[Z_i] * pa_rep_q[Z_i]
@@ -971,10 +970,10 @@ def _d4srev_atom_potential_fast(basis, atoms, coords_ang, qat):
 # file "exists nowhere on this machine". It does now: both tables are static
 # data in the binary and were read straight out of it.
 #
-#     ___tblite_data_onecxints_MOD_onecxints  @ 0x6c0d58  (103 x 10 float64)
-#     ___tblite_data_onecxints_MOD_lidx       @ 0x6c2d88  (4 x 4 int32)
+#     onecxints  (103 x 10 float64)
+#     lidx  (4 x 4 int32)
 #
-# The size is exactly 0x6c2d88 - 0x6c0d58 = 8240 B = 1030 doubles = 103 x 10,
+# The size is exactly -, 8240 B = 1030 doubles = 103 x 10,
 # and the values behave like one-centre exchange integrals should: 0.03-0.18 Ha
 # and monotonic across a period (C 0.1321 < N 0.1452 < O 0.1631 < F 0.1828).
 # `lidx` is the usual packed (l1,l2) map, 1-based as Fortran writes it.
@@ -1016,7 +1015,7 @@ def _install_onecxints() -> bool:
 # the per-component work is three multiplies at fixed table indices (blocking by
 # angular type means no gather). 6.0x over the compiled path on the large
 # molecules, and the result agrees with it to 2.9e-16.
-# `probes/check_xover2.py` pins the two against each other.
+# a differential test pins the two against each other.
 
 _ACP_NCOMP = (1, 3, 6, 10)
 
@@ -1273,14 +1272,14 @@ def build_gxtb_acp_hamiltonian(atomic_numbers, coords_ang, basis, *, enabled=Tru
 #
 # The repo already ships a compiled kernel whose first output IS that overlap
 # (`multipole_matrices_cpp`), used here for AES and ACP after being checked
-# exact. Same swap, same verification (`probes/check_basis.py`).
+# exact. Same swap, same verification (a differential test).
 #
 # Pure cost: the basis, the overlap and every downstream number are unchanged.
 
 
 # --------------------------------------- the H0 basis is a SECOND cgto set
 #
-# `recovered/xtb_gxtb/new_gxtb_calculator.f90` (differential test vs the binary)
+# `new_gxtb_calculator` (differential test vs the binary)
 # builds TWO q-vSZP sets per shell:
 #
 #     call new_qvszp_cgto(c1, num, ish, .true., error)              ! density
@@ -1342,17 +1341,17 @@ def _qeff_h0(atoms: np.ndarray, basis) -> np.ndarray:
 
 # ------------------------------------------------- anisotropic H0, decoded
 #
-# `recovered/tblite_xtb_h0/{get_anisotropy,get_hamiltonian}.f90`, both with a
+# `get_anisotropy,get_hamiltonian`, both with a
 # passing differential test against the binary.
 #
 #     aniso(:, a) = sum_{b /= a} (r_b - r_a) * f_ab              [NOT normalised]
 #     f_ab = 0.5*(1 + erf(-dpol_scale*(|r_ab| - rvdw(za,zb)))) * dpol(za,zb)
 #
 # with, from `tblite_xtb_gxtb::get_anisotropy` / `::get_rvdw` (both read via the
-# adrp, NOT Ghidra's labels -- it mislabelled the mode word as 0x73b260 and the
-# scale table as 0x745ae8; the real ones are 0x73b480 and pa_rvdw_scale):
+# the constant loads, NOT the automatic labels -- it mislabelled the mode word as and the
+# scale table as; the real ones are and pa_rvdw_scale):
 #
-#     dpol_scale = 1.5                       (0x3ff8000000000000, immediate)
+#     dpol_scale = 1.5
 #     dpol(i,j)  = arithmetic_avg(pa_h0_dip_scale[Zi], pa_h0_dip_scale[Zj])
 #     rvdw(i,j)  = vdw_rad_pair(Zi,Zj) * arithmetic_avg(pa_rvdw_scale[Z..])
 #
@@ -1412,10 +1411,9 @@ def _aniso_h0_decoded(basis, atoms, coords_ang):
 # ------------------------------------------------ the basis itself was wrong
 #
 # Found by RUNNING both sides on the same molecule and diffing every
-# intermediate (`gxtb-recovery/probes/audit/port_divergence.py`), not by
-# reading. Three things, in order of size:
+# intermediate in a stage-by-stage divergence run, not by reading. Three things, in order of size:
 #
-# 1. SHELL COUNT -- NOT a bug. `probes/h0_get_hamiltonian`'s harness picks the
+# 1. SHELL COUNT -- NOT a bug. a differential test's harness picks the
 #    shell count itself (it counts how many q-vSZP templates exist, giving H
 #    two shells and O three, nao = 17 for water), which is NOT what the
 #    calculator does. `new_gxtb_calculator` uses `nsh_id = pa_nshell`, and
@@ -1423,7 +1421,7 @@ def _aniso_h0_decoded(basis, atoms, coords_ang):
 #    what the port has. `include_polarization_shells` stays False.
 #
 # 2. CN STEEPNESS. `_gxtb_erf_coordination_number` defaults to `k = 2.068`,
-#    sourced from a literal at 0x73b270 -- one of the addresses Ghidra
+#    sourced from a literal -- one of the addresses the automatic labelling
 #    mislabelled in this binary. The value that reproduces the binary's own
 #    contraction is 3.75 (fitted 3.749992 against the binary's overlap over a
 #    9-atom molecule, residual 4.8e-8 -- the fit's floor).
@@ -1518,8 +1516,8 @@ def _shell_qref(atoms, basis):
 
 # ------------------------------------- the onsite first-order term, decoded
 #
-# `recovered/tblite_coulomb_firstorder/get_potential.f90`, bit-exact (0 ulp)
-# against the binary over probes/fo_get_potential. `add_coulomb` constructs it,
+# `get_potential`, bit-exact (0 ulp)
+# against the binary over a differential test `add_coulomb` constructs it,
 # so it is part of the model.
 #
 #     mu(ish) = ipea(ish,izp)*0.5*((sqrt(cn + 1e-12) - 1e-6)*ipea_cn(izp) + 1)
@@ -1576,7 +1574,7 @@ def _first_order_decoded(atoms, cn, shell_atom, shell_l, qsh):
 # `coulomb_thirdorder_twobody::get_potential` (recovered, 0 ulp) applies
 # alpha = 1/3 to BOTH dsymv calls, so the whole term carries a factor of a
 # third that `gxtb_aes.gxtb_twobody_thirdorder` does not have. The port was 3x
-# too large on it. (The constant is at 0x6b9418; Ghidra labels that operand
+# too large on it. (The constant is; the automatic labelling labels that operand
 # DAT_006b91f8, which holds 1.0 -- believing the label is exactly how a missing
 # 1/3 gets written.)
 GXTB_TB3_TWOBODY_SCALE = 1.0 / 3.0
@@ -1682,7 +1680,7 @@ def _restore_calc_cn(basis, atoms, coords_ang, calc_cn=None):
 # population is -0.005 against the oracle's +0.202, and the missing d density
 # reappears as an s deficit and a p excess.
 #
-# The decoded rule (probes/DECODED.md) is that the binary applies the FULL
+# The decoded rule is that the binary applies the FULL
 # sigma/pi/delta scales to the m-diagonal elements in the spherical frame. Doing
 # exactly that overshoots the d population by 2x (0.429 vs 0.202), which says
 # our d basis function is too diffuse, not that the rule is wrong.
@@ -1698,7 +1696,7 @@ _hcore_mod.GXTB_D_H0_SCALE_DAMP = GXTB_D_H0_SCALE_DAMP
 # --------------------------------------- diatomic overlap scaling, made cheap
 #
 # Same arithmetic as `hcore_gxtb._diatomic_scaled_overlap_cao`, pinned
-# bit-identical by `probes/check_diat.py`. Two pure-cost changes:
+# bit-identical by a differential test. Two pure-cost changes:
 #
 #   * the frozen version indexes every shell-pair block with `np.ix_`, which is
 #     29,532 calls per six molecules and 11 % of runtime. CAO functions of a
@@ -1719,7 +1717,7 @@ def _diatomic_scaled_overlap_cao(atomic_numbers, coords_bohr, basis):
     one (n_cao, n_cao) mask from a tiny (3, 3, n_elem, n_elem) table and apply
     it in one multiply, leaving only the p-p blocks for the loop -- ~435 of them
     instead of ~5 000.  Same multiplications in the same places, so the scalar
-    part is bit-identical; probes/check_diat.py pins it.
+    part is bit-identical; a differential test pins it.
     """
     atoms = np.asarray(atomic_numbers, dtype=np.intp)
     S = np.asarray(basis.S_cao, dtype=np.float64).copy()
@@ -1809,7 +1807,7 @@ def _diatomic_scaled_overlap_cao(atomic_numbers, coords_bohr, basis):
 #     bincount(aoat[:,None] broadcast, X.ravel()) == bincount(aoat, X.sum(axis=1))
 #     bincount(aoat[None,:] broadcast, X.ravel()) == bincount(aoat, X.sum(axis=0))
 # so an nao^2 integer scatter becomes an nao^2 float sum plus an nao scatter.
-# `probes/check_reduce.py` pins it bit-identical.
+# a differential test pins it bit-identical.
 
 
 def _atom_reduce_fast(values_i, values_j, values_diag, aoat, nat):
@@ -1846,7 +1844,7 @@ def _coulomb_matrix(
     # ⚠️ The same-atom block IS a special case.  The comment that used to sit
     # here claimed R = 0 makes `1/(R + inv_avg*exp(0))` identical to `1/inv_avg`
     # "bit for bit"; it is not -- a round trip through the reciprocal loses the
-    # last bit, and `probes/audit/port_stages.py` stage 10b reported exactly
+    # last bit, and a differential test stage 10b reported exactly
     # that as 5.6e-17.  The recovered `get_coulomb_matrix` writes the on-site
     # block DIRECTLY:
     #     amat(ii+ish, ii+ish) += etai              (the shell's own hardness)
@@ -1856,7 +1854,7 @@ def _coulomb_matrix(
     #     gam = 2/(1/a + 1/b) ;  tmp = r + damp/gam ;  A = 1/tmp
     # `0.5*(1/a + 1/b) * damp` is the same number algebraically and a different
     # one in floating point -- 5.6e-17 on ordinary input, which is exactly what
-    # `probes/audit/port_stages.py` stage 10b was reporting.  Kept in the
+    # a differential test stage 10b was reporting.  Kept in the
     # binary's association.
     gam = 2.0 / (1.0 / g[:, None] + 1.0 / g[None, :])
     xyz = np.asarray(coords_bohr, dtype=np.float64)[np.asarray(shell_atom, dtype=np.intp)]
@@ -1884,7 +1882,7 @@ def _mulliken_shell_charges(P: np.ndarray, S: np.ndarray, bf_to_shell: np.ndarra
 # ddot on ravelled views).  The earlier scan rejected a longer history because
 # the bigger Pulay solve ate the gain; with that cost removed the trade flips:
 # 18.6 -> 16.8 mean iterations now shows up as ~6 % of wall time.
-# probes/scan_diis.py: warm=3/hist=6 1.14 s -> warm=2/hist=12 0.99 s.
+# a differential test: warm=3/hist=6 1.14 s -> warm=2/hist=12 0.99 s.
 GXTB_DIIS_WARMUP = 2
 GXTB_DIIS_MAX = 12
 
@@ -1986,7 +1984,7 @@ def _solve_generalized(F: np.ndarray, S: np.ndarray) -> tuple[np.ndarray, np.nda
     the whole SCF -- ~19 calls per molecule.  Factor it once, cache the inverse
     factor, and each iteration is then two matmuls plus a standard eigensolve.
 
-    Benchmarked at n=92 (probes/bench_eigh.py): the generalized driver is
+    Benchmarked at n=92: the generalized driver is
     0.492 ms, this path 0.410 ms.  Every LAPACK backend reachable from here
     lands on the same 0.386 ms standard eigensolve -- numpy on Accelerate,
     scipy driver='evd' and torch CPU are within 1 % of each other, driver='evr'
@@ -2040,7 +2038,7 @@ def _generalized_hubbard_average(ua: float, ub: float, xi: float) -> float:
     return (2.0 ** (xi - 1.0)) * ((ua * ub) ** (0.5 * xi)) / ((ua + ub) ** (xi - 1.0))
 
 
-# DECODED (get_gmulliken_0d._omp_fn.0, onsite block at LAB_0034aef0).  The
+# Established (get_gmulliken_0d._omp_fn.0, onsite block at LAB_0034aef0).  The
 # Mulliken kernel has TWO onsite forms the port did not distinguish:
 #     same atom, different shells:  gamma = u_i * u_j        * FR
 #     same atom, same shell:        gamma = u_i * ONSITE_DIAG * FR
@@ -2050,7 +2048,7 @@ def _generalized_hubbard_average(ua: float, ub: float, xi: float) -> float:
 # dereferenced in the omp body as *pdVar35).  That field is populated at run
 # time, so its value is not readable from the static image; it is instead
 # MEASURED from the binary's own H2 output by exact Fock inversion
-# (probes/h2_gamma.py): the binary's onsite gamma is 0.194598 against the
+#: the binary's onsite gamma is 0.194598 against the
 # port's u*FR = 0.506054, giving 0.194598/0.506054.
 GXTB_MFX_ONSITE_DECODED = False
 # Scale of the ONSITE exchange component (get_gons): gons = (1 - 0.5*(kq_a q_a
@@ -2080,21 +2078,21 @@ def _mfx_gamma_ao(
 ) -> np.ndarray:
     """Range-separated Mulliken Fock-exchange AO kernel.
 
-    Vectorised rewrite of the original double loop; `probes/check_mfx.py` pins
+    Vectorised rewrite of the original double loop; a differential test pins
     it against that loop at machine precision. The closed form of
     `_generalized_hubbard_average` covers its xi=0/1/2 special cases exactly
     (2^(xi-1) (ua ub)^(xi/2) / (ua+ub)^(xi-1) reduces to the arithmetic,
     geometric and harmonic mean respectively), so dropping the branches is not
     an approximation.
 
-    Scalars are binary-verified at libxtb __const 0x73b4d8:
+    Scalars are verified against the reference in the model record:
     frscale=0.15, lrscale=0.85, omega=0.2, gexp=1.3826597204.
 
-    The two optional pieces are DECODED, not guessed: `add_exchange`
-    (libxtb 0x4182c0) resolves adrp/add loads against `pg_fock_offdiag_l` and
+    The two optional pieces are Established, not guessed: `add_exchange`
+ resolves the constant loads against `pg_fock_offdiag_l` and
     `pg_fock_kq` as well as the `ps_fock_shell_hubbard` / `ps_fock_avg_exp`
     this function already used, so both belong in this kernel. Their exact
-    algebraic placement is still inferred -- see probes/DECODED.md.
+    algebraic placement is still inferred -- see the decoding notes.
     """
 
     atoms = np.asarray(atomic_numbers, dtype=np.intp)
@@ -2107,7 +2105,7 @@ def _mfx_gamma_ao(
     Z = atoms[shell_atom]
     hub = np.asarray(GXTB_PARAMS["ps_fock_shell_hubbard"], dtype=np.float64)
     avg = np.asarray(GXTB_PARAMS["ps_fock_avg_exp"], dtype=np.float64)
-    # 🔑 add_exchange 0x418670 `fmul d30, d30, d31`:
+    # 🔑 add_exchange `fmul d30, d30, d31`:
     #     gpar(ish,izp) = ps_fock_shell_hubbard(ish,num) * pa_hubbard_parameter(num)
     # d31 is loaded ONCE per species outside the shell loop, so it is a clean
     # per-element scalar on every shell. Cross-checked against the binary's own
@@ -2129,7 +2127,7 @@ def _mfx_gamma_ao(
     rij = np.sqrt(np.sum(d * d, axis=-1))
 
     if _MFX_DAMP_HOOK is not None:
-        # Experiment hook (probes/mfx_damping_ab.py). Default None = untouched.
+        # Experiment hook. Default None = untouched.
         gam = _MFX_DAMP_HOOK(favg=favg, rij=rij, xi=xi, zbf=Z[ish],
                              frscale=float(frscale))
     elif decoded_damping:
@@ -2220,7 +2218,7 @@ def _mfx_gamma_ao(
         gamma = np.where(diff_shell, gamma * f, gamma)
 
     if kq_onsite and qsh is not None:
-        # DECODED (`get_gons._omp_fn.0`): the charge factor
+        # Established (`get_gons`): the charge factor
         # `(1 - 0.5*(kq_a q_a + kq_b q_b))` belongs to the ONSITE exchange
         # component, not to the whole Mulliken kernel. Applying it everywhere
         # (use_kq) is destructive; applying it to same-atom blocks is the
@@ -2267,7 +2265,7 @@ def _twobody_tau(basis, atoms, coords_ang, *, k3=2.3, kx=1.3, rexp=0.2093327496)
     """Geometry-only tau matrix of the two-body third order term.
 
     Same algebra as `gxtb_aes.gxtb_twobody_thirdorder`, hoisted out of the SCF
-    loop.  probes/check_tb3.py pins the (E3, V3) pair against the frozen routine.
+    loop.  a differential test pins the (E3, V3) pair against the frozen routine.
     """
     key = id(basis)
     hit = _TB3_TAU_CACHE.get(key)
@@ -2352,14 +2350,14 @@ def _shell_local_indices(shell_atom: np.ndarray) -> np.ndarray:
 #
 # with a = kx*(q - ks), b = kx*(q + ks) and q = wfn%qat -- the ATOM charge, in
 # tblite's own convention, which is the port's too (both give O = -0.7 in
-# water). There is NO negation in either branch of the decompile, so the
+# water). There is NO negation in either branch of the reference implementation, so the
 # docstring's `charge_sign=-1` is wrong; the decoded value is +1.
 #
 # ⚠️ +1 fits oxygen WORSE than -1 does (H2O 0.31 vs 0.08 against the binary's
 # converged charges) while fitting sulfur much better (H2S 0.03 vs 0.48).
 # Neither sign fits both, so the disagreement is in the FORM, not the sign,
 # and this term needs its own differential probe before it can be trusted.
-# The decoded sign is used here because the decompile is the oracle.
+# The decoded sign is used here because the reference implementation is the oracle.
 GXTB_FO_SIGN = 1.0
 GXTB_FO_QREF = 0.0
 
@@ -2442,7 +2440,7 @@ def qvszp_multipoles(basis):
     and is the single largest cost in the AES path once ``mmompop``/``setvsdq``
     are vectorised.  The repo already ships a compiled kernel for it,
     ``multipole_integrals_cpp.multipole_matrices_cpp``; it was simply never
-    wired into this route.  ``probes/check_cpp_mp.py`` checks the two against
+    wired into this route.  `a differential test` checks the two against
     each other on the three largest score molecules: max |delta| 5.5e-14 at
     400x.  Pure cost, not physics.
 
@@ -2492,7 +2490,7 @@ def gxtb_aes_fock(
     The frozen version spends ~85% of its time in ``aes.mmompop`` and
     ``aes.setvsdq``, both of which are explicit Python loops over AO/atom
     pairs.  ``mlxmolkit.xtb.aes_fast`` already carries vectorised twins of
-    exactly those two; ``probes/check_fast_aes.py`` checks them against the
+    exactly those two; `a differential test` checks them against the
     originals on the largest score molecule and finds max |delta| of 5e-15
     (dipm/qp) and 4e-16 (vs/vd/vq) — machine precision, i.e. the same
     function — at 20x and 47x.
@@ -2511,7 +2509,7 @@ def gxtb_aes_fock(
     # A COMPILED mmompop exists and the GFN2 fast path already uses it
     # (`scf_gfn2_fast.py`: `_ref.mmompop = mmompop_cpp if CPP_AVAILABLE`), but
     # the g-xTB route never did. It is the AES hot spot -- ~19 calls per
-    # molecule. Pinned bit-identical by probes/check_mmompop.py.
+    # molecule. Pinned bit-identical by a differential test.
     try:
         from mlxmolkit.xtb.multipole_integrals_cpp import CPP_AVAILABLE as _CA
         from mlxmolkit.xtb.multipole_integrals_cpp import mmompop_cpp as _mmompop
@@ -2571,8 +2569,7 @@ def gxtb_aes_fock(
         # (five amat blocks, the asymmetric sqrt(CN) scale, all FOUR damping
         # channels) + `tblite_coulomb_multipole::get_potential` (eight
         # contractions, alpha=1/3 on the last).  Verified against the binary's
-        # own container to 1e-17 on H2O, CH3SH and benzene --
-        # gxtb-recovery probes/audit/port_divergence.py stage 8c.
+        # own container to 1e-17 on H2O, CH3SH and benzene.
         #
         # `gxtb_aes_gab`/`_setvsdq_fast` are a GFN2-shaped stand-in: two of the
         # four channels, and no CN scale at all.
@@ -3017,7 +3014,7 @@ def gxtb_energy(
     defaults to True because it is the single largest missing charge term:
     against the real ``xtb --gxtb`` binary over 20 molecules / 516 atoms it takes
     the atomic-charge MAE from 0.04617 to 0.02494 e, and it wins on every one of
-    the 20 molecules individually.  See tools/gxtb_charge_oracle.py.
+    the 20 molecules individually.
 
     Two things that look like they should help and do not, both measured on the
     same set rather than inferred from water:
@@ -3269,7 +3266,7 @@ def gxtb_energy(
                     from mlxmolkit.xtb.gxtb_aes import gxtb_onsite_potential
                     V_os = gxtb_onsite_potential(P, S, basis, atoms)
                 if onsite_diag == 2:
-                    # EXACT get_kfock fold (disasm-derived): M = 0.25*OS(V)+0.5*OS(V)+0.25*diag(V)
+                    # EXACT get_kfock fold (verified against the reference): M = 0.25*OS(V)+0.5*OS(V)+0.25*diag(V)
                     # where OS(V)[j,i]=V[i]*S[j,i] (overlap-sandwich daxpy column form);
                     # then fock = -0.125*(M+M^T) off-diag, -0.25*M diag.
                     M = 0.75 * (S * V_os[None, :])
@@ -3431,7 +3428,7 @@ def gxtb_energy(
         # The rebuild above changes `S` while `P` was solved against the old
         # one, so `Tr(P.S)` -- the electron count -- comes out 7.936839 where
         # it must be 8.000000, and 13.979228 / 29.964959 where it must be
-        # 14 / 30 (walk stage 41).  Sum-of-charges still holds, so no existing
+        # 14 / 30 ().  Sum-of-charges still holds, so no existing
         # check saw it: `max_abs_qsum` is 1.05e-09 throughout.
         #
         # ONE re-solve in the new basis restores it.  This is NOT the forty
@@ -3475,7 +3472,7 @@ def gxtb_energy(
     # after the loop -- so `basis`, `S` and `H0` came out two refreshes behind
     # the charges reported beside them.  Against the binary's own
     # `basis_qvszp::basis_update` driven at those same charges, the overlap was
-    # 1.7e-2 out on H2O (walk stage 23d) while the port's basis BUILDER, given
+    # 1.7e-2 out on H2O () while the port's basis BUILDER, given
     # the same charges, reproduces the binary at 4.2e-15 (23d').  The recipe
     # was never wrong; the point it was evaluated at was.
     # ⚠️ THE RETURNED BASIS IS STILL ONE UPDATE BEHIND THE RETURNED CHARGES,
@@ -3495,7 +3492,7 @@ def gxtb_energy(
     # The coupling is exactly what a mixer exists to damp, and the binary
     # updates the contraction INSIDE `next_scf`, after the Broyden step, not
     # after the loop.  So this belongs in the SCF iteration with the mixer
-    # (walk stage 22), not in a post-loop patch.  Left out rather than left
+    # (), not in a post-loop patch.  Left out rather than left
     # wrong.
     # ⚠️ THE AES ENERGY HAS TO FOLLOW THE DENSITY THAT IS RETURNED.
     # `_F_aes_f` and `_vat_aes_f` above legitimately come from the PREVIOUS
@@ -3520,7 +3517,7 @@ def gxtb_energy(
     # electronic energy is one number: sum(P * H0).  The port summed
     # sum(P*H_eht) + sum(P*H_acp) instead, which drops the third piece of
     # `H0 = H_eht + H_acp + aniso_h0` -- worth +2.42 Ha on H2O and +9.6 on
-    # benzene.  Walk stage 23a': sum(P*H0) matches the binary at 8.9e-16.
+    # benzene.  an earlier divergence run sum(P*H0) matches the binary at 8.9e-16.
     # E_acp_h stays as a REPORTED breakdown; it is no longer added on top.
     E_h0 = float(np.sum(P * H0))
     E_acp_h = float(np.sum(P * H_acp)) if use_acp_hamiltonian else 0.0
@@ -3557,8 +3554,8 @@ def gxtb_energy(
     # binary over 60 perfumery molecules, where this expression puts the median
     # at 3.7 and reproduces water's electronic energy to 2.1e-11 Eh.
     # `F_mfx` is left alone: it is the post-loop Fock, a separate question.
-    # Recovered at recovered/exchange_fock/get_energy_w_overlap.f90, gated by
-    # probes/xt_get_energy_w_overlap (bit-exact, per atom).
+    # Recovered at `get_energy_w_overlap`, gated by
+    # a differential test (bit-exact, per atom).
     E_mfx, F_mfx = _mfx_fock_energy(P, S, gamma_mfx) if gamma_mfx is not None else (0.0, np.zeros_like(H0))
     if gamma_mfx is not None and onsite_potential == 4:
         _kf_e = _kfock_fast(P, S, basis, atoms, _kmat_shell_of(basis, gamma_mfx),
@@ -3648,7 +3645,7 @@ def gxtb_energy(
         "eigenvalues": eigvals,
         # probe support: the SHELL potential the driver actually folded into F
         # (Hartree/e per shell, PORT shell order), and its terms.  Stage 31 of
-        # `probes/audit/port_divergence.py` found the driver's Fock differs by
+        # a differential test found the driver's Fock differs by
         # 2.3e-1 from the one the walk composes out of the port's OWN
         # components; without this the two assemblies cannot be diffed.
         "V_sh": np.asarray(V_sh, dtype=np.float64).copy(),
@@ -3683,7 +3680,7 @@ def gxtb_energy(
             "eeqbc": "binary-formula",
             "qvszp": "binary tables, active pa_nshell shells",
             "h0": "binary parameter scaffold without anisotropic H0",
-            # DECODED: gxtb's add_coulomb constructs exactly five Coulomb
+            # Established: gxtb's add_coulomb constructs exactly five Coulomb
             # objects -- new_onsite_firstorder, new_effective_coulomb,
             # new_twobody_thirdorder, new_onsite_fourthorder and
             # new_gxtb_multipole. There is NO offsite first-order term; the
@@ -3773,12 +3770,12 @@ SOLVE_KWARGS: dict = {
     # ⚠️ THE BINARY DOES NOT UPDATE THE BASIS INSIDE THE SCF.
     # This was True on the strength of a comment saying
     # "basis_qvszp::basis_update is called every SCF iteration with wfn%qat".
-    # `recovered/tblite_scf_iterator/next_scf.f90` passes at 0 ulp and its
+    # `next_scf` passes at 0 ulp and its
     # COMPLETE call list contains no basis update of any kind:
     #     reset, coulomb_get_potential, cont*%get_potential,
     #     get_potential_w_overlap, list_get_potential, add_pot_to_h1,
     #     next_density, get_mulliken_*, get_qat_from_qsh, *_mixer, reduce
-    # `basis_update` has no caller anywhere in the decompiled tree either.
+    # `basis_update` has no caller anywhere in the reference implementation either.
     # The basis is built ONCE, before the loop.
     #
     # Switching it off also removes the electron-count violation on its own:
@@ -3786,7 +3783,7 @@ SOLVE_KWARGS: dict = {
     "scf_basis_update": False,
     # ⚠️ ELECTRON CONSERVATION.  The post-loop rebuild changes `S` while `P`
     # was solved against the old one, so `Tr(P.S)` came out 7.974613 where it
-    # must be 8.000000 (walk stage 41; 13.979228/14 and 29.964959/30 on the
+    # must be 8.000000 (13.979228/14 and 29.964959/30 on the
     # other two).  Sum-of-charges still held -- `max_abs_qsum` 1.05e-09 -- so
     # no shipped check saw it.  One re-solve in the rebuilt basis restores it
     # exactly, and leaves sum(q) where it was.
@@ -3811,7 +3808,7 @@ SOLVE_KWARGS: dict = {
     # Anisotropic electrostatics. Also never scored (same dead-code story).
     # Free now that qvszp_multipoles goes through the compiled kernel.
     "use_aes": True,
-    # The DECODED H0 distance polynomial (get_shpoly2 / get_shpoly4 +
+    # The Established H0 distance polynomial (get_shpoly2 / get_shpoly4 +
     # get_hamiltonian): pi = 1 + 2*pa*pg*(R/rcov + 0.0402348406*R^2/rcov).
     # The port's `1 + pa*pg*sqrt(R/rcov)` implements the ONE term that is zero
     # for g-xTB, with a missing factor 2 and no quadratic term.
@@ -3822,14 +3819,14 @@ SOLVE_KWARGS: dict = {
     #: at scale 1.  Production was running a DIFFERENT H0: the carbon p-level
     #: shift on (the binary has no such term) and the effective basis off.
     #: sum(P*(H0+H_acp)) was 2.3e-2 Ha from the binary's on H2O and 3.0e-2 on
-    #: benzene -- walk stage 23a.  The docstring's "dropping the carbon shift
+    #: benzene -- an earlier divergence run The docstring's "dropping the carbon shift
     #: costs 2.6x on charge MAE" is the compensation talking, not physics.
     "use_carbon_plevel_shift": False,
     "use_h0_effective_basis": 1.0,
-    # DECODED: add_coulomb constructs `new_onsite_fourthorder`, so the binary
+    # Established: add_coulomb constructs `new_onsite_fourthorder`, so the binary
     # runs the fourth-order onsite term. The port defaulted it off.
     "use_fourth_order": True,
-    # DECODED: the g-xTB repulsion is charge dependent
+    # Established: the g-xTB repulsion is charge dependent
     # (zeff = (1 - q*pa_rep_q)*pa_rep_zeff) and contributes an atomic potential
     # to the SCF via `get_potential`. The port evaluated it only post-SCF.
     "scf_repulsion": True,
@@ -3837,7 +3834,7 @@ SOLVE_KWARGS: dict = {
     #: verified against it at 2.6e-18 on the divergence walk.  The binary
     #: adds it to pot%vat on every SCF iteration, so it is not optional.
     "scf_dispersion": True,
-    # DECODED MFX pair-term damping (get_gmulliken_0d): pair = favg/exp(-R(c0+xi*c1)),
+    # Established MFX pair-term damping (get_gmulliken_0d): pair = favg/exp(-R(c0+xi*c1)),
     # no frscale. Verified against the binary's own H2 gamma to 0.9 %.
     "mfx_decoded_damping": True,
     # 🔑 the VERIFIED get_kfock (1.78e-15 against the shipped routine), in place
@@ -3852,7 +3849,7 @@ SOLVE_KWARGS: dict = {
     # extracted 103x10 table, and it was switched off; it was also invisible to
     # every ablation sweep, because the key was absent from this dict.
     "use_onecenter": True,
-    # DECODED: new_gxtb_calculator constructs `new_acp`, so the ACP Hamiltonian
+    # Established: new_gxtb_calculator constructs `new_acp`, so the ACP Hamiltonian
     # is part of g-xTB. It only pays once the exchange is right (before the MFX
     # damping fix it cost 4 % on charge; after it, it gains 18 %), and it is
     # only affordable once its AO+aux overlap goes through the compiled kernel.
@@ -3886,7 +3883,7 @@ SOLVE_KWARGS: dict = {
     # error (+0.50 -> +0.26).  It costs 0.001 on charge MAE, which is the one
     # metric that cancels an s/p misplacement (C is +0.29 s / -0.26 p, sum
     # +0.03), so it is the metric least able to see this error.
-    # DECODED `new_gxtb_calculator`: the q-vSZP basis is built as TWO cgto sets
+    # Established `new_gxtb_calculator`: the q-vSZP basis is built as TWO cgto sets
     # and the second becomes `new_qvszp_basis`' `cgto2`, i.e. `bas%cgto_h0`:
     #     alpha2 = alpha * ps_h0_qvszp_exp_scal(ish, num)
     #     k0,k2,k3 scaled by pa_h0_qvszp_{k0,k2,k3}_scal(num);  k1 untouched
@@ -3895,10 +3892,10 @@ SOLVE_KWARGS: dict = {
     # from `cgto`. `power=1.0` is the binary's own scaling, verbatim; 0.0 meant
     # the port applied `diat_trafo` to the ORDINARY overlap.
     "use_h0_effective_basis": 1.0,
-    # DECODED (get_anisotropy + get_hamiltonian): the binary always applies the
+    # Established (get_anisotropy + get_hamiltonian): the binary always applies the
     # anisotropic H0 term, on-site included. Not a knob -- scale stays 1.0.
     "use_aniso_h0": True,
-    # DECODED: get_selfenergy is `h0 - cn*kcn - cn_en*kcn_en - q*kq1 - q^2*kq2`,
+    # Established: get_selfenergy is `h0 - cn*kcn - cn_en*kcn_en - q*kq1 - q^2*kq2`,
     # and for g-xTB the last three tables are filled by `tblite_xtb_spec`'s
     # get_cnenshift/get_q1shift/get_q2shift, which are PURE ZERO-FILLS (56-line
     # functions that reference no parameter table). So the binary's level is
@@ -3939,7 +3936,7 @@ def solve(atoms, coords_ang):
 #
 # Five of them: `aniso_electro` (a triple loop, pairs x 3 x 3), the mctc ERF
 # coordination number, and three EEQ-BC assemblers. All are pure pair sums, so
-# they vectorise directly. `probes/check_vec.py` checks each against the frozen
+# they vectorise directly. a differential test checks each against the frozen
 # version: agreement is 3e-16 to 5e-14, i.e. summation-order rounding -- nine
 # orders below the 1.3e-05 oracle reproducibility floor.
 #
@@ -4132,7 +4129,7 @@ _FAST_CONTRACTION = _install_fast_contraction()
 # Layout note, checked rather than assumed: `vq` is ordered (xx, yy, zz, xy, xz,
 # yz) while `qp` uses the mmompop order (xx, xy, yy, xz, yz, zz). The two are
 # not the same permutation, so the trace correction landing on vq[0..2] is
-# correct. `probes/check_setvsdq.py` pins the result against the frozen twin.
+# correct. a differential test pins the result against the frozen twin.
 
 
 # ---------------------------------------------------- AES Fock fold, made cheap
@@ -4141,7 +4138,7 @@ _FAST_CONTRACTION = _install_fast_contraction()
 # dipole/quadrupole channel, each multiplying `integral[k].T` by an outer sum.
 # Two facts collapse that to a single contraction:
 #   * dpint and qpint are symmetric to *exactly* zero (checked, not assumed:
-#     probes/check_fock_aes.py), so every `.T` is a no-op; and
+#     a differential test), so every `.T` is a no-op; and
 #   * with that symmetry the i-indexed half of the outer sum is the transpose of
 #     the j-indexed half, so only one of the two needs contracting.
 # The channel stack is geometry-only, so it is built once per molecule.
