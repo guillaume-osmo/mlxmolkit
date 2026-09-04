@@ -11,7 +11,36 @@ from mlxmolkit.xtb.cosmo_sigma import hybrid_gxtb_gfn2_cosmo_from_smiles
 from mlxmolkit.xtb.sigma_features import sigma_feature_tensors
 
 
-XTB = Path("/tmp/gxtb-v2-macos/bin/xtb")
+def _gxtb_binary():
+    """The g-xTB binary these reference values were produced with, or None.
+
+    ⚠️ This used to be the bare path `/tmp/gxtb-v2-macos/bin/xtb`, which does
+    not survive a reboot -- so these four tests had been skipping silently
+    rather than failing, and a skipped test proves nothing. The resolution
+    order is `cosmo_sigma._find_xtb`'s own, so the test and the code cannot
+    disagree about which binary is meant.
+
+    The stock xtb SEGFAULTS on `--gxtb`, so a binary that merely exists is not
+    enough: the flag has to be accepted, and that is checked here rather than
+    assumed from the path.
+    """
+    import subprocess
+    from mlxmolkit.xtb.cosmo_sigma import _find_xtb
+    try:
+        path = _find_xtb()
+    except Exception:                                   # noqa: BLE001
+        return None
+    if not path.is_file():
+        return None
+    try:
+        out = subprocess.run([str(path), "--help"], capture_output=True,
+                             text=True, timeout=30)
+    except Exception:                                   # noqa: BLE001
+        return None
+    return path if "--gxtb" in (out.stdout + out.stderr) else None
+
+
+XTB = _gxtb_binary()
 
 
 CASES = {
@@ -145,7 +174,8 @@ CASES = {
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not XTB.exists(), reason=f"official g-xTB binary not found at {XTB}")
+@pytest.mark.skipif(XTB is None, reason="no xtb build accepting --gxtb was found "
+                                        "(set MLXMOLKIT_XTB to one)")
 @pytest.mark.parametrize("name", CASES)
 def test_binary_cosmo_sigma_features_match_golden_fingerprints(name: str):
     """Prove the binary-backed COSMO -> sigma tensor path is reproducible."""
