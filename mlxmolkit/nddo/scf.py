@@ -745,7 +745,13 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None, plan=None):
             from .w_integrals import compute_w_integrals
             from .params import principal_qn
             qn_sp = principal_qn(p.Z)
-            if p.Z in PM6_TAIL_EXPONENTS:
+            # ⚠️ The element's OWN tail exponents first (PM6-ORG ships its
+            # own set); the PM6 table only as the fallback it always was.
+            # Looking every method up in the PM6 table put PM6-ORG's S and P
+            # 2-3e-02 e from MOPAC 23 while its sp atoms sat at 2e-04.
+            if getattr(p, "tail_exponents", None):
+                zs_t, zp_t, zd_t = p.tail_exponents
+            elif p.Z in PM6_TAIL_EXPONENTS:
                 zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
             else:
                 zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d

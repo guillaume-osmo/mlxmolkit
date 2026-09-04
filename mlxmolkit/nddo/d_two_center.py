@@ -62,9 +62,57 @@ _ROT_CACHE: dict | None = None
 _YH_CACHE: dict | None = None
 
 
+_CSV_TO_PARAM = {"zeta_s": "zeta_s", "zeta_p": "zeta_p", "zeta_d": "zeta_d",
+                 "g_ss": "gss", "g_pp": "gpp", "g_p2": "gp2", "h_sp": "hsp",
+                 "F0SD": "F0SD", "G2SD": "G2SD", "alpha": "alpha"}
+_TAIL_SLOT = {"s_orb_exp_tail": 0, "p_orb_exp_tail": 1, "d_orb_exp_tail": 2}
+
+
+def _col_from_params(name, plist, csv):
+    """Per-atom parameter column, from the atoms' OWN ElementParams.
+
+    ⚠️ This used to read every column from the PM6 CSV by Z, whatever the
+    method -- so PM6-ORG's d-bearing pairs were integrated with PM6's zetas,
+    g's and tails, and its S and P sat 2-3e-02 e from MOPAC 23 while sp atoms
+    were at 2e-04. The CSV is kept only for what ElementParams does not carry
+    (rho_core), and as the fallback for a zero/missing field.
+    """
+    out = []
+    for p in plist:
+        if isinstance(p, (int, np.integer)):
+            # ⚠️ The phantom H that `_tetci_pair_w` appends to odd-electron
+            # pairs has no ElementParams -- it is a bare Z=1 at 1000 A. It
+            # takes the CSV row, as it always did; forgetting it here made
+            # `Zs` three long and this column two, and TETCI raised IndexError
+            # on CH3Cl (test_pm6_d_native).
+            out.append(float(csv.get(int(p), {}).get(name, 0.0)))
+            continue
+        row = csv.get(int(p.Z), {})
+        if name in _TAIL_SLOT:
+            tail = getattr(p, "tail_exponents", None)
+            v = tail[_TAIL_SLOT[name]] if tail else row.get(name, 0.0)
+        elif name in _CSV_TO_PARAM:
+            v = getattr(p, _CSV_TO_PARAM[name], 0.0)
+            if not v:
+                v = row.get(name, 0.0)
+        else:
+            v = row.get(name, 0.0)
+        out.append(float(v))
+    return np.asarray(out, dtype=np.float64)
+
+
+def _param_fingerprint(p):
+    """What makes two ElementParams of the same Z different integrals: the
+    exponents. Z alone let PM6 and PM6-ORG -- same Z, different zetas and
+    tails -- share a cache entry."""
+    tail = getattr(p, "tail_exponents", None)
+    return (float(p.zeta_s), float(p.zeta_p), float(getattr(p, "zeta_d", 0.0)),
+            tuple(tail) if tail else None)
+
+
 def _pair_key(p1, p2, c1, c2):
     """Cache key for an ordered pair at a fixed geometry."""
-    return (int(p1.Z), int(p2.Z),
+    return (int(p1.Z), int(p2.Z), _param_fingerprint(p1), _param_fingerprint(p2),
             np.asarray(c1, dtype=np.float64).tobytes(),
             np.asarray(c2, dtype=np.float64).tobytes())
 
@@ -224,8 +272,10 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
 
     # Load PM6 params from bundled CSV (PYSEQM MOPAC values, BSD-3 Clause).
     csv = _load_pm6_csv_params()
+    _plist = [pa, pb] + [1] * (len(Zs) - 2)      # + le H fantome eventuel
+
     def col(name):
-        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+        return _col_from_params(name, _plist, csv)
 
     zetas = col('zeta_s')
     zetap = col('zeta_p')
@@ -287,11 +337,13 @@ def _tetci_pairs_w(pair_specs):
         return []
 
     Zs, coords, order = [], [], []
+    _plist = []
     for p1, p2, c1, c2 in pair_specs:
         first_is_A = p1.Z >= p2.Z
         pa, pb = (p1, p2) if first_is_A else (p2, p1)
         ca, cb = (c1, c2) if first_is_A else (c2, c1)
         Zs.extend([int(pa.Z), int(pb.Z)])
+        _plist.extend([pa, pb])
         coords.extend([np.asarray(ca, dtype=np.float64),
                        np.asarray(cb, dtype=np.float64)])
         order.append(first_is_A)
@@ -307,8 +359,9 @@ def _tetci_pairs_w(pair_specs):
     xij = diff / R_ang[:, None]
 
     csv = _load_pm6_csv_params()
+
     def col(name):
-        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+        return _col_from_params(name, _plist, csv)
 
     zetas, zetap, zetad = col('zeta_s'), col('zeta_p'), col('zeta_d')
     zs, zp, zd = col('s_orb_exp_tail'), col('p_orb_exp_tail'), col('d_orb_exp_tail')

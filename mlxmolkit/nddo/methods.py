@@ -589,6 +589,15 @@ def _load_pm6_org() -> None:
                 zeta_d=_sf(row, "zeta_d"), beta_d=_sf(row, "beta_d"),
                 F0SD=_sf(row, "F0SD"), G2SD=_sf(row, "G2SD"), has_d=has_d)
             PM6_ORG_PARAMS[z].eisol = _compute_eisol(PM6_ORG_PARAMS[z])
+            # ⚠️ PM6-ORG's own one-centre tail exponents. Without them the SCF
+            # fell back to the PM6 table for every d atom, which put PM6-ORG's
+            # sulfur 2.7e-02 e and phosphorus 2.2e-02 e from MOPAC 23 while its
+            # sp atoms sat at 2e-04 -- the whole method read as broken when only
+            # this lookup was.
+            tail = (_sf(row, "s_orb_exp_tail"), _sf(row, "p_orb_exp_tail"),
+                    _sf(row, "d_orb_exp_tail"))
+            if has_d and all(t > 0 for t in tail):
+                PM6_ORG_PARAMS[z].tail_exponents = tail
 
 
 _load_pm6_org()
@@ -638,6 +647,10 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     # carry P/S/Cl/Br/I. Kept for callers that spell it this way; a test that
     # parametrises over both is testing one method twice.
     'PM6_D': PM6_FULL_PARAMS,
+    # PM6-ORG: its own 18-element set (loaded below, after the dict, because
+    # `_load_pm6_org` fills PM6_ORG_PARAMS in place -- the dict holds the
+    # reference, so the entry is live once the loader has run).
+    'PM6_ORG': PM6_ORG_PARAMS,
     # The dispersion / hydrogen-bond / halogen variants. Electronically these
     # are plain PM6 — same parameters, same SCF, same density and charges — and
     # differ only by a post-SCF function of geometry added to the heat of
