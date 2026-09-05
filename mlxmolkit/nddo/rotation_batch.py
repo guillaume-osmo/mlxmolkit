@@ -25,6 +25,8 @@ import os
 
 import numpy as np
 
+from .params import ANG_TO_BOHR
+
 # The 100 (kk, ll, mm, nn) combinations with kk >= ll and mm >= nn, grouped by
 # category. Built once at import.
 _CATEGORIES: dict[str, np.ndarray] = {}
@@ -269,6 +271,71 @@ def rotate_pairs(pair_params, pair_coords):
             else:
                 out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
         elif pair_type == "XH":
+            out[sel] = rotate_xh_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
+        else:
+            out[sel] = rotate_hh_batch(ri_all[sel])
+
+    flip = np.flatnonzero(swapped & live)
+    if flip.size:
+        out[flip] = np.transpose(out[flip], (0, 3, 4, 1, 2))
+    return out
+
+
+def rotate_pairs_indexed(tab, zval, nb, xyz, ia, ja):
+    """:func:`rotate_pairs` for pairs given as index arrays into per-atom tables.
+
+    Same arithmetic, same grouping, same values -- but nothing is built per
+    pair: the parameter columns are gathers out of `tab` (see
+    :func:`~mlxmolkit.nddo.two_center_integrals.multipole_table`) and the
+    coordinates are gathers out of `xyz`. The list form below builds two lists
+    of P tuples and eleven lists of P floats to say the same thing, which on a
+    106-atom molecule is ~30,000 objects and 9.4 ms of a 65 ms single point.
+
+    Args:
+        tab, zval, nb: the per-atom tables.
+        xyz: (n_atoms, 3) in Angstrom.
+        ia, ja: (P,) atom indices, ia < ja.
+
+    Returns:
+        (P, 4, 4, 4, 4), the same tensor `rotate_pairs` returns.
+    """
+    from .overlap_batch import _rotations
+    from .two_center_integrals import KIND_HH, KIND_HX, KIND_XH, KIND_XX, ri_batch_indexed
+
+    P = len(ia)
+    out = np.zeros((P, 4, 4, 4, 4))
+    if P == 0:
+        return out
+
+    delta = xyz[ja] - xyz[ia]
+    dist = np.linalg.norm(delta, axis=1)
+    live = dist >= 1e-10
+
+    ri_all, kinds = ri_batch_indexed(tab, zval, nb, ia, ja, dist * ANG_TO_BOHR)
+
+    # HX is XH with the pair reversed; the integrals were solved in that order,
+    # so only the geometry is flipped here and the block transposed at the end.
+    swapped = kinds == KIND_HX
+    signed = np.where(swapped[:, None], -delta, delta)
+
+    safe = np.where(live, dist, 1.0)
+    rot = _rotations(-signed / safe[:, None])
+    r0, r1, r2 = rot[:, 0, :], rot[:, 1, :], rot[:, 2, :]
+
+    for kind in (KIND_HH, KIND_XH, KIND_XX):
+        mask = (kinds == kind) | (swapped if kind == KIND_XH else False)
+        sel = np.flatnonzero(live & mask)
+        if sel.size == 0:
+            continue
+        if kind == KIND_XX:
+            if _use_mlx(sel.size):
+                import mlx.core as mx
+                arrs = [mx.array(a[sel].astype(np.float32))
+                        for a in (ri_all, r0, r1, r2)]
+                out[sel] = np.asarray(rotate_xx_batch_mlx(*arrs), dtype=np.float64)
+            else:
+                out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
+        elif kind == KIND_XH:
             out[sel] = rotate_xh_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
         else:
             out[sel] = rotate_hh_batch(ri_all[sel])

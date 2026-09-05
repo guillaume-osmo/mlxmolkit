@@ -57,7 +57,7 @@ def test_the_gradient_is_unchanged_by_the_cache(smiles):
     from contextlib import contextmanager
 
     @contextmanager
-    def disabled(_specs):
+    def disabled(_specs, **_kw):      # pair_cache grew a `rotations` switch
         yield
     D.pair_cache = disabled
     try:
