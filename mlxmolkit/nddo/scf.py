@@ -452,107 +452,98 @@ def _pair_core_attraction(pA, pB, rA, rB):
     return block
 
 
-def _build_core_hamiltonian(atoms, coords, info):
-    """Build core Hamiltonian H_core."""
+
+def _build_core_hamiltonian(atoms, coords, info, pair_ws=None):
+    """Build core Hamiltonian H_core.
+
+    `pair_ws`: the (ia, ja, ws) of :func:`_all_pair_w` when the caller already
+    has it -- the SCF driver does, for the Fock plan -- so the N(N-1)/2 sp
+    rotations are done once per geometry rather than once here and once there.
+    """
     n_basis = info['n_basis']
     params = info['params']
-    b2a = info['basis_to_atom']
-    btype = info['basis_type']
-    starts = info['atom_basis_start']
+    b2a = np.asarray(info['basis_to_atom'], dtype=np.int64)
+    btype = np.asarray(info['basis_type'])
+    starts = np.asarray(info['atom_basis_start'], dtype=np.int64)
+    n_atoms = len(atoms)
+    nb = np.array([p.n_basis for p in params], dtype=np.int64)
+    zval = np.array([float(p.n_valence) for p in params])
 
     H = np.zeros((n_basis, n_basis))
 
-    # Diagonal: one-electron one-center (Uss, Upp, Udd)
-    for mu in range(n_basis):
-        i = b2a[mu]
-        p = params[i]
-        if btype[mu] == 0:
-            H[mu, mu] = p.Uss
-        elif btype[mu] <= 3:
-            H[mu, mu] = p.Upp
-        else:
-            # d-orbital (types 4-8)
-            H[mu, mu] = p.Udd
+    # Diagonal: one-electron one-center (Uss, Upp, Udd), one gather per shell.
+    uss = np.array([p.Uss for p in params])
+    upp = np.array([p.Upp if p.n_basis >= 4 else 0.0 for p in params])
+    udd = np.array([p.Udd if p.n_basis > 4 else 0.0 for p in params])
+    np.fill_diagonal(H, np.where(btype == 0, uss[b2a], np.where(btype <= 3, upp[b2a], udd[b2a])))
+
+    # The pair triage. `triu_indices` yields the same (i, j), i < j, sequence
+    # as the nested loops it replaces, in C rather than N^2/2 Python iterations.
+    iu, ju = np.triu_indices(n_atoms, 1)
+    sp_pair = (nb[iu] <= 4) & (nb[ju] <= 4)
 
     # Off-diagonal: resonance integrals using proper Slater overlap.
     #
     # sp pairs go through the batch: one `overlap_pairs` call for all of them,
-    # then one broadcast per orbital shape, then a fancy-indexed scatter into
-    # H. The scalar loop was 2701 calls of `_pair_resonance_block` on
-    # cholesterol, each running its own nA x nB Python loop, and it is the
-    # largest line in an SCF profile after the eigendecomposition.
-    #
-    # d pairs stay scalar. `overlap_pairs` falls back to
+    # then one broadcast per orbital shape, then a fancy-indexed scatter into H.
+    # d pairs stay scalar: `overlap_pairs` falls back to
     # `overlap_molecular_frame` for shapes its table does not cover, but
-    # `_pair_resonance_block` uses `overlap_d_molecular_frame` for those —
+    # `_pair_resonance_block` uses `overlap_d_molecular_frame` for those --
     # different routines, so batching them together would silently change the
     # d overlap.
-    n_atoms = len(atoms)
-    sp_res, d_res = [], []
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            (sp_res if params[i].n_basis <= 4 and params[j].n_basis <= 4
-             else d_res).append((i, j))
-
-    for i, j in d_res:
+    for i, j in zip(iu[~sp_pair].tolist(), ju[~sp_pair].tolist()):
         block = _pair_resonance_block(params[i], params[j], coords[i], coords[j])
         si, sj = starts[i], starts[j]
         H[si:si + block.shape[0], sj:sj + block.shape[1]] = block
         H[sj:sj + block.shape[1], si:si + block.shape[0]] = block.T
 
-    if sp_res:
+    if sp_pair.any():
+        ri, rj = iu[sp_pair], ju[sp_pair]
+        ril, rjl = ri.tolist(), rj.tolist()
         S_all = _stacked_overlaps([(params[i], params[j], coords[i], coords[j])
-                                   for i, j in sp_res])
-        shapes: dict[tuple[int, int], list[int]] = {}
-        for k, (i, j) in enumerate(sp_res):
-            shapes.setdefault((params[i].n_basis, params[j].n_basis),
-                              []).append(k)
-        for (nA, nB), ks in shapes.items():
+                                   for i, j in zip(ril, rjl)])
+        shape_key = nb[ri] * 16 + nb[rj]
+        for key in np.unique(shape_key):
+            ks = np.flatnonzero(shape_key == key)
+            nA, nB = int(key) // 16, int(key) % 16
             blocks = _pair_resonance_blocks(
-                [params[sp_res[k][0]] for k in ks],
-                [params[sp_res[k][1]] for k in ks],
-                np.stack([S_all[k] for k in ks]))
-            rows_a = (np.asarray([starts[sp_res[k][0]] for k in ks])[:, None]
-                      + np.arange(nA))
-            rows_b = (np.asarray([starts[sp_res[k][1]] for k in ks])[:, None]
-                      + np.arange(nB))
+                [params[ril[k]] for k in ks.tolist()],
+                [params[rjl[k]] for k in ks.tolist()],
+                np.stack([S_all[k] for k in ks.tolist()]))
+            rows_a = starts[ri[ks]][:, None] + np.arange(nA)
+            rows_b = starts[rj[ks]][:, None] + np.arange(nB)
             H[rows_a[:, :, None], rows_b[:, None, :]] = blocks
             H[rows_b[:, :, None], rows_a[:, None, :]] = np.swapaxes(blocks, 1, 2)
 
     # Electron-nuclear attraction. One rotation of the pair (i, j) yields the
-    # attraction on i from j *and* on j from i, so the unordered loop below
-    # does half the work the ordered one did. d pairs keep the 9x9 Wigner-D
-    # path, which is not expressible through the sp rotation.
-    # The sp pairs are rotated in one batched call rather than one scalar call
-    # each. On cholesterol that is 2701 rotations per build, and the build runs
-    # twice per gradient (once for H_ref, once inside the SCF) — 5402 scalar
-    # rotations, the single largest line in a gradient profile at 0.211 s.
-    # e1b and e2a are slices of w, so the batch supplies both orderings.
-    sp_pairs = []
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            if params[i].n_basis == 9 or params[j].n_basis == 9:
-                si, nA = starts[i], params[i].n_basis
-                sj, nB = starts[j], params[j].n_basis
-                H[si:si + nA, si:si + nA] += _pair_core_attraction(
-                    params[i], params[j], coords[i], coords[j])
-                H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(
-                    params[j], params[i], coords[j], coords[i])
-            else:
-                sp_pairs.append((i, j))
+    # attraction on i from j *and* on j from i. d pairs keep the 9x9 Wigner-D
+    # path, which is not expressible through the sp rotation. The sp pairs are
+    # rotated in one batched call, and e1b and e2a are slices of w:
+    #   e1b = -Z_B w[:, :, 0, 0]   on A,      e2a = -Z_A w[0, 0, :, :]   on B.
+    att_sp = (nb[iu] != 9) & (nb[ju] != 9)
+    for i, j in zip(iu[~att_sp].tolist(), ju[~att_sp].tolist()):
+        si, nA = starts[i], nb[i]
+        sj, nB = starts[j], nb[j]
+        H[si:si + nA, si:si + nA] += _pair_core_attraction(params[i], params[j], coords[i], coords[j])
+        H[sj:sj + nB, sj:sj + nB] += _pair_core_attraction(params[j], params[i], coords[j], coords[i])
 
-    if sp_pairs:
-        from .rotation_batch import rotate_pairs
-        ws = rotate_pairs([(params[i], params[j]) for i, j in sp_pairs],
-                          [(coords[i], coords[j]) for i, j in sp_pairs])
-        for (i, j), w in zip(sp_pairs, ws):
-            pA, pB = params[i], params[j]
-            si, nA = starts[i], pA.n_basis
-            sj, nB = starts[j], pB.n_basis
-            H[si:si + nA, si:si + nA] += (
-                -float(pB.n_valence) * w[:nA, :nA, 0, 0])
-            H[sj:sj + nB, sj:sj + nB] += (
-                -float(pA.n_valence) * w[0, 0, :nB, :nB])
+    if att_sp.any():
+        ai, aj = iu[att_sp], ju[att_sp]
+        if pair_ws is not None and pair_ws[2].shape[0] == iu.size:
+            ws = pair_ws[2][att_sp]          # same triu order by construction
+        else:
+            from .rotation_batch import rotate_pairs
+            ail, ajl = ai.tolist(), aj.tolist()
+            ws = rotate_pairs([(params[i], params[j]) for i, j in zip(ail, ajl)],
+                              [(coords[i], coords[j]) for i, j in zip(ail, ajl)])
+        # Per-atom accumulation of the 4x4 blocks, then one slice-add per atom
+        # instead of two per pair (11k slice-adds on a 106-atom molecule).
+        acc = np.zeros((n_atoms, 4, 4))
+        np.add.at(acc, ai, ws[:, :, :, 0, 0] * (-zval[aj])[:, None, None])
+        np.add.at(acc, aj, ws[:, 0, 0, :, :] * (-zval[ai])[:, None, None])
+        for i in np.unique(np.concatenate([ai, aj])).tolist():
+            s, n = starts[i], min(int(nb[i]), 4)
+            H[s:s + n, s:s + n] += acc[i, :n, :n]
 
     return H
 
@@ -598,84 +589,175 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB, w=None):
 
 
 
+
 def precompute_pair_w(atoms, coords, info):
-    """Rotated two-centre tensors for every sp pair of a fixed geometry.
+    """Rotated sp two-centre tensors for EVERY atom pair of a fixed geometry.
 
-    The rotation depends on the atom parameters and the geometry, never on the
-    density, so it is constant for the whole SCF — yet _build_fock re-derived
-    it at every iteration. On menthol that was ~7000 scalar rotations per
-    single point, half the cost of a gradient.
+    {(i, j): (4, 4, 4, 4)} for i < j. The rotation depends on the parameters
+    and the geometry, never on the density, so it is constant for the whole
+    SCF; one batched `rotate_pairs` call covers all N(N-1)/2 pairs.
 
-    d-bearing pairs are omitted: they take a different integral routine, and a
-    missing key simply falls back to computing that pair as before.
+    d-bearing pairs are included. The sp corner of a d pair is the ordinary
+    XX/XH tensor -- both `two_center_integrals` and its batch clamp a
+    9-function atom to its sp block and use the same multipole parameters --
+    and :func:`_fock_plan` needs it to build the pair's fused tensor
+    (:func:`d_two_center.d_pair_effective_w`).
     """
+    ia, ja, ws = _all_pair_w(atoms, coords, info)
+    return dict(zip(zip(ia.tolist(), ja.tolist()), ws))
+
+
+def _all_pair_w(atoms, coords, info):
+    """(ia, ja, ws): every pair i < j in `triu_indices` order and its rotated tensor."""
     from .rotation_batch import rotate_pairs
 
     params = info['params']
-    n_atoms = len(atoms)
-    sp = [(i, j) for i in range(n_atoms) for j in range(i + 1, n_atoms)
-          if params[i].n_basis <= 4 and params[j].n_basis <= 4]
-    if not sp:
-        return {}
-    ws = rotate_pairs([(params[i], params[j]) for i, j in sp],
-                      [(coords[i], coords[j]) for i, j in sp])
-    return {pair: ws[k] for k, pair in enumerate(sp)}
+    ia, ja = np.triu_indices(len(atoms), 1)
+    if ia.size == 0:
+        return ia, ja, np.zeros((0, 4, 4, 4, 4))
+    il, jl = ia.tolist(), ja.tolist()
+    ws = rotate_pairs([(params[i], params[j]) for i, j in zip(il, jl)],
+                      [(coords[i], coords[j]) for i, j in zip(il, jl)])
+    return ia, ja, ws
 
 
-def _fock_plan(info, atoms, coords, pair_w=None):
-    """The parts of a Fock build that depend on geometry but not on density.
+def _one_centre_d_w(p):
+    """The 243 one-centre W integrals of a d atom. Parameters only, so once per element."""
+    from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
+    from .w_integrals import compute_w_integrals
+    from .params import principal_qn
+    qn_sp = principal_qn(p.Z)
+    # ⚠️ The element's OWN tail exponents first (PM6-ORG ships its own set);
+    # the PM6 table only as the fallback it always was. Looking every method
+    # up in the PM6 table put PM6-ORG's S and P 2-3e-02 e from MOPAC 23.
+    if getattr(p, "tail_exponents", None):
+        zs_t, zp_t, zd_t = p.tail_exponents
+    elif p.Z in PM6_TAIL_EXPONENTS:
+        zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
+    else:
+        zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
+    return compute_w_integrals(zs_t, zp_t, zd_t, qn_sp, qn_sp,
+                               getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
 
-    An SCF sits at one geometry for ~18 iterations and rebuilt all of this on
-    every one of them: the sp/d triage over N(N-1)/2 pairs — 48,618 loop
-    iterations per cholesterol SCF — the stacked rotation tensors, the
-    basis-row index arrays and the flat scatter indices. Only the three
-    density contractions actually differ between iterations.
 
-    `precompute_pair_w` already hoisted the rotations themselves; this hoists
-    everything built around them.
+
+def _fock_plan(info, atoms, coords, pair_w=None, pair_ws=None):
+    """Everything in a Fock build that depends on the geometry but not on the density.
+
+    An SCF sits at one geometry for ~15 iterations; only the density
+    contractions differ between them. Built once here:
+
+    * the pair tensors, grouped by orbital shape (nA, nB) so each group is one
+      batched contraction: the rotated sp tensor for sp pairs, and for d-bearing
+      pairs the FUSED tensor of :func:`d_two_center.d_pair_effective_w`, which
+      carries the whole pair term. Before this, a pair touching a sulfur
+      re-rotated its integrals and re-unpacked its TETCI block on every
+      iteration (16 x 51 scalar rotations on a 52-atom molecule) -- the reason
+      S-bearing molecules cost 2.5x their sp equivalents;
+    * the flat scatter indices of every group, and a kernel code: two thirds of
+      the pairs of an organic molecule touch a hydrogen, where the contracted
+      axis has length one and `einsum` degenerates to a loop of single-term
+      sums -- those groups are a broadcast multiply instead;
+    * the one-centre factors: the Slater-Condon combinations of the sp atoms as
+      arrays, the H atoms' diagonal positions, the d atoms' 243 W integrals
+      once per element (they were recomputed per atom per iteration).
+
+    `pair_w`: an optional {(i, j): w} from :func:`precompute_pair_w`;
+    `pair_ws`: the (ia, ja, ws) tuple of :func:`_all_pair_w` when the caller has
+    it. With neither, the rotations are done here, in one call.
+    Pairs whose TETCI block is unavailable stay in ``d_pairs`` and take the
+    scalar route in :func:`_build_fock`.
     """
+    from .d_two_center import d_pair_effective_w
+
     params = info['params']
-    starts = info['atom_basis_start']
+    starts = np.asarray(info['atom_basis_start'], dtype=np.int64)
     n_basis = info['n_basis']
     n_atoms = len(atoms)
+    nb = np.array([p.n_basis for p in params], dtype=np.int64)
+    b2a = np.asarray(info['basis_to_atom'], dtype=np.int64)
+    counts = np.bincount(b2a, minlength=n_atoms)[:n_atoms]
+    idx_by_atom = np.split(np.argsort(b2a, kind='stable'), np.cumsum(counts)[:-1])
 
-    idx_by_atom = [np.where(info['basis_to_atom'] == i)[0]
-                   for i in range(n_atoms)]
-
-    d_pairs = []
-    sp_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            pA, pB = params[i], params[j]
-            if pA.n_basis == 9 or pB.n_basis == 9 or (
-                    pair_w is not None and pair_w.get((i, j)) is None):
-                d_pairs.append((i, j))
-            else:
-                sp_by_shape.setdefault((pA.n_basis, pB.n_basis),
-                                       []).append((i, j))
+    # --- pair tensors ------------------------------------------------------
+    if pair_ws is not None:
+        ia, ja, ws = pair_ws
+    elif pair_w is None:
+        ia, ja, ws = _all_pair_w(atoms, coords, info)
+    else:
+        ia, ja = np.triu_indices(n_atoms, 1)
+        ws = [pair_w.get((i, j)) for i, j in zip(ia.tolist(), ja.tolist())]
+        for k, w in enumerate(ws):
+            if w is None:          # a partial dict: rotate the missing pair itself
+                ws[k], _, _ = rotate_integrals_to_molecular_frame(
+                    params[ia[k]], params[ja[k]], coords[ia[k]], coords[ja[k]])
+        ws = np.stack(ws) if ws else np.zeros((0, 4, 4, 4, 4))
 
     groups = []
-    for (nA, nB), pairs in sp_by_shape.items():
-        if pair_w is not None:
-            W = np.stack([pair_w[(i, j)] for i, j in pairs])
+    d_pairs = []
+    shape_key = nb[ia] * 16 + nb[ja]
+    for key in np.unique(shape_key):
+        sel = np.flatnonzero(shape_key == key)
+        nA, nB = int(key) // 16, int(key) % 16
+        if nA == 9 or nB == 9:
+            W, keep = [], []
+            for k in sel.tolist():
+                i, j = int(ia[k]), int(ja[k])
+                Weff = d_pair_effective_w(params[i], params[j], coords[i], coords[j], ws[k])
+                if Weff is None:
+                    d_pairs.append((i, j))
+                else:
+                    W.append(Weff)
+                    keep.append(k)
+            if not W:
+                continue
+            W = np.stack(W)
+            sel = np.asarray(keep)
         else:
-            from .rotation_batch import rotate_pairs
-            W = np.stack(rotate_pairs(
-                [(params[i], params[j]) for i, j in pairs],
-                [(coords[i], coords[j]) for i, j in pairs]))
-        W = W[:, :nA, :nA, :nB, :nB]
-
-        ia = np.asarray([starts[i] for i, _ in pairs])
-        ib = np.asarray([starts[j] for _, j in pairs])
-        rows_a = ia[:, None] + np.arange(nA)
-        rows_b = ib[:, None] + np.arange(nB)
+            W = np.ascontiguousarray(ws[sel][:, :nA, :nA, :nB, :nB])
+        gi, gj = ia[sel], ja[sel]
+        rows_a = starts[gi][:, None] + np.arange(nA)
+        rows_b = starts[gj][:, None] + np.arange(nB)
         flat = np.concatenate([
             (rows[:, :, None] * n_basis + cols[:, None, :]).ravel()
             for rows, cols in ((rows_a, rows_a), (rows_b, rows_b),
                                (rows_a, rows_b), (rows_b, rows_a))])
-        groups.append((W, rows_a, rows_b, flat))
+        kernel = 'hh' if nA == 1 and nB == 1 else 'xh' if nB == 1 else 'hx' if nA == 1 else 'xx'
+        groups.append((kernel, W, rows_a, rows_b, flat))
 
-    return {'idx_by_atom': idx_by_atom, 'd_pairs': d_pairs, 'groups': groups}
+    # --- one-centre factors -----------------------------------------------
+    # Every atom with p orbitals takes the sp formulas on its s,p block; the d
+    # atoms then add their W term on top, exactly as before.
+    sp_atoms = np.flatnonzero(nb >= 4)
+    onec_sp = None
+    if sp_atoms.size:
+        ps = [params[i] for i in sp_atoms.tolist()]
+        rows = starts[sp_atoms][:, None] + np.arange(4)
+        onec_sp = ((rows[:, :, None] * n_basis + rows[:, None, :]).ravel(),
+                   np.array([p.gss for p in ps]),
+                   np.array([p.gsp - 0.5 * p.hsp for p in ps]),
+                   np.array([1.5 * p.hsp - 0.5 * p.gsp for p in ps]),
+                   np.array([p.gpp for p in ps]),
+                   np.array([1.25 * p.gp2 - 0.25 * p.gpp for p in ps]),
+                   np.array([0.75 * p.gpp - 1.25 * p.gp2 for p in ps]))
+    h_atoms = np.flatnonzero(nb == 1)
+    onec_h = None
+    if h_atoms.size:
+        s = starts[h_atoms]
+        onec_h = (s * n_basis + s, np.array([params[i].gss for i in h_atoms.tolist()]))
+    onec_d = []
+    by_element = {}
+    for i in np.flatnonzero(nb == 9).tolist():
+        p = params[i]
+        if getattr(p, 'has_d', False):
+            key = (p.Z, id(p))
+            if key not in by_element:
+                by_element[key] = _one_centre_d_w(p)
+            onec_d.append((int(starts[i]), by_element[key]))
+
+    return {'idx_by_atom': idx_by_atom, 'd_pairs': d_pairs, 'groups': groups,
+            'onec_sp': onec_sp, 'onec_h': onec_h, 'onec_d': onec_d}
+
 
 
 def _build_fock(H, P, info, atoms, coords, pair_w=None, plan=None):
@@ -683,152 +765,96 @@ def _build_fock(H, P, info, atoms, coords, pair_w=None, plan=None):
 
     Two contributions:
     1. One-center: G_μν (same atom) from Slater-Condon parameters
-    2. Two-center: Coulomb/exchange between atoms via (ss|ss) integrals
+    2. Two-center: Coulomb/exchange between atoms via (μν|λσ) integrals
 
-    NDDO approximation: only (μμ|λλ)-type integrals survive.
+    NDDO approximation: only (μμ|λλ)-type integrals survive. Everything that
+    does not depend on P comes from :func:`_fock_plan`; this function is the
+    density contractions and nothing else.
     """
-    n_basis = info['n_basis']
-    n_atoms = len(atoms)
-    params = info['params']
-    b2a = info['basis_to_atom']
-    btype = info['basis_type']
-    starts = info['atom_basis_start']
-
-    F = H.copy()
     if plan is None:
         plan = _fock_plan(info, atoms, coords, pair_w)
+    params = info['params']
+    starts = info['atom_basis_start']
+    F = H.copy()
 
-    # === One-center two-electron contributions ===
-    for i, p in enumerate(params):
-        idx = plan['idx_by_atom'][i]
-        if len(idx) == 0:
-            continue
+    # d atoms: the one-centre W term, in place, before the flat views are taken.
+    if plan['onec_d']:
+        from .fock_d import fock_d_one_center
+        for s, W in plan['onec_d']:
+            F = fock_d_one_center(F, P, W, s, n_basis=9)
+        F = np.ascontiguousarray(F)
+    Pf = P.reshape(-1)
+    Ff = F.reshape(-1)
 
-        s = idx[0]
-        Pss = P[s, s]
+    # === One-center sp contributions, all atoms at once ===
+    #   F_ss  += P_ss gss/2 + P_pp (gsp - hsp/2)
+    #   F_pp  += P_ss (gsp - hsp/2) + P_pp gpp/2 + (P_p'p' + P_p''p'') (5/4 gp2 - 1/4 gpp)
+    #   F_sp  += P_sp (3/2 hsp - 1/2 gsp)
+    #   F_pp' += P_pp' (3/4 gpp - 5/4 gp2)
+    oc = plan['onec_sp']
+    if oc is not None:
+        flat, gss, sp_fac_1, sp_fac_2, gpp, pp_fac_d, pp_fac_off = oc
+        Pb = Pf[flat].reshape(-1, 4, 4)
+        Pss = Pb[:, 0, 0]
+        Pkk = Pb[:, [1, 2, 3], [1, 2, 3]]
+        Ppp = Pkk.sum(axis=1)
+        G = Pb * pp_fac_off[:, None, None]
+        G[:, 0, 1:] = Pb[:, 0, 1:] * sp_fac_2[:, None]
+        G[:, 1:, 0] = Pb[:, 1:, 0] * sp_fac_2[:, None]
+        G[:, 0, 0] = Pss * gss * 0.5 + Ppp * sp_fac_1
+        G[:, [1, 2, 3], [1, 2, 3]] = (Pss[:, None] * sp_fac_1[:, None]
+                                      + Pkk * gpp[:, None] * 0.5
+                                      + (Ppp[:, None] - Pkk) * pp_fac_d[:, None])
+        Ff[flat] += G.ravel()
+    oh = plan['onec_h']
+    if oh is not None:
+        h_flat, h_gss = oh
+        Ff[h_flat] += Pf[h_flat] * h_gss * 0.5
 
-        if p.n_basis == 9 and getattr(p, 'has_d', False) and len(idx) >= 9:
-            # PM6 d-orbital atom: sp formulas for 4×4 block + W for d cross-terms
-            px, py, pz = idx[1], idx[2], idx[3]
-            Pss = P[s, s]
-            Ppp_total = P[px, px] + P[py, py] + P[pz, pz]
-
-            # Standard sp one-center (same as non-d atoms)
-            F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
-            sp_fac_1 = p.gsp - 0.5 * p.hsp
-            sp_fac_2 = 1.5 * p.hsp - 0.5 * p.gsp
-            pp_fac_d = 1.25 * p.gp2 - 0.25 * p.gpp
-            pp_fac_off = 0.75 * p.gpp - 1.25 * p.gp2
-
-            for k in range(1, 4):
-                pk = idx[k]
-                F[pk, pk] += (Pss * sp_fac_1
-                              + P[pk, pk] * p.gpp * 0.5
-                              + (Ppp_total - P[pk, pk]) * pp_fac_d)
-            for k in range(1, 4):
-                pk = idx[k]
-                F[s, pk] += P[s, pk] * sp_fac_2
-                F[pk, s] += P[pk, s] * sp_fac_2
-            for k in range(1, 4):
-                for l in range(k + 1, 4):
-                    pk, pl = idx[k], idx[l]
-                    F[pk, pl] += P[pk, pl] * pp_fac_off
-                    F[pl, pk] += P[pl, pk] * pp_fac_off
-
-            # d-orbital cross terms via W integrals (pure NumPy).
-            # Native compute_w_integrals matches PYSEQM's calc_integral to
-            # machine precision (~1e-14) after the IntRep/IntRf2 table fix.
-            # Uses TAIL exponents (PM6_TAIL_EXPONENTS) — the PYSEQM
-            # convention for d-orbital atoms. No PyTorch dependency.
-            from .fock_d import fock_d_one_center, TRIL_I, TRIL_J
-            from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
-            from .w_integrals import compute_w_integrals
-            from .params import principal_qn
-            qn_sp = principal_qn(p.Z)
-            # ⚠️ The element's OWN tail exponents first (PM6-ORG ships its
-            # own set); the PM6 table only as the fallback it always was.
-            # Looking every method up in the PM6 table put PM6-ORG's S and P
-            # 2-3e-02 e from MOPAC 23 while its sp atoms sat at 2e-04.
-            if getattr(p, "tail_exponents", None):
-                zs_t, zp_t, zd_t = p.tail_exponents
-            elif p.Z in PM6_TAIL_EXPONENTS:
-                zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
-            else:
-                zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
-            W = compute_w_integrals(
-                zs_t, zp_t, zd_t, qn_sp, qn_sp,
-                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
-            )
-            # W integrals: ADDITIVE d-orbital contribution on top of sp formulas
-            # W encodes s-d, p-d, and d-d cross-terms (NOT sp-sp replacement)
-            F = fock_d_one_center(F, P, W, starts[i], n_basis=9)
-
-        elif p.n_basis == 1:
-            F[s, s] += Pss * p.gss * 0.5
-        else:
-            px, py, pz = idx[1], idx[2], idx[3]
-            Ppp_total = P[px, px] + P[py, py] + P[pz, pz]
-
-            F[s, s] += Pss * p.gss * 0.5 + Ppp_total * (p.gsp - 0.5 * p.hsp)
-
-            sp_fac_1 = p.gsp - 0.5 * p.hsp
-            sp_fac_2 = 1.5 * p.hsp - 0.5 * p.gsp
-            pp_fac_d = 1.25 * p.gp2 - 0.25 * p.gpp
-            pp_fac_off = 0.75 * p.gpp - 1.25 * p.gp2
-
-            for k in range(1, 4):
-                pk = idx[k]
-                F[pk, pk] += (Pss * sp_fac_1
-                              + P[pk, pk] * p.gpp * 0.5
-                              + (Ppp_total - P[pk, pk]) * pp_fac_d)
-
-            for k in range(1, 4):
-                pk = idx[k]
-                F[s, pk] += P[s, pk] * sp_fac_2
-                F[pk, s] += P[pk, s] * sp_fac_2
-
-            for k in range(1, 4):
-                for l in range(k + 1, 4):
-                    pk, pl = idx[k], idx[l]
-                    F[pk, pl] += P[pk, pl] * pp_fac_off
-                    F[pl, pk] += P[pl, pk] * pp_fac_off
-
-    # === Two-center contribution (full 10x10 w tensor) ===
-    # sp pairs are contracted in groups of one orbital shape and scattered in
-    # a single accumulation; d pairs keep the scalar routine. On cholesterol
-    # this loop ran 2701 times per SCF iteration and 20 iterations per energy,
-    # 54k calls each doing three 4x4x4x4 einsums on arrays far too small to
-    # cover numpy's per-call overhead.
-    for i, j in plan['d_pairs']:
-        F = _pair_fock_twocentre(
-            F, P, params[i], params[j], starts[i], starts[j],
-            coords[i], coords[j],
-            w=None if pair_w is None else pair_w.get((i, j)))
-
+    # === Two-center, one batched contraction per orbital shape ===
+    #   F[mu nu_A] += sum P[la si_B] W        (J on A)
+    #   F[la si_B] += sum P[mu nu_A] W        (J on B)
+    #   F[mu la_AB] -= 0.5 sum P[nu si_AB] W  (K)
     if plan['groups']:
-        flat_idx: list[np.ndarray] = []
-        flat_val: list[np.ndarray] = []
-        for W, rows_a, rows_b, flat in plan['groups']:
+        flat_idx, flat_val = [], []
+        for kernel, W, rows_a, rows_b, flat in plan['groups']:
             P_AA = P[rows_a[:, :, None], rows_a[:, None, :]]
             P_BB = P[rows_b[:, :, None], rows_b[:, None, :]]
             P_AB = P[rows_a[:, :, None], rows_b[:, None, :]]
-
-            t_aa = np.einsum('gabcd,gcd->gab', W, P_BB)
-            t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
-            t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
-
+            if kernel == 'xx':
+                t_aa = np.einsum('gabcd,gcd->gab', W, P_BB)
+                t_bb = np.einsum('gabcd,gab->gcd', W, P_AA)
+                t_ab = -0.5 * np.einsum('gabcd,gbd->gac', W, P_AB)
+            elif kernel == 'xh':                       # B is a hydrogen: c = d = 0
+                w = W[:, :, :, 0, 0]
+                t_aa = w * P_BB[:, 0, 0][:, None, None]
+                t_bb = np.einsum('gab,gab->g', w, P_AA)[:, None, None]
+                t_ab = -0.5 * np.einsum('gab,gb->ga', w, P_AB[:, :, 0])[:, :, None]
+            elif kernel == 'hx':                       # A is a hydrogen: a = b = 0
+                w = W[:, 0, 0, :, :]
+                t_aa = np.einsum('gcd,gcd->g', w, P_BB)[:, None, None]
+                t_bb = w * P_AA[:, 0, 0][:, None, None]
+                t_ab = -0.5 * np.einsum('gcd,gd->gc', w, P_AB[:, 0, :])[:, None, :]
+            else:                                      # both hydrogens
+                w = W[:, 0, 0, 0, 0]
+                t_aa = (w * P_BB[:, 0, 0])[:, None, None]
+                t_bb = (w * P_AA[:, 0, 0])[:, None, None]
+                t_ab = (-0.5 * w * P_AB[:, 0, 0])[:, None, None]
             flat_idx.append(flat)
             flat_val.append(np.concatenate([
                 t_aa.ravel(), t_bb.ravel(), t_ab.ravel(),
                 np.swapaxes(t_ab, 1, 2).ravel()]))
-
         # One accumulation rather than per-pair `+=`: several pairs land on the
-        # same atom's diagonal block, so the scatter has to add rather than
-        # assign, and bincount does that in a single pass.
-        F += np.bincount(np.concatenate(flat_idx),
-                         weights=np.concatenate(flat_val),
-                         minlength=n_basis * n_basis).reshape(n_basis, n_basis)
+        # same atom's diagonal block, so the scatter has to add, and bincount
+        # does that in a single pass.
+        Ff += np.bincount(np.concatenate(flat_idx), weights=np.concatenate(flat_val),
+                          minlength=Ff.size)
 
+    # d pairs without a TETCI block: the scalar routine, last, because it may
+    # hand back a new array.
+    for i, j in plan['d_pairs']:
+        F = _pair_fock_twocentre(F, P, params[i], params[j], starts[i], starts[j],
+                                 coords[i], coords[j])
     return F
 
 
@@ -1211,22 +1237,14 @@ def _nddo_energy_at_geometry(
     if verbose:
         print(f"{method}: {len(atoms)} atoms, {n_basis} basis functions, {info['n_elec']} electrons, {n_occ} occupied")
 
-    # Precompute (ss|ss) integrals between all atom pairs (used in Fock build)
-    n_atoms = len(atoms)
     params = info['params']
-    ssss = np.zeros((n_atoms, n_atoms))
-    for i in range(n_atoms):
-        for j in range(n_atoms):
-            if i == j:
-                continue
-            R = np.linalg.norm(coords[i] - coords[j]) * ANG_TO_BOHR
-            rho0A = 0.5 * EV / params[i].gss if params[i].gss > 0 else 0.0
-            rho0B = 0.5 * EV / params[j].gss if params[j].gss > 0 else 0.0
-            aee = (rho0A + rho0B) ** 2
-            ssss[i, j] = EV / np.sqrt(R ** 2 + aee)
+
+    # The sp two-centre rotations of every pair, once per geometry: the core
+    # Hamiltonian's attraction terms and the Fock plan both read them.
+    _pair_ws = _all_pair_w(atoms, coords, info)
 
     # Core Hamiltonian
-    H = _build_core_hamiltonian(atoms, coords, info)
+    H = _build_core_hamiltonian(atoms, coords, info, pair_ws=_pair_ws)
 
     # Initial density: MOPAC-style neutral-atom diagonal guess. Each atom keeps its own
     # valence electrons, spread uniformly over its s/p orbitals (d starts empty for
@@ -1287,19 +1305,23 @@ def _nddo_energy_at_geometry(
         use_metal = False
 
     def _fock(H, P):
-        return _build_fock(H, P, info, atoms, coords, pair_w=_pair_w,
-                           plan=_fock_plan_)
+        return _build_fock(H, P, info, atoms, coords, plan=_fock_plan_)
 
-    # The two-centre rotations are fixed for this geometry, so they are
-    # built once here instead of at every iteration of the loop below — as is
-    # everything else the Fock build derives from them.
-    _pair_w = precompute_pair_w(atoms, coords, info)
-    _fock_plan_ = _fock_plan(info, atoms, coords, _pair_w)
+    # Everything the Fock build derives from the geometry -- the two-centre
+    # rotations, the fused d-pair tensors, the one-centre factors -- is built
+    # once here instead of at every iteration of the loop below.
+    _fock_plan_ = _fock_plan(info, atoms, coords, pair_ws=_pair_ws)
+    has_d = any(p.n_basis > 4 for p in params)
 
-    # DIIS (Direct Inversion in the Iterative Subspace) storage
+    # DIIS (Direct Inversion in the Iterative Subspace) storage. The stored
+    # matrices live in two (diis_max, n^2) buffers and the error-overlap matrix
+    # B is kept incrementally: a new vector costs one (diis_max, n^2) @ (n^2,)
+    # product instead of nd^2 full-matrix reductions per iteration.
     diis_max = 6
-    diis_F_list = []  # stored Fock matrices
-    diis_e_list = []  # stored error vectors (FPS - SPF)
+    diis_F = np.zeros((diis_max, n_basis * n_basis))
+    diis_E = np.zeros((diis_max, n_basis * n_basis))
+    diis_B = np.zeros((diis_max, diis_max))
+    diis_slots = []      # occupied slots, oldest first
 
     # SCF loop
     converged = False
@@ -1315,38 +1337,35 @@ def _nddo_energy_at_geometry(
         # it is already the right root, so there is nothing to wait for.
         if iteration >= (0 if warm_start else 2):
             # Error vector: e = F @ P - P @ F (commutator, should be zero at convergence)
-            e = F @ P - P @ F
-            diis_F_list.append(F.copy())
-            diis_e_list.append(e.copy())
+            e = (F @ P - P @ F).reshape(-1)
+            slot = diis_slots.pop(0) if len(diis_slots) == diis_max else len(diis_slots)
+            diis_slots.append(slot)
+            diis_F[slot] = F.reshape(-1)
+            diis_E[slot] = e
+            # B[i, j] = Tr(e_i e_j) = e_i . e_j: only the new row/column changes.
+            dots = diis_E @ e
+            diis_B[slot, :] = dots
+            diis_B[:, slot] = dots
 
-            # Keep only last diis_max entries
-            if len(diis_F_list) > diis_max:
-                diis_F_list.pop(0)
-                diis_e_list.pop(0)
-
-            nd = len(diis_F_list)
+            nd = len(diis_slots)
             if nd >= 2:
-                # Build DIIS B matrix: B[i,j] = Tr(e_i @ e_j)
+                idx = np.asarray(diis_slots)
                 B = np.zeros((nd + 1, nd + 1))
-                for i in range(nd):
-                    for j in range(nd):
-                        B[i, j] = np.sum(diis_e_list[i] * diis_e_list[j])
+                B[:nd, :nd] = diis_B[np.ix_(idx, idx)]
                 B[nd, :nd] = -1.0
                 B[:nd, nd] = -1.0
-                B[nd, nd] = 0.0
 
                 rhs = np.zeros(nd + 1)
                 rhs[nd] = -1.0
 
                 try:
                     coeffs = np.linalg.solve(B, rhs)
-                    F = sum(coeffs[i] * diis_F_list[i] for i in range(nd))
+                    F = (coeffs[:nd] @ diis_F[idx]).reshape(n_basis, n_basis)
                 except np.linalg.LinAlgError:
                     pass  # fall back to un-extrapolated F
 
         # Level shifting for d-orbital convergence
         # Add shift to virtual orbitals to prevent oscillation
-        has_d = any(p.n_basis > 4 for p in params)
         _delta = delta if iteration > 0 else 1.0
         if has_d and iteration < 100 and _delta > 0.001:
             level_shift = 5.0  # stronger level shift for d-orbital atoms
@@ -1356,13 +1375,14 @@ def _nddo_energy_at_geometry(
         # Diagonalize
         eigenvalues, C = np.linalg.eigh(F)
 
-        # Apply level shift to virtual orbitals (helps d-orbital convergence)
+        # Apply level shift to virtual orbitals (helps d-orbital convergence).
+        # Shifting the virtual eigenvalues leaves C an eigenbasis of the shifted
+        # operator with the same ordering (every virtual sits above every
+        # occupied level), so the re-diagonalisation this used to do returned
+        # the same C up to column signs -- and the density below is built from
+        # the occupied columns only.
         if level_shift > 0 and n_occ < n_basis:
-            for k in range(n_occ, n_basis):
-                eigenvalues[k] += level_shift
-            # Rebuild F with shifted eigenvalues
-            F_shifted = C @ np.diag(eigenvalues) @ C.T
-            eigenvalues, C = np.linalg.eigh(F_shifted)
+            eigenvalues[n_occ:] += level_shift
 
         # Build new density matrix. One GEMM, not n_occ rank-1 updates: the
         # loop's cost was never the outer products but the n_occ full-matrix
@@ -1388,7 +1408,6 @@ def _nddo_energy_at_geometry(
         # a neutral-atom guess oscillating while it is still far away. Applied
         # to a `P_init` warm start it damps a density that is already close,
         # and the measured `delta` below is a better guide from iteration 0.
-        has_d = any(p.n_basis > 4 for p in params)
         if iteration < 3 and not warm_start:
             mix = 0.3 if has_d else 0.5
         elif delta > 0.1:
@@ -1432,13 +1451,11 @@ def _nddo_energy_at_geometry(
     # Returned by default so the toolkit is drop-in usable like OpenMOPAC (which prints
     # net atomic charges). Sums to ~0 for neutral molecules by construction.
     charges = np.empty(len(atoms))
+    _pdiag = np.diag(P)
     _mu = 0
     for _i, _p in enumerate(params):
-        _pop = 0.0
-        for _k in range(_p.n_basis):
-            _pop += P[_mu, _mu]
-            _mu += 1
-        charges[_i] = _p.n_valence - _pop
+        charges[_i] = _p.n_valence - _pdiag[_mu:_mu + _p.n_basis].sum()
+        _mu += _p.n_basis
 
     # Frontier orbitals, reported the way OpenMOPAC does so the two are directly
     # comparable: MOPAC prints NO. OF FILLED LEVELS, HOMO LUMO ENERGIES (EV) and
