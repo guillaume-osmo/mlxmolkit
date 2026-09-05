@@ -608,16 +608,24 @@ def precompute_pair_w(atoms, coords, info):
 
 
 def _all_pair_w(atoms, coords, info):
-    """(ia, ja, ws): every pair i < j in `triu_indices` order and its rotated tensor."""
-    from .rotation_batch import rotate_pairs
+    """(ia, ja, ws): every pair i < j in `triu_indices` order and its rotated tensor.
+
+    The rotation is addressed by atom index rather than by lists of parameter
+    and coordinate tuples -- see
+    :func:`~mlxmolkit.nddo.rotation_batch.rotate_pairs_indexed`. On a 106-atom
+    molecule the list form was 9.4 ms of a 65 ms single point, nearly all of it
+    building 30,000 short-lived tuples and per-pair parameter columns.
+    """
+    from .rotation_batch import rotate_pairs_indexed
+    from .two_center_integrals import multipole_table
 
     params = info['params']
     ia, ja = np.triu_indices(len(atoms), 1)
     if ia.size == 0:
         return ia, ja, np.zeros((0, 4, 4, 4, 4))
-    il, jl = ia.tolist(), ja.tolist()
-    ws = rotate_pairs([(params[i], params[j]) for i, j in zip(il, jl)],
-                      [(coords[i], coords[j]) for i, j in zip(il, jl)])
+    tab, zval, nb = multipole_table(params)
+    ws = rotate_pairs_indexed(tab, zval, nb, np.asarray(coords, dtype=np.float64),
+                              ia, ja)
     return ia, ja, ws
 
 
@@ -1101,10 +1109,13 @@ def _pm6_heat_corrections(atoms, coords, method) -> float:
     if (canonical not in PM6_CORE_CORE_METHODS
             and canonical not in DISPERSION_METHODS):
         return 0.0
+    # The last two walk the same atom pairs; one distance matrix serves both.
+    from .pwcct import _distance_matrix
+    dist = _distance_matrix(coords)
     return (dispersion_correction(atoms, coords, canonical)
             + c_triple_bond_correction(atoms, coords)
-            + nsp2_correction(atoms, coords)
-            + nhco_dihedral_correction(atoms, coords))
+            + nsp2_correction(atoms, coords, dist=dist)
+            + nhco_dihedral_correction(atoms, coords, dist=dist))
 
 
 def nddo_energy(
@@ -1175,7 +1186,11 @@ def nddo_energy(
     coords_ = np.asarray(coords, dtype=np.float64)
     specs_ = [(params_[i], params_[j], coords_[i], coords_[j])
               for i in range(len(atoms)) for j in range(i + 1, len(atoms))]
-    with pair_cache(specs_):
+    # rotations=False: `_all_pair_w` rotates every pair of this geometry in one
+    # indexed call inside the SCF, so having the cache build and key them too is
+    # pure duplication. The d work -- batched TETCI, the d overlaps, the
+    # Wigner-D attraction blocks -- is what this cache is for.
+    with pair_cache(specs_, rotations=False):
         return _nddo_energy_at_geometry(
             atoms, coords, max_iter=max_iter, conv_tol=conv_tol, verbose=verbose,
             use_metal=use_metal, method=method, native=native,

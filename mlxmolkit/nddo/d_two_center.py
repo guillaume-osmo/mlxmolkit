@@ -123,7 +123,7 @@ def _tetci_key(pa, pb, ca, cb):
 
 
 @contextmanager
-def pair_cache(pair_specs):
+def pair_cache(pair_specs, rotations=True):
     """Precompute every geometry-dependent pair quantity in `pair_specs`.
 
     Each of these routines is written for a batch and was being called one pair
@@ -202,10 +202,15 @@ def pair_cache(pair_specs):
             pA, pB, cA, cB = spec
             overlaps[_pair_key(pA, pB, cA, cB)] = S
             overlaps[_pair_key(pB, pA, cB, cA)] = S.T
-        ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
-                          [(c, d) for _a, _b, c, d in sp_specs])
-        for spec, w in zip(sp_specs, ws):
-            rot[_pair_key(*spec)] = w
+        # `rotations=False` when the caller rotates every pair itself in one
+        # indexed call (`scf._all_pair_w`), which a single point now does: the
+        # rotations computed here would then be built and keyed a second time
+        # for nothing -- 5565 `_pair_key` tuples on a 106-atom molecule.
+        if rotations:
+            ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
+                              [(c, d) for _a, _b, c, d in sp_specs])
+            for spec, w in zip(sp_specs, ws):
+                rot[_pair_key(*spec)] = w
 
     prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE, _YH_CACHE)
     (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE,
