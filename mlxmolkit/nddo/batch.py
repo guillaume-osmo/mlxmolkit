@@ -65,13 +65,19 @@ class RM1Batch:
 
 
 @lru_cache(maxsize=None)
-def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD) -> np.ndarray:
+def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD, tail=None) -> np.ndarray:
     from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
     from .w_integrals import compute_w_integrals
     from .params import principal_qn
 
     qn = principal_qn(Z)
-    if Z in PM6_TAIL_EXPONENTS:
+    # ⚠️ `tail` is part of the cache KEY on purpose: PM6 and PM6-ORG share Z and
+    # can share zetas, and a cache keyed on Z alone would hand one method the
+    # other's integrals. The element's own tails first; the PM6 table only as
+    # the fallback it always was.
+    if tail:
+        zs_t, zp_t, zd_t = tail
+    elif Z in PM6_TAIL_EXPONENTS:
         zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[Z]
     else:
         zs_t, zp_t, zd_t = zeta_s, zeta_p, zeta_d
@@ -92,9 +98,11 @@ def _one_centre_w(p) -> np.ndarray:
     The cached array is returned read-only so a caller cannot mutate the shared
     copy.
     """
+    tail = getattr(p, 'tail_exponents', None)
     return _one_centre_w_cached(
         p.Z, p.zeta_s, p.zeta_p, p.zeta_d,
-        getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
+        getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
+        tuple(tail) if tail else None)
 
 
 def _one_centre_w_uncached(p) -> np.ndarray:
@@ -104,7 +112,9 @@ def _one_centre_w_uncached(p) -> np.ndarray:
     from .params import principal_qn
 
     qn = principal_qn(p.Z)
-    if p.Z in PM6_TAIL_EXPONENTS:
+    if getattr(p, 'tail_exponents', None):
+        zs_t, zp_t, zd_t = p.tail_exponents
+    elif p.Z in PM6_TAIL_EXPONENTS:
         zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
     else:
         zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d

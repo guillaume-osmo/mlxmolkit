@@ -67,6 +67,33 @@ def atomic_multipoles_from_density(atoms, params, density):
         for the ESP is applied at evaluation via ``quad_scale``, calibrated to QM.)
     """
     from .nddo.integrals import _charge_separations
+    from .nddo.params import principal_qn
+
+    def dewar_thiel_dd(p):
+        """The sp charge separation DD (Bohr), as MOPAC's gettab computes it:
+
+            DD = (2n+1)/sqrt(3) * (4 zs zp)^(n+1/2) / (zs+zp)^(2n+2)
+
+        ⚠️ Not `_charge_separations(p)[0]`. That formula --
+        (2n+1) sqrt(zs zp) / ((zs+zp)^2 sqrt 3) -- is a factor ~2 off (carbon:
+        0.383 against 0.754 Bohr), and it was what made the molecular dipole
+        reassembled from these atomic moments miss MOPAC's HYBRID term by up to
+        0.8 D. Gated against MOPAC 23 on CHNO/F molecules: 0.000-0.001 D with
+        this form, 0.05-0.8 D with the old one. The SCF path is left alone: its
+        two-centre integrals match MOPAC to 2e-5 through their own route.
+
+        ⚠️ Basis zetas (zs, zp) for EVERY element, d-bearing ones included.
+        MOPAC's calpar.F90 computes `dd(i)` from zs(i), zp(i) and never from
+        zsn/zpn -- read in the source, not assumed. Using the tail exponents
+        for Cl happened to shrink the Cl residual (0.18 -> 0.05 D) and was
+        rejected for that reason: it is not what the reference does, and the
+        0.18 D left on Cl molecules is the p-d hybrid dipole, which this
+        monopole+sp model does not carry. Implement, do not fit.
+        """
+        n = principal_qn(p.Z)
+        zs, zp = p.zeta_s, p.zeta_p
+        return (2 * n + 1) / np.sqrt(3.0) * (4.0 * zs * zp) ** (n + 0.5) \
+            / (zs + zp) ** (2 * n + 2)
 
     P = np.asarray(density, dtype=np.float64)
     N = len(params)
@@ -79,7 +106,8 @@ def atomic_multipoles_from_density(atoms, params, density):
         pop = float(np.trace(P[mu:mu + nb, mu:mu + nb]))
         q[i] = float(p.n_valence) - pop
         if nb >= 4:
-            da, qa = _charge_separations(p)
+            _da_old, qa = _charge_separations(p)
+            da = dewar_thiel_dd(p)          # the gated one; see the docstring above
             # <s|r|p_i> = da along axis i (Bohr); P symmetric so the s-p block
             # contributes 2 * P(s,p_i); electrons carry -1 -> electronic dipole.
             dip[i, 0] = -2.0 * da * P[mu, mu + 1]
