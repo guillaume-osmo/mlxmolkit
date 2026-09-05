@@ -433,6 +433,59 @@ def _yx_pair_w(p_d, p_sp, coord_d, coord_sp):
     return unpack(w[:packed_size(4), :packed_size(9)].T, 9, 4)
 
 
+def d_pair_effective_w(pA, pB, coordA, coordB, w_sp):
+    """The whole two-centre term of a d-bearing pair as ONE (nA, nA, nB, nB) tensor.
+
+    On every branch that has its integrals, :func:`d_two_center_fock` runs the
+    same three contractions as the sp routine -- J on A from P_BB, J on B from
+    P_AA, K from P_AB -- over the FULL block, then subtracts the sp corner that
+    ``scf._pair_fock_twocentre`` has already added from the rotated sp tensor
+    ``w_sp``. All three are linear in the tensor, so
+
+        sp(w_sp) + full(W) - corner(W[:a, :a, :b, :b])  ==  full(Weff),
+        Weff = W with W[:a, :a, :b, :b] := w_sp[:a, :a, :b, :b],   a, b = min(n, 4)
+
+    and a d pair becomes an ordinary NDDO pair contraction, hoisted out of the
+    SCF loop like the sp pairs. Branch by branch of the routine it replaces:
+
+    * YY (9, 9): W is the TETCI block, the corner W[:4, :4, :4, :4];
+    * YX (9, 4) and XY (4, 9): W from :func:`_yx_pair_w`, XY transposed into
+      (A, B) order, the corner W[:4, :4, :, :];
+    * YH (9, 1) and HY (1, 9): W is the 9x9 (mu nu_A | s_B s_B) matrix as
+      (9, 9, 1, 1); the routine's explicit loops are exactly "full minus the
+      (mu < 4 and nu < 4) corner" for J_A, J_B and K, both orderings.
+
+    Returns None when TETCI has no block for the pair: that branch of the
+    routine is a monopole approximation, not linear in one tensor, and the
+    caller keeps calling ``d_two_center_fock`` for such a pair.
+    ``tests/test_nddo_fock_plan.py`` checks the identity on random densities
+    for every kind.
+    """
+    nA, nB = pA.n_basis, pB.n_basis
+    if nA == 9 and nB == 9:
+        W = _yy_pair_w(pA, pB, coordA, coordB)
+    elif nA == 9 and nB == 4:
+        W = _yx_pair_w(pA, pB, coordA, coordB)
+    elif nA == 4 and nB == 9:
+        W = _yx_pair_w(pB, pA, coordB, coordA)
+        if W is not None:
+            W = np.transpose(W, (2, 3, 0, 1))
+    elif nA == 9 and nB == 1:
+        from .tetci_yh import yh_rotated_integral_matrix
+        W = np.asarray(yh_rotated_integral_matrix(pA, pB, coordA, coordB)).reshape(9, 9, 1, 1)
+    elif nA == 1 and nB == 9:
+        from .tetci_yh import yh_rotated_integral_matrix
+        W = np.asarray(yh_rotated_integral_matrix(pB, pA, coordB, coordA)).reshape(1, 1, 9, 9)
+    else:
+        return None
+    if W is None:
+        return None
+    Weff = np.array(W, dtype=np.float64)          # a copy: the TETCI blocks are cached
+    a, b = min(nA, 4), min(nB, 4)
+    Weff[:a, :a, :b, :b] = w_sp[:a, :a, :b, :b]
+    return Weff
+
+
 def compute_d_two_center(
     pA, pB,
     R_bohr: float,
