@@ -5,7 +5,7 @@ Remote comparison on 2026-09-06:
 | Ref | Commit | Integration status |
 |---|---|---|
 | Previous main | b777b439ac48ea151fc03cd72e68081d2bcff02f | Separate clean snapshot history |
-| publish-clean | 3e1a710 | Already an ancestor of fix/nddo-mopac-gates |
+| publish-clean | 3e1a710 | Same tree as a63bea3; its separate merge commit is also retained |
 | perf/nddo-fock-plan | d1b5784 | Already merged into fix/nddo-mopac-gates |
 | perf/nddo-round2 | 85b2eab | Already merged into fix/nddo-mopac-gates |
 | fix/nddo-mopac-gates | 0a508e98f958fcffea1483179e8d69cca8a2c751 | Contains the complete published branch stack |
