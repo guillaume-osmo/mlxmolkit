@@ -72,6 +72,9 @@ class ElementParams:
     F0SD: float = 0.0        # Slater-Condon F0 for s-d interaction
     G2SD: float = 0.0        # Slater-Condon G2 for s-d interaction
     has_d: bool = False       # True if element uses d-orbitals in PM6
+    d_quantum_number: int | None = None
+    d_electrons: int = 0
+    d_screening: bool = False  # ddpo for core/d integrals; sp electron integrals use calpar.
     feather: bool = False  # Smooth PM7 transition to point-charge integrals
     rho_core: float | None = None  # Explicit MOPAC pocord, including zero; None uses legacy table.
 

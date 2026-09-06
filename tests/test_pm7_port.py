@@ -17,7 +17,7 @@ ORGANICS = ['CO', 'CCO', 'CC(=O)N', 'CC(=O)O', 'C#C', 'c1ccccc1',
 
 @pytest.mark.skipif(MOPAC is None, reason='MOPAC executable not installed')
 @pytest.mark.parametrize('case', CASES)
-def test_pm7_all_elements_against_mopac(case, tmp_path):
+def test_pm7_original_hydrides_against_mopac(case, tmp_path):
     a, x = hydride(*case)
     oracle = reference(a, x, tmp_path)
     result = nddo_energy(a, x, method='PM7', max_iter=300, conv_tol=1e-9)
@@ -122,11 +122,11 @@ def test_pm7_rotation_and_permutation():
 
 @pytest.mark.parametrize('entry', ['scalar', 'batch'])
 def test_pm7_unsupported_elements_fail_explicitly(entry):
-    with pytest.raises(ValueError, match='PM7 element Z=26 is not ported'):
+    with pytest.raises(ValueError, match='PM7 element Z=79 is not ported'):
         if entry == 'scalar':
-            nddo_energy([26], np.zeros((1, 3)), method='PM7')
+            nddo_energy([79], np.zeros((1, 3)), method='PM7')
         else:
-            nddo_energy_batch([([26], np.zeros((1, 3)))], method='PM7')
+            nddo_energy_batch([([79], np.zeros((1, 3)))], method='PM7')
 
 
 def test_pm7_case_normalization_and_fused_metal(monkeypatch):

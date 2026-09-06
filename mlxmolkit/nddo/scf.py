@@ -438,6 +438,8 @@ def _pair_core_attraction(pA, pB, rA, rB):
     Added to A's own diagonal block. When A carries d orbitals the full 9x9
     Wigner-D rotated block supersedes the sp-only one rather than adding to it.
     """
+    from .pm7 import core_partner
+    pB = core_partner(pB)
     nA = pA.n_basis
     block = np.zeros((nA, nA))
 
@@ -520,7 +522,8 @@ def _build_core_hamiltonian(atoms, coords, info, pair_ws=None):
     # path, which is not expressible through the sp rotation. The sp pairs are
     # rotated in one batched call, and e1b and e2a are slices of w:
     #   e1b = -Z_B w[:, :, 0, 0]   on A,      e2a = -Z_A w[0, 0, :, :]   on B.
-    att_sp = (nb[iu] != 9) & (nb[ju] != 9)
+    special_core = np.array([p.feather and bool(p.rho_core and p.rho_core > 1e-5) for p in params])
+    att_sp = (nb[iu] != 9) & (nb[ju] != 9) & ~special_core[iu] & ~special_core[ju]
     for i, j in zip(iu[~att_sp].tolist(), ju[~att_sp].tolist()):
         si, nA = starts[i], nb[i]
         sj, nB = starts[j], nb[j]
@@ -567,6 +570,16 @@ def _pair_fock_twocentre(F, P, pA, pB, sA, sB, rA, rB, w=None):
     """
     if w is None:
         w, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+    if pA.feather and pB.feather and (pA.d_electrons or pB.d_electrons):
+        from .d_two_center import d_pair_effective_w
+        full = d_pair_effective_w(pA, pB, rA, rB, w)
+        a, b = slice(sA, sA+pA.n_basis), slice(sB, sB+pB.n_basis)
+        F[a,a] += np.einsum('ijkl,kl->ij', full, P[b,b])
+        F[b,b] += np.einsum('ijkl,ij->kl', full, P[a,a])
+        exchange = -.5*np.einsum('ijkl,jl->ik', full, P[a,b])
+        F[a,b] += exchange
+        F[b,a] += exchange.T
+        return F
     nA_sp = min(pA.n_basis, 4)
     nB_sp = min(pB.n_basis, 4)
     #   F[mu nu_A] += sum P[la si_B] w        (J on A)
@@ -644,7 +657,7 @@ def _one_centre_d_w(p):
         zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
     else:
         zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
-    return compute_w_integrals(zs_t, zp_t, zd_t, qn_sp, qn_sp,
+    return compute_w_integrals(zs_t, zp_t, zd_t, qn_sp, p.d_quantum_number or qn_sp,
                                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
 
 
@@ -1140,7 +1153,7 @@ def nddo_energy(
         coords: (N, 3) coordinates in Angstrom
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
-        method: Registered NDDO method, including PM7 (11 main-group elements).
+        method: Registered NDDO method, including PM7 (40 elements, closed shell).
         molecular_charge: net charge used to set the closed-shell electron count.
         native: retained for compatibility; all methods run natively.
 

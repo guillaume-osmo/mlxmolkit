@@ -205,6 +205,10 @@ def yh_e1b_contribution(
         if hit is not None:
             return hit
 
+    from .pm7 import core_partner, transition_core
+    from dataclasses import replace
+    pA = replace(pA, d_screening=True) if pA.feather and pA.d_electrons else pA
+    pB = core_partner(pB)
     R = float(np.linalg.norm(coordB - coordA))
     R_bohr = R * ANG_TO_BOHR
 
@@ -334,7 +338,7 @@ def yh_e1b_contribution(
     if pA.feather and pB.feather:
         from .point_charge import matrix
         e1b = matrix(e1b, R, pB.n_valence)
-    return -e1b
+    return transition_core(-e1b, pA, pB)
 
 
 def yh_e1b_batch(pair_params, pair_coords) -> NDArray[np.float64]:
@@ -363,6 +367,9 @@ def yh_e1b_batch(pair_params, pair_coords) -> NDArray[np.float64]:
     if P == 0:
         return np.zeros((0, 9, 9))
 
+    from .pm7 import core_partner, transition_core
+    from dataclasses import replace
+    pair_params = [(replace(a, d_screening=True) if a.feather and a.d_electrons else a, core_partner(b)) for a, b in pair_params]
     rA = np.array([c[0] for c in pair_coords], dtype=np.float64)
     rB = np.array([c[1] for c in pair_coords], dtype=np.float64)
     delta = rB - rA
@@ -452,4 +459,6 @@ def yh_e1b_batch(pair_params, pair_coords) -> NDArray[np.float64]:
     if selected.any():
         from .point_charge import matrix
         result[selected] = matrix(result[selected], R_ang[selected], -Z_B[selected])
+    for k, (a, b) in enumerate(pair_params):
+        transition_core(result[k], a, b)
     return result

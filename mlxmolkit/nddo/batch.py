@@ -65,7 +65,7 @@ class RM1Batch:
 
 
 @lru_cache(maxsize=None)
-def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD, tail=None) -> np.ndarray:
+def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD, tail=None, qn_d=None) -> np.ndarray:
     from .tetci_multipole_pyseqm import PM6_TAIL_EXPONENTS
     from .w_integrals import compute_w_integrals
     from .params import principal_qn
@@ -81,7 +81,7 @@ def _one_centre_w_cached(Z, zeta_s, zeta_p, zeta_d, F0SD, G2SD, tail=None) -> np
         zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[Z]
     else:
         zs_t, zp_t, zd_t = zeta_s, zeta_p, zeta_d
-    out = compute_w_integrals(zs_t, zp_t, zd_t, qn, qn, F0SD, G2SD)
+    out = compute_w_integrals(zs_t, zp_t, zd_t, qn, qn_d or qn, F0SD, G2SD)
     out.flags.writeable = False
     return out
 
@@ -102,7 +102,7 @@ def _one_centre_w(p) -> np.ndarray:
     return _one_centre_w_cached(
         p.Z, p.zeta_s, p.zeta_p, p.zeta_d,
         getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0),
-        tuple(tail) if tail else None)
+        tuple(tail) if tail else None, p.d_quantum_number)
 
 
 def _one_centre_w_uncached(p) -> np.ndarray:
@@ -118,7 +118,7 @@ def _one_centre_w_uncached(p) -> np.ndarray:
         zs_t, zp_t, zd_t = PM6_TAIL_EXPONENTS[p.Z]
     else:
         zs_t, zp_t, zd_t = p.zeta_s, p.zeta_p, p.zeta_d
-    return compute_w_integrals(zs_t, zp_t, zd_t, qn, qn,
+    return compute_w_integrals(zs_t, zp_t, zd_t, qn, p.d_quantum_number or qn,
                                getattr(p, 'F0SD', 0.0), getattr(p, 'G2SD', 0.0))
 
 
@@ -156,7 +156,13 @@ def _two_centre_packed(pA, pB, rA, rB, dense=None, tetci=None) -> np.ndarray:
                 da = np.arange(nA)*(np.arange(nA)+3)//2
                 db = np.arange(nB)*(np.arange(nB)+3)//2
                 result[np.ix_(da, db)] += point
-            return result
+            if pA.feather and pB.feather and (pA.d_electrons or pB.d_electrons):
+                # repp supplies the sp corner with calpar, while rijkl uses ddpo.
+                sp, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
+                sa, sb = min(nA, 4), min(nB, 4)
+                result[:packed_size(sa), :packed_size(sb)] = pack(sp[:sa,:sa,:sb,:sb], sa, sb)
+            from .pm7 import transition_packed
+            return transition_packed(result, pA, pB)
 
     if dense is None:
         dense, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)
@@ -382,7 +388,8 @@ def prepare_batch(
         for (pos, slot), blk in zip(_yh_at, yh_e1b_batch(_yh_pp, _yh_pc)):
             pair_attraction[pos][slot] = blk
     if _sp_at:
-        _w_att = rotate_pairs(_sp_att_params, _sp_att_coords)
+        from .pm7 import core_partner
+        _w_att = rotate_pairs([(a, core_partner(b)) for a, b in _sp_att_params], _sp_att_coords)
         for n, (pos, slot) in enumerate(_sp_at):
             nX = _sp_att_params[n][0].n_basis
             pair_attraction[pos][slot] = (
@@ -469,6 +476,13 @@ def prepare_batch(
                              dtype=np.float64)
             att_a = -val_b[:, None, None] * w_grp[:, :nA, :nA, 0, 0]
             att_b = -val_a[:, None, None] * w_grp[:, 0, 0, :nB, :nB]
+            for k, pos in enumerate(positions):
+                a, b = sp_params[pos]
+                ra, rb = sp_coords[pos]
+                if b.feather and b.rho_core and b.rho_core > 1e-5:
+                    att_a[k] = _pair_core_attraction(a, b, ra, rb)
+                if a.feather and a.rho_core and a.rho_core > 1e-5:
+                    att_b[k] = _pair_core_attraction(b, a, rb, ra)
             _acc_idx.append((off[:, None, None] + rows_a[:, :, None] * MB
                              + rows_a[:, None, :]).ravel())
             _acc_val.append(att_a.ravel())

@@ -5156,14 +5156,14 @@ def diatom_overlap_matrixD(ni, nj, xij, rij, zeta_a, zeta_b, qn_int, qnD_int):
         S331 * (np.sqrt(3.0) * sa * sb * cb) * np.sqrt(3.0) * sa * ca * sb**2
         + S332 * ((sa * (2.0 * cb**2 - 1.0)) * 2.0 * sa * ca * sb * cb + (ca * cb) * (2.0 * ca**2 - 1.0) * sb)
         + S333
-        * (-(sa * sb * cb) * (2.0 * sa * ca * cb**2 + sa * ca * sb**2) + ca * sb * cb * (2.0 * ca**2 - 1.0))
+        * (-(sa * sb * cb) * (2.0 * sa * ca * cb**2 + sa * ca * sb**2) - ca * sb * cb * (2.0 * ca**2 - 1.0))
     )  ##
 
     di[..., 8, 7] = (
         S331 * (np.sqrt(3.0) * sa * sb * cb) * np.sqrt(3.0) * sa * ca * sb**2
         + S332 * ((sa * (2.0 * cb**2 - 1.0)) * 2.0 * sa * ca * sb * cb + (ca * cb) * (2.0 * ca**2 - 1.0) * sb)
         + S333
-        * (-(sa * sb * cb) * (2.0 * sa * ca * cb**2 + sa * ca * sb**2) + ca * sb * cb * (2.0 * ca**2 - 1.0))
+        * (-(sa * sb * cb) * (2.0 * sa * ca * cb**2 + sa * ca * sb**2) - ca * sb * cb * (2.0 * ca**2 - 1.0))
     )  ##
 
     di[..., 8, 8] = (

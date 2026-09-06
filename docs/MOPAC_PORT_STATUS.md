@@ -44,7 +44,7 @@ against central differences, and ethanol optimization convergence.
 | AM1, RM1, PM3 | Existing native ports, included in the full regression run. |
 | PM6, PM6-ORG, PM6-D3/H4/X variants | Existing native ports; PM6_D is an alias, not another Hamiltonian. |
 | MNDO/d | Not ported: requires method-specific d/core parameters and diatomic repulsion, with independent energy/gradient gates. |
-| PM7 | Native eleven-element main-group port, complete corrections/gradient and CPU/Metal batch; see [validation](PM7_PORT.md). |
+| PM7 | Native 40-element closed-shell port, including Sc–Cu, complete corrections/gradient and CPU/Metal batch; see [validation](PM7_PORT.md). |
 | PM7-TS | Not ported; requires its own model parameters and validation. |
 | PM8 | Present in the inspected current OpenMOPAC source, not ported here. Needs source/version-specific validation. |
 | INDO and Sparkles | Not ported; these need their own model/basis semantics and validation. |

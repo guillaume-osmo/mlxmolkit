@@ -3,27 +3,26 @@
 Sources: corrections/Hydrogen_bond_corrections.F90 (setup_DH_Plus),
 H_bond_correction_EH_plus.F90, H_bond_correction_bits.F90,
 set_up_dentate.F90, geometry/dihed.F90. Copyright 2021 Virginia
-Polytechnic Institute and State University. Nonperiodic main-group scope.
+Polytechnic Institute and State University. Nonperiodic scope.
 """
 import math
 import numpy as np
 from scipy.special import expit
 from .constants import BOHR_TO_ANG, HARTREE_TO_EV, EV_TO_KCAL
 
-_HB_RADII = {1: .32, 6: .75, 7: .71, 8: .63, 9: .64, 14: 1.04,
-             15: 1.10, 16: 1.02, 17: .99, 35: 1.14, 53: 1.32}
-
+# OpenMOPAC covrad and atom_radius_covalent, Z=1..54.
+_HB_RADII = dict(enumerate([0.32, 0.46, 1.2, 0.94, 0.77, 0.75, 0.71, 0.63, 0.64, 0.67, 1.4, 1.25, 1.13, 1.04, 1.1, 1.02, 0.99, 0.96, 1.76, 1.54, 1.33, 1.22, 1.21, 1.1, 1.07, 1.04, 1.0, 0.99, 1.01, 1.09, 1.12, 1.09, 1.15, 1.1, 1.14, 1.17, 1.89, 1.67, 1.47, 1.39, 1.32, 1.24, 1.15, 1.13, 1.13, 1.08, 1.15, 1.23, 1.28, 1.26, 1.26, 1.23, 1.32, 1.31], 1))
+_COV_RADII = dict(enumerate([0.37, 0.32, 1.34, 0.9, 0.82, 0.77, 0.75, 0.73, 0.71, 0.69, 1.54, 1.3, 1.18, 1.11, 1.06, 1.02, 0.99, 0.97, 1.96, 1.74, 1.44, 1.36, 1.25, 1.27, 1.39, 1.25, 1.26, 1.21, 1.38, 1.31, 1.26, 1.22, 1.19, 1.16, 1.14, 1.1, 2.11, 1.92, 1.62, 1.48, 1.37, 1.45, 1.56, 1.26, 1.35, 1.31, 1.53, 1.48, 1.44, 1.41, 1.38, 1.35, 1.33, 1.3], 1))
 
 def bonded(atoms, coords):
     """Ordinary MOPAC bond graph (distinct from the EH+ neighbor graph)."""
-    radii = {1: .37, 6: .77, 7: .75, 8: .73, 9: .71, 14: 1.11,
-             15: 1.06, 16: 1.02, 17: .99, 35: 1.14, 53: 1.33}
+    radii = _COV_RADII
     result = [[] for _ in atoms]
     for i, a in enumerate(atoms):
         for j in range(i):
             b = atoms[j]
             pair = tuple(sorted((a, b)))
-            safety = 1.25 if pair == (1, 6) else 1.2 if pair in (
+            safety = 1.0 if pair == (5, 7) else 1.25 if pair == (1, 6) else 1.2 if pair in (
                 (6, 6), (6, 7), (16, 16)) else 1.1
             if np.linalg.norm(coords[i]-coords[j]) < safety*(radii[a]+radii[b]):
                 result[i].append(j)

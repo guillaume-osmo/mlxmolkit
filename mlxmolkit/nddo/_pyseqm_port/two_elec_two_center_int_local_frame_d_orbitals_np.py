@@ -85,6 +85,11 @@ def two_elec_two_center_int_local_frame_d_orbitals(ni,nj,r0d, tore,
     YY = (((ni > 12) & (ni <18)) | ((ni > 20) & (ni <30)) | ((ni > 32) & (ni <36)) | ((ni > 38) & (ni <48)) | ((ni > 50) & (ni <54)) | ((ni > 70) & (ni <80)) | (ni ==57)) &\
          (((nj > 12) & (nj <18)) | ((nj > 20) & (nj <30)) | ((nj > 32) & (nj <36)) | ((nj > 38) & (nj <48)) | ((nj > 50) & (nj <54)) | ((nj > 70) & (nj <80)) | (nj ==57))
 
+    if themethod == "PM7":
+        YH = (rho3ad > 0) & (nj == 1)
+        YX = (rho3ad > 0) & (rho3bd == 0) & (nj > 1)
+        YY = (rho3ad > 0) & (rho3bd > 0)
+
     Ycore = (drho_corea[YY] > 0.000) | (drho_coreb[YY] > 0.000)
     ##rho0a = rho_corea
     ##rho0b = rho_coreb
@@ -475,6 +480,8 @@ def two_elec_two_center_int_local_frame_d_orbitals(ni,nj,r0d, tore,
 #            k = k + 1
 #        LL = L.bool()
         YYH = (((ni[XH] > 12) & (ni[XH] <18)) | ((ni[XH] > 20) & (ni[XH] <30)) | ((ni[XH] > 32) & (ni[XH] <36)) | ((ni[XH] > 38) & (ni[XH] <48)) | ((ni[XH] > 50) & (ni[XH] <54)) | ((ni[XH] > 70) & (ni[XH] <80)) | (ni[XH] ==57))  & (nj[XH]==1)
+        if themethod == "PM7":
+            YYH = YH[XH]
 
 
         coreYHLocal[...,0] = tore[ni[YH]]*riXHPM6[YYH,1-1]
@@ -1411,10 +1418,16 @@ def two_elec_two_center_int_local_frame_d_orbitals(ni,nj,r0d, tore,
         
 
 
+        if themethod == "PM7":
+            # Match OpenMOPAC's real d-harmonic phases (also used by YY).
+            riYX[..., [257, 400, 437]] *= -1
+
         coreYX = torch.zeros(YX.sum(),55,dtype=dtype)
         coreYXLocal = torch.zeros(YX.sum(),55,dtype=dtype)
         YYX = (ni[XX]>1) & (nj[XX]>1) & (((ni[XX] > 12) & (ni[XX] <18)) | ((ni[XX] > 20) & (ni[XX] <30)) | ((ni[XX] > 32) & (ni[XX] <36)) | ((ni[XX] > 38) & (ni[XX] <48)) | ((ni[XX] > 50) & (ni[XX] <54)) | ((ni[XX] > 70) & (ni[XX] <80)) | (ni[XX] ==57)) & \
          ((nj[XX] <= 12) | ((nj[XX] >= 18) & (nj[XX] <=20)) | ((nj[XX] >= 30) & (nj[XX] <= 32)) | ((nj[XX] >= 36) & (nj[XX] <= 38)) | ((nj[XX] >= 48) & (nj[XX] <= 50)) | ((nj[XX] >= 54) & (nj[XX] <= 56)) | ((nj[XX] >= 80) & (nj[XX] <= 83)))
+        if themethod == "PM7":
+            YYX = YX[XX]
 
         ##print(r0[YX]**2,rhoSS)
 #        coreYXLocal[...,0] = tore[ni[YX]]*riPM6a[YX,1-1]
@@ -4027,6 +4040,8 @@ def two_elec_two_center_int_local_frame_d_orbitals(ni,nj,r0d, tore,
         coreYYLocal = torch.zeros(YY.sum(),90,dtype=dtype)
         YYY = (((ni[XX] > 12) & (ni[XX] <18)) | ((ni[XX] > 20) & (ni[XX] <30)) | ((ni[XX] > 32) & (ni[XX] <36)) | ((ni[XX] > 38) & (ni[XX] <48)) | ((ni[XX] > 50) & (ni[XX] <54)) | ((ni[XX] > 70) & (ni[XX] <80)) | (ni[XX] ==57)) &\
          (((nj[XX] > 12) & (nj[XX] <18)) | ((nj[XX] > 20) & (nj[XX] <30)) | ((nj[XX] > 32) & (nj[XX] <36)) | ((nj[XX] > 38) & (nj[XX] <48)) | ((nj[XX] > 50) & (nj[XX] <54)) | ((nj[XX] > 70) & (nj[XX] <80)) | (nj[XX] ==57))
+        if themethod == "PM7":
+            YYY = YY[XX]
 
         ##print(r0[YY]**2,rhoSS)
         ##print(riPM6[LL,...])

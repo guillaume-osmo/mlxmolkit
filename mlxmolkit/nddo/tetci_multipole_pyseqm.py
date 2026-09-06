@@ -202,19 +202,24 @@ def pyseqm_d_params(pA) -> dict:
             5 if 50 <= z <= 56 else 3
         )
     )
+    from .params import principal_qn
+    ns = principal_qn(z) if pA.d_quantum_number else qn0
+    nd = pA.d_quantum_number or qn0
     g2sd = getattr(pA, "G2SD", 0.0)
 
     # Slater-Condon parameters use TAIL exponents (PYSEQM convention)
-    ds_add = 0.2 * _SC(2, qn0, zs_tail, qn0, zd_tail, qn0, zs_tail, qn0, zd_tail)
-    dp_add = (4.0 / 15.0) * _SC(1, qn0, zp_tail, qn0, zd_tail, qn0, zp_tail, qn0, zd_tail)
-    dd_add = (4.0 / 49.0) * _SC(2, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail)
-    dd0_add = _SC(0, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail)
-    dd4 = _SC(4, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail, qn0, zd_tail)
-    dp3 = (27.0 / 245.0) * _SC(3, qn0, zp_tail, qn0, zd_tail, qn0, zp_tail, qn0, zd_tail)
+    ds_add = 0.2 * _SC(2, ns, zs_tail, nd, zd_tail, ns, zs_tail, nd, zd_tail)
+    if pA.feather and g2sd > .001:
+        ds_add = .2*g2sd
+    dp_add = (4.0 / 15.0) * _SC(1, ns, zp_tail, nd, zd_tail, ns, zp_tail, nd, zd_tail)
+    dd_add = (4.0 / 49.0) * _SC(2, nd, zd_tail, nd, zd_tail, nd, zd_tail, nd, zd_tail)
+    dd0_add = _SC(0, nd, zd_tail, nd, zd_tail, nd, zd_tail, nd, zd_tail)
+    dd4 = _SC(4, nd, zd_tail, nd, zd_tail, nd, zd_tail, nd, zd_tail)
+    dp3 = (27.0 / 245.0) * _SC(3, ns, zp_tail, nd, zd_tail, ns, zp_tail, nd, zd_tail)
     # AIJL uses MAIN exponents
-    aij52 = _aijl(zeta_p, zeta_d, qn0, qn0, 1)
-    aij43 = _aijl(zeta_s, zeta_d, qn0, qn0, 2)
-    aij63 = _aijl(zeta_d, zeta_d, qn0, qn0, 2)
+    aij52 = _aijl(zeta_p, zeta_d, ns, nd, 1)
+    aij43 = _aijl(zeta_s, zeta_d, ns, nd, 2)
+    aij63 = _aijl(zeta_d, zeta_d, nd, nd, 2)
 
     # dp = AIJ52/sqrt(5)
     dp = aij52 / math.sqrt(5.0)

@@ -110,7 +110,7 @@ def _param_fingerprint(p):
     tail = getattr(p, "tail_exponents", None)
     return (float(p.zeta_s), float(p.zeta_p), float(getattr(p, "zeta_d", 0.0)),
             tuple(tail) if tail else None, p.gss, p.gpp, p.gp2, p.hsp,
-            p.F0SD, p.G2SD, p.rho_core, p.feather)
+            p.F0SD, p.G2SD, p.rho_core, p.feather, p.d_quantum_number, p.d_electrons, p.d_screening)
 
 
 def _pair_key(p1, p2, c1, c2):
@@ -118,6 +118,13 @@ def _pair_key(p1, p2, c1, c2):
     return (int(p1.Z), int(p2.Z), _param_fingerprint(p1), _param_fingerprint(p2),
             np.asarray(c1, dtype=np.float64).tobytes(),
             np.asarray(c2, dtype=np.float64).tobytes())
+
+
+def _tetci_first(a, b):
+    # TETCI YX requires the d-bearing centre first, including P-Se and S-I.
+    if a.feather and b.feather:
+        return (a.n_basis, a.Z) >= (b.n_basis, b.Z)
+    return a.Z >= b.Z
 
 
 def _tetci_key(pa, pb, ca, cb):
@@ -169,7 +176,7 @@ def pair_cache(pair_specs, rotations=True):
         for (p1, p2, c1, c2), (w, _flag) in zip(d_specs, _tetci_pairs_w(d_specs)):
             if w is None:
                 continue
-            pa, pb, ca, cb = ((p1, p2, c1, c2) if p1.Z >= p2.Z
+            pa, pb, ca, cb = ((p1, p2, c1, c2) if _tetci_first(p1, p2)
                               else (p2, p1, c2, c1))
             tetci[_tetci_key(pa, pb, ca, cb)] = w
         directed = d_specs + [(b, a, d, c) for a, b, c, d in d_specs]
@@ -238,7 +245,7 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
     from ._pyseqm_port.two_elec_two_center_int_np import two_elec_two_center_int
     from ._pyseqm_port import constants_np
 
-    if p1.Z >= p2.Z:
+    if _tetci_first(p1, p2):
         pa, pb, ca, cb = p1, p2, coord1, coord2
     else:
         pa, pb, ca, cb = p2, p1, coord2, coord1
@@ -252,7 +259,7 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
     if _TETCI_CACHE is not None:
         hit = _TETCI_CACHE.get(_tetci_key(pa, pb, ca, cb))
         if hit is not None:
-            return hit, (p1.Z >= p2.Z)
+            return hit, (_tetci_first(p1, p2))
 
     Zs = [int(pa.Z), int(pb.Z)]
     coords = [np.asarray(ca, dtype=np.float64), np.asarray(cb, dtype=np.float64)]
@@ -307,13 +314,22 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
         tore = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
                          0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0] + [0.0]*60)
     const = FakeConst()
+    # PM7 transition atoms use ddpo screening, distinct from main-group calpar.
+    from .two_center_integrals import _compute_multipole_params
+    from dataclasses import replace
+    const.pm7_multipoles = {p.Z: _compute_multipole_params(replace(p, d_screening=True))
+                           for p in _plist if not isinstance(p, int) and p.feather and p.d_electrons}
+    const.tore = const.tore.copy()
+    for p in _plist:
+        if not isinstance(p, int):
+            const.tore[p.Z] = p.n_valence
     w, e1b, e2a, _, _, _, _ = two_elec_two_center_int(
         const, idxi, idxj, ni, nj, xij, rij, Z,
         zetas, zetap, zetad, zs, zp, zd,
-        gss, gpp, gp2, hsp, F0SD, G2SD, rho_core, alpha, chi, 'PM6'
+        gss, gpp, gp2, hsp, F0SD, G2SD, rho_core, alpha, chi, 'PM7' if pa.feather and pb.feather else 'PM6'
     )
     # First pair (the real pair we care about; phantom pairs come after).
-    return w[0], (p1.Z >= p2.Z)
+    return w[0], (_tetci_first(p1, p2))
 
 
 
@@ -347,7 +363,7 @@ def _tetci_pairs_w(pair_specs):
     Zs, coords, order = [], [], []
     _plist = []
     for p1, p2, c1, c2 in pair_specs:
-        first_is_A = p1.Z >= p2.Z
+        first_is_A = _tetci_first(p1, p2)
         pa, pb = (p1, p2) if first_is_A else (p2, p1)
         ca, cb = (c1, c2) if first_is_A else (c2, c1)
         Zs.extend([int(pa.Z), int(pb.Z)])
@@ -383,12 +399,20 @@ def _tetci_pairs_w(pair_specs):
         tore = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
                          0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0] + [0.0] * 60)
 
+    const = FakeConst()
+    from .two_center_integrals import _compute_multipole_params
+    from dataclasses import replace
+    const.pm7_multipoles = {p.Z: _compute_multipole_params(replace(p, d_screening=True))
+                           for p in _plist if p.feather and p.d_electrons}
+    const.tore = const.tore.copy()
+    for p in _plist:
+        const.tore[p.Z] = p.n_valence
     w, _e1b, _e2a, _a, _b, _c, _d = two_elec_two_center_int(
-        FakeConst(), idxi, idxj, Z[idxi], Z[idxj], xij, rij, Z,
+        const, idxi, idxj, Z[idxi], Z[idxj], xij, rij, Z,
         zetas, zetap, zetad, zs, zp, zd,
         col('g_ss'), col('g_pp'), col('g_p2'), col('h_sp'),
         col('F0SD'), col('G2SD'), col('rho_core'), col('alpha'),
-        np.zeros_like(zetas), 'PM6')
+        np.zeros_like(zetas), 'PM7' if all(p.feather for p in _plist) else 'PM6')
     return [(w[k], order[k]) for k in range(n_pairs)]
 
 
@@ -499,6 +523,10 @@ def d_pair_effective_w(pA, pB, coordA, coordB, w_sp):
     Weff = np.array(W, dtype=np.float64)          # a copy: the TETCI blocks are cached
     a, b = min(nA, 4), min(nB, 4)
     Weff[:a, :a, :b, :b] = w_sp[:a, :a, :b, :b]
+    if pA.feather and pB.feather and (pA.d_electrons or pB.d_electrons):
+        from .packing import pack, unpack
+        from .pm7 import transition_packed
+        Weff = unpack(transition_packed(pack(Weff, nA, nB), pA, pB), nA, nB)
     return Weff
 
 

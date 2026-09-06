@@ -1,4 +1,4 @@
-"""Extract PM7 main-group parameters from the pinned OpenMOPAC source.
+"""Extract PM7 parameters from the pinned OpenMOPAC source.
 
 Apache-2.0 source, copyright 2021 Virginia Polytechnic Institute and State
 University. Source revision: 1d9d92b0283f197616f1e9e76d1ee09e2bc21e72.
@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import sys
 
-ELEMENTS = {1: ('H', 1), 6: ('C', 4), 7: ('N', 5), 8: ('O', 6),
-            9: ('F', 7), 14: ('Si', 4), 15: ('P', 5), 16: ('S', 6),
-            17: ('Cl', 7), 35: ('Br', 7), 53: ('I', 7)}
+# Valence populations from parameters_C.F90 (ios + iop + iod).
+ELEMENTS = dict(zip(
+    [1,3,4,5,6,7,8,9,11,12,13,14,15,16,17,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,37,38,48,49,50,51,52,53],
+    zip('H Li Be B C N O F Na Mg Al Si P S Cl K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Rb Sr Cd In Sn Sb Te I'.split(),
+        [1,1,2,3,4,5,6,7,1,2,3,4,5,6,7,1,2,3,4,5,6,7,8,9,10,11,2,3,4,5,6,7,1,2,2,3,4,5,6,7])))
 FIELDS = dict(Uss='uss7', Upp='upp7', Udd='udd7', zeta_s='zs7',
               zeta_p='zp7', zeta_d='zd7', beta_s='betas7', beta_p='betap7',
               beta_d='betad7', gss='gss7', gsp='gsp7', gpp='gpp7',

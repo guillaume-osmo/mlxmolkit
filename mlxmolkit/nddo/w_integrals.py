@@ -92,7 +92,7 @@ def compute_w_integrals(
 
     Args:
         zeta_s, zeta_p, zeta_d: Slater orbital exponents
-        qn_sp: principal quantum number for s/p (2 for C-Cl, 3 for K-Br)
+        qn_sp: principal quantum number for s/p (2 for C-F, 3 for Na-Cl, 4 for K-Br)
         qn_d: principal quantum number for d (3 for first transition row)
         F0SD, G2SD: override Slater-Condon F0(sd) and G2(sd) if nonzero
 

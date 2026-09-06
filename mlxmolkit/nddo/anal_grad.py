@@ -44,7 +44,7 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
     dH[sA:sA + nA, sB:sB + nB] += block
     dH[sB:sB + nB, sA:sA + nA] += block.T
 
-    if nA == 9 or nB == 9:
+    if nA == 9 or nB == 9 or any(p.feather and p.rho_core and p.rho_core > 1e-5 for p in (pA, pB)):
         # d pairs keep the 9x9 Wigner-D attraction and the d two-centre path.
         dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, rA, rB)
         dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, rB, rA)
@@ -111,7 +111,8 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None,
 
     sp, dd, sp_pos = [], [], []
     for k, (i, j) in enumerate(pairs):
-        if params[i].n_basis <= 4 and params[j].n_basis <= 4:
+        if (params[i].n_basis <= 4 and params[j].n_basis <= 4
+                and not any(p.feather and p.rho_core and p.rho_core > 1e-5 for p in (params[i], params[j]))):
             sp.append((i, j))
             sp_pos.append(k)
         else:

@@ -68,7 +68,7 @@ def _pm6_d_param_from_key(key):
         aij52 = AIJL(zetap, zetad, qn0, qn0 - 1, 1)
         aij43 = AIJL(zetas, zetad, qn0, qn0 - 1, 2)
         aij63 = AIJL(zetad, zetad, qn0 - 1, qn0 - 1, 2)
-    elif category == "B" and method == "PM6":
+    elif category == "B" and method in ("PM6", "PM7"):
         ds_add = 0.2 * GetSlaterCondonParameter(
             2, qn0, zs, qn0, zd, qn0, zs, qn0, zd
         )
@@ -162,11 +162,11 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     dd4 = np.zeros(qn0.shape, dtype=np.float64)
     dp3 = np.zeros(qn0.shape, dtype=np.float64)
     mask_a = ((Z > 20) & (Z < 30)) | ((Z > 38) & (Z < 48)) | ((Z > 70) & (Z < 80)) | (Z == 57)
-    if themethod == "PM6":
+    if themethod in ("PM6", "PM7"):
         mask_b = ((Z > 12) & (Z < 18)) | ((Z > 32) & (Z < 36)) | ((Z > 50) & (Z < 54))
     else:
         mask_b = torch.zeros_like(mask_a)
-    active = mask_a | mask_b
+    active = (mask_a | mask_b) & ((zetad > 0) if themethod == "PM7" else True)
     if active.any():
         active_idx = torch.nonzero(active, as_tuple=False).squeeze(1).tolist()
         key_map = {}
@@ -211,7 +211,7 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     t1 =     time.time()
 
     dp= AIJ52/math.sqrt(5)
-    isY = qnd[Z] > 0
+    isY = (zetad > 0) if themethod == "PM7" else qnd[Z] > 0
     D = torch.sqrt(AIJ43*math.sqrt(1.0000/15.0000))*math.sqrt(2.0000)
     ds = D
     DS = np.zeros(qn0.shape, dtype=np.float64)
@@ -243,6 +243,11 @@ def two_elec_two_center_int(const,idxi, idxj, ni, nj, xij, rij, Z,
     rho_1[isX] = rho1(hsp[isX],dd[isX])
     rho_2[isX] = rho2(hpp[isX],qq[isX])
     rho_2d[isX] = POIJ(2,qq[isX]*math.sqrt(2),hppd[isX])
+    for z, mp in getattr(const, 'pm7_multipoles', {}).items():
+        selected = Z == z
+        dd[selected], qq[selected], rho_0[selected], rho_1[selected], rho_2[selected] = mp
+    if themethod == "PM7":
+        rho_2d = rho_2.copy()
     ##rho_2[isX] = POIJ(2,qq[isX]*math.sqrt(2),hpp[isX])
 
     #print("PRE-ROTATE2:", time.time() - t1)
@@ -328,6 +333,11 @@ def rotate(ni,nj,xij,rij,tore,da,db, qa,qb, dpa, dpb, dsa, dsb, dda, ddb, rho0a,
          ((nj <= 12) | ((nj >= 18) & (nj <=20)) | ((nj >= 30) & (nj <= 32)) | ((nj >= 36) & (nj <= 38)) | ((nj >= 48) & (nj <= 50)) | ((nj >= 54) & (nj <= 56)) | ((nj >= 80) & (nj <= 83))) & (nj !=1)
     YY = (((ni > 12) & (ni <18)) | ((ni > 20) & (ni <30)) | ((ni > 32) & (ni <36)) | ((ni > 38) & (ni <48)) | ((ni > 50) & (ni <54)) | ((ni > 70) & (ni <80)) | (ni ==57)) &\
          (((nj > 12) & (nj <18)) | ((nj > 20) & (nj <30)) | ((nj > 32) & (nj <36)) | ((nj > 38) & (nj <48)) | ((nj > 50) & (nj <54)) | ((nj > 70) & (nj <80)) | (nj ==57))
+
+    if themethod == "PM7":
+        YH = (rho3a > 0) & (nj == 1)
+        YX = (rho3a > 0) & (rho3b == 0) & (nj > 1)
+        YY = (rho3a > 0) & (rho3b > 0)
 
     #enuc is not computed at this moment
 #    if(themethod == "PM6"):
@@ -1052,7 +1062,7 @@ def rotate(ni,nj,xij,rij,tore,da,db, qa,qb, dpa, dpb, dsa, dsb, dda, ddb, rho0a,
     # e2a[XX,3,3] = -core[...,6]*xx33 - core[...,7]*zz33
     
 
-    if themethod == "PM6":
+    if themethod in ("PM6", "PM7"):
         dRotationMatrix = GenerateRotationMatrix(xij)
 
         riYH, riYX, riYY, coreYH, coreYX, coreYY = \

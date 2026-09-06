@@ -1,8 +1,10 @@
-PM7 main-group parameters derived from OpenMOPAC
+PM7 parameters derived from OpenMOPAC
 Copyright 2021 Virginia Polytechnic Institute and State University
 Licensed under Apache-2.0; see LICENSE_OpenMOPAC.txt.
 Source: https://github.com/openmopac/mopac/blob/1d9d92b0283f197616f1e9e76d1ee09e2bc21e72/src/models/parameters_for_PM7_C.F90
-Extraction: tools/import_pm7_params.py; H,C,N,O,F,Si,P,S,Cl,Br,I subset.
+Extraction: tools/import_pm7_params.py; 40-element subset matching the PM6 registry.
+H,Li,Be,B,C,N,O,F,Na,Mg,Al,Si,P,S,Cl,K,Ca,Sc,Ti,V,Cr,Mn,Fe,Co,Ni,Cu,
+Zn,Ga,Ge,As,Se,Br,Rb,Sr,Cd,In,Sn,Sb,Te,I.
 Includes PM7 one-center parameters, orbital and tail exponents, Gaussian
 core terms, and PM7 diatomic alpha/chi parameters. Zero-valued fields are
 explicit zeros, never fallback PM6 values. Physical constants use the
@@ -11,3 +13,6 @@ Integral feathering and core-core source: src/integrals/mndod.F90 and ccrep.F90.
 Correction sources: src/corrections/H_bond_correction_PM6_DH_Dispersion.F90,
 Hydrogen_bond_corrections.F90, H_bond_correction_EH_plus.F90,
 H_bond_correction_bits.F90, set_up_dentate.F90, and src/compfg.F90.
+Transition-metal initialization: src/integrals/sp_two_electron.F90,
+src/models/calpar.F90 and src/integrals/mndod.F90 (inighd, eiscor, ddpo, rotatd).
+Valence populations: src/models/parameters_C.F90 (ios + iop + iod).

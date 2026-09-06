@@ -11,11 +11,11 @@ if not MOPAC:
     MOPAC = str(path) if path.exists() else None
 
 
-def reference(atoms, coords, directory, method='PM7'):
+def reference(atoms, coords, directory, method='PM7', charge=0):
     from rdkit import Chem
     table = Chem.GetPeriodicTable()
     p = Path(directory) / 'reference.mop'
-    p.write_text(f'{method} 1SCF SCFCRT=1.D-9 DISP PRT DEBUG\nport gate\n\n' + ''.join(
+    p.write_text(f'{method} CHARGE={charge} 1SCF SCFCRT=1.D-9 DISP PRT DEBUG\nport gate\n\n' + ''.join(
         f'{table.GetElementSymbol(int(z))} {x:.12f} 0 {y:.12f} 0 {w:.12f} 0\n'
         for z, (x, y, w) in zip(atoms, coords)))
     run = subprocess.run([MOPAC, str(p)], cwd=directory, capture_output=True,

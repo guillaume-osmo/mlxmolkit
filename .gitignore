@@ -22,3 +22,6 @@ gxtb_charge_run/
 # path unusable from a fresh clone.
 !mlxmolkit/**/data/*.npz
 !mlxmolkit/xtb/params/*.npz
+
+# Independent, reproducible OpenMOPAC reference fixtures.
+!tests/data/pm7_element_integrals.npz

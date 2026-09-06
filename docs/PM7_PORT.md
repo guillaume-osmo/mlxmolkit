@@ -2,9 +2,24 @@
 
 PM7 is available through the native scalar SCF, CPU batch, MLX/Metal batch,
 gradient and geometry optimization APIs. Coverage is closed-shell,
-nonperiodic H, C, N, O, F, Si, P, S, Cl, Br and I. The latter six elements
-retain PM7's nine-orbital bases. Unsupported elements fail explicitly.
-Transition metals, PM7-TS, PM7-HH and periodic PM7 are outside this port.
+nonperiodic calculations with 40 elements, matching PM6's element set:
+H, Li, Be, B, C, N, O, F, Na, Mg, Al, Si, P, S, Cl, K, Ca, Sc, Ti, V,
+Cr, Mn, Fe, Co, Ni, Cu, Zn, Ga, Ge, As, Se, Br, Rb, Sr, Cd, In, Sn, Sb, Te, I.
+The basis and valence populations come from PM7/MOPAC; Zn and Cd each use two
+valence electrons. Unsupported elements fail explicitly. Open-shell/UHF,
+PM7-TS, PM7-HH and periodic PM7 are outside this port.
+
+This extends the original eleven-element port by 29 elements. Transition atoms
+use their own s/p and d quantum numbers, tail-derived one-center integrals,
+d-shell isolated-atom energies, nuclear screening and PM7 shell-average Coulomb
+corrections. Mixed s/p–d integral phases and d–d overlap rotation are checked
+against MOPAC. The d(YZ)–d(XY) overlap sign fix also applies to other d methods.
+
+SCF convergence does not guarantee the lowest electronic state. Some symmetric
+metal hydrides have competing restricted SCF solutions; CPU, Metal and MOPAC
+can select different states. The molecular gates use stable closed-shell cases,
+including CrF6, Ni(CO)4 and SrF2. Element coverage is not a claim of unrestricted
+spin support or identical state selection for every transition-metal complex.
 
 ```python
 from mlxmolkit.nddo import nddo_energy_batch, nddo_optimize_batch
@@ -71,7 +86,45 @@ these symbols are never required by the package runtime or unit tests.
 
 ## Validation
 
-On 24 fixed geometries (11 hydrides and 13 organic molecules), maximum
+### Expanded 40-element gates
+
+Full repository suite: **1,411 passed, 24 skipped, 4 expected failures**,
+with three existing COSMO warnings, in 78.90 seconds:
+[full test output](validation/pm7_expanded_full_suite.txt).
+The isolated wheel also runs all 40 PM7 systems through Metal and preserves
+the g-xTB/MNDO checks: [wheel results](validation/pm7_expanded_wheel_runtime.json).
+
+The expanded molecular set has one fixed closed-shell system per element.
+Maximum absolute MOPAC heat-of-formation disagreement is **0.00121 kcal/mol**
+for scalar/CPU batch and **0.0127 kcal/mol** for MLX float32 batch. Maximum
+atomic-charge errors are **0.0000258 e** and **0.0000209 e**, respectively.
+Coordinates and results: [expanded oracle evidence](validation/pm7_expanded_oracle_results.json).
+These are numerical parity measurements on these geometries, not an accuracy
+benchmark against experimental chemistry or a guarantee of SCF state selection.
+
+The default regression fixture independently captures 200 atom pairs from
+libmopac (every element paired with H, C, S, Fe and I). It checks atomic
+parameters, overlaps, two-electron tensors, nuclear attraction and core
+repulsion, in both atom orders and with/without batch caches. A broader check
+of all **820 unordered pairs including homonuclear pairs** also passed:
+[all-pair output](validation/pm7_all_pairs.txt).
+Six additional gradient cases cover Al, Sc, Fe, Ni, As and Sb. CPU and fused
+Metal batch tests include all 40 molecular cases, with explicit rejection of
+open-shell inputs. There are **251 expanded PM7 tests**, in addition to the
+original PM7 regression tests.
+
+```sh
+OMP_NUM_THREADS=1 python -m tools.validate_pm7_elements
+OMP_NUM_THREADS=1 python -m pytest tests/test_pm7_elements.py -q
+# Independently regenerate all element-pair references, then check them:
+OMP_NUM_THREADS=1 python -m tools.capture_pm7_element_references --all-pairs --output /tmp/pm7-reference
+OMP_NUM_THREADS=1 MLXMOLKIT_PM7_REFERENCE_DIR=/tmp/pm7-reference python -m pytest tests/test_pm7_elements.py -q
+```
+
+### Original eleven-element baseline
+
+The original eleven-element port recorded the following baseline. On 24 fixed
+geometries (11 hydrides and 13 organic molecules), maximum
 absolute heat-of-formation disagreement with default MOPAC is
 **0.000935 kcal/mol**, and maximum atomic-charge disagreement is
 **0.0000697 e**. These are measured results for this set, not universal
@@ -93,7 +146,7 @@ optional fused Metal rotation/SCF update. The shared optimizer test includes
 PM7 ethanol convergence. Installed-wheel checks exercise PM7 parameter loading
 alongside the preserved g-xTB and MNDO checks.
 
-Full suite: **1,160 passed, 24 skipped, 4 expected failures**, with three
+Original port suite: **1,160 passed, 24 skipped, 4 expected failures**, with three
 existing COSMO warnings, in 72.41 seconds. Full output and exclusion reasons:
 [pm7_full_suite.txt](validation/pm7_full_suite.txt). The isolated installed-wheel
 check passed for PM7, MNDO and g-xTB, with unchanged g-xTB frozen charge errors:

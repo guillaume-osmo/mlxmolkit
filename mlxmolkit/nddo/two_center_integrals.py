@@ -39,13 +39,18 @@ def _compute_multipole_params(p: ElementParams) -> tuple[float, float, float, fl
     Returns: da, qa, rho0, rho1, rho2
     """
     return _multipole_params_cached(
-        p.Z, p.n_basis, p.gss, p.zeta_s, p.zeta_p, p.hsp, p.gpp, p.gp2)
+        p.Z, p.n_basis, p.gss, p.zeta_s, p.zeta_p, p.hsp, p.gpp, p.gp2, p.feather and bool(p.d_electrons) and p.d_screening)
 
 
 @lru_cache(maxsize=None)
-def _multipole_params_cached(Z, n_basis, gss, zeta_s, zeta_p, hsp, gpp, gp2):
+def _multipole_params_cached(Z, n_basis, gss, zeta_s, zeta_p, hsp, gpp, gp2, transition=False):
     p = _MultipoleInputs(Z, n_basis, gss, zeta_s, zeta_p, hsp, gpp, gp2)
-    return _compute_multipole_params_uncached(p)
+    result = _compute_multipole_params_uncached(p)
+    if transition:
+        from .tetci_multipole_pyseqm import _poij
+        da, qa, rho0, _, _ = result
+        return da, qa, rho0, _poij(1, da, hsp), _poij(2, np.sqrt(2)*qa, .5*(gpp-gp2))
+    return result
 
 
 class _MultipoleInputs(NamedTuple):
@@ -486,7 +491,7 @@ def two_center_integrals_batch(pair_params, R_ang):
 
     mp = {}                                     # memoised per element
     def params_of(p):
-        key = (p.Z, p.n_basis, p.gss, p.zeta_s, p.zeta_p, p.hsp, p.gpp, p.gp2)
+        key = (p.Z, p.n_basis, p.gss, p.zeta_s, p.zeta_p, p.hsp, p.gpp, p.gp2, p.feather and bool(p.d_electrons) and p.d_screening)
         if key not in mp:
             mp[key] = _compute_multipole_params(p)
         return mp[key]

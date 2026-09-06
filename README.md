@@ -125,7 +125,7 @@ See [MOPAC port status](docs/MOPAC_PORT_STATUS.md) for validation and remaining 
 | RM1 | H, C, N, O, F, P, S, Cl, Br, I |
 | AM1 | H, C, N, O, F, Si, P, S, Cl, Br, I |
 | PM3 | 25 elements in `get_params('PM3')` |
-| PM7 | H, C, N, O, F, Si, P, S, Cl, Br, I; complete correction energy/gradient, scalar and MLX batch |
+| PM7 | 40 elements (same element set as PM6), including Sc–Cu; closed-shell scalar and MLX batch, complete correction energy/gradient |
 | PM6 | 40 elements, including d orbitals where parameterized |
 | PM6_D | Alias for PM6; `PM6_SP` is not a registered method |
 | PM6-ORG | Its own 18-element parameter set and corrections |
