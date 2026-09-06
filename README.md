@@ -11,7 +11,7 @@ quantum chemistry.
 |---|---|---|
 | **Conformers** | Drop-in for RDKit `EmbedMolecules`: DG (4D) → ETK (3D) → MMFF94, all on Metal. 8 ETKDG variants. N×k parallel | `generate_conformers_nk` |
 | **Clustering** | Morgan FP → Tanimoto → Butina, at 150k+ molecules with divide-and-conquer memory | `butina_tanimoto_mlx` |
-| **NDDO semi-empirical** | 7 methods (RM1, AM1, PM3, PM6, PM6_SP, PM6_D, AM1\*) + PM6-D3H4 corrections, energies **and** gradients/geometry optimization | `mlxmolkit.nddo` |
+| **NDDO semi-empirical** | MNDO, RM1, AM1, PM3, PM6 and corrected variants; scalar and batched SCF, gradients/geometry optimization | `mlxmolkit.nddo` |
 | **xTB** | GFN0/1/2 and g-xTB energies, analytical gradients, ANCOPT geometry optimization, ALPB water solvation | `mlxmolkit.xtb` |
 | **COSMO / COSMO-RS** | σ-profiles, σ-potentials, activity coefficients, solubility in solvent mixtures | `mlxmolkit.xtb` (σ), `mlxmolkit.cosmo` (ddCOSMO) |
 | **Similarity & descriptors** | ERG fingerprints, dense cosine, CHEESE embeddings, Connolly surfaces, dipole atom features | top-level exports |
@@ -116,19 +116,25 @@ RDKit-14T outright; it is already within 1.22× at 200.
 
 ## Semi-empirical NDDO
 
-Seven methods plus PM6-D3H4 post-SCF corrections, **bit-exact to
-[PYSEQM](https://github.com/lanl/PYSEQM) for PM6_D**, with no PYSEQM or PyTorch
-runtime dependency.
+Native SCF has no external MOPAC, PYSEQM, or PyTorch runtime dependency.
+See [MOPAC port status](docs/MOPAC_PORT_STATUS.md) for validation and remaining ports.
 
-| Method | Element coverage | HoF (H₂O, kcal/mol) |
-|---|---|---:|
-| RM1 | H, C, N, O, F, P, S, Cl, Br, I | −57.81 |
-| AM1 | H, C, N, O | −59.22 |
-| PM3 | H, C, N, O, F, P, S, Cl, Br, I | −53.19 |
-| PM6 / PM6_SP | H, C, N, O, F, P, S, Cl, Br, I (sp-only) | −54.19 |
-| PM6_D | + d-orbitals on P, S, Cl, Br | bit-exact vs PYSEQM |
-| AM1\* / RM1\* | H, C, N, O (\*-variants) | −53.71 / −54.47 |
-| PM6-D3H4 | D3 dispersion + H4 H-bond + HH repulsion | post-SCF correction |
+| Method | Current parameter coverage / behavior |
+|---|---|
+| MNDO | H, C, N, O, F, Si, P, S, Cl, Br, I; scalar and MLX batch |
+| RM1 | H, C, N, O, F, P, S, Cl, Br, I |
+| AM1 | H, C, N, O, F, Si, P, S, Cl, Br, I |
+| PM3 | 25 elements in `get_params('PM3')` |
+| PM6 | 40 elements, including d orbitals where parameterized |
+| PM6_D | Alias for PM6; `PM6_SP` is not a registered method |
+| PM6-ORG | Its own 18-element parameter set and corrections |
+| AM1\* / RM1\* | H, C, N, O geometry-corrected variants |
+| PM6-D3 / PM6-D3H4 / PM6-D3H4X | PM6 SCF with post-SCF energy corrections |
+
+Parameter coverage does not imply equal validation across all elements.
+PM5 is unavailable: OpenMOPAC does not ship its proprietary implementation.
+The PM6-family geometry-dependent heat corrections still need their matching
+optimization gradients; the current optimizer differentiates `energy_eV`.
 
 - **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) via the 22-integral
   local frame, rotated to the molecular frame with Wigner D-matrices. Covers YH,

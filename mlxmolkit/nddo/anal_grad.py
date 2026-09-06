@@ -49,7 +49,7 @@ def _pair_terms(params, coords, i, j, starts, P, n_basis, w=None):
         dH[sA:sA + nA, sA:sA + nA] += _pair_core_attraction(pA, pB, rA, rB)
         dH[sB:sB + nB, sB:sB + nB] += _pair_core_attraction(pB, pA, rB, rA)
         dT = _pair_fock_twocentre(np.zeros((n_basis, n_basis)), P,
-                                  pA, pB, sA, sB, rA, rB)
+                                  pA, pB, sA, sB, rA, rB, w=w)
         return dH, dT
 
     # One rotation supplies all three sp contributions. Attraction is not
@@ -199,13 +199,17 @@ def _pair_energy_many(params, coords, pairs, starts, P, n_basis, shift=None,
             for pos, k in enumerate(ks):
                 out[sp[k]] = float(totals[pos])
 
-    for i, j in dd:
+    # The d routine adds its d correction to an ordinary sp block. Rotate
+    # those sp blocks together, just as for sp-only pairs above.
+    dd_ws = rotate_pairs([(params[i], params[j]) for i, j in dd],
+                         [(coords[i], coords_b[j]) for i, j in dd]) if dd else []
+    for (i, j), w in zip(dd, dd_ws):
         if shift is None:
-            dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis)
+            dH, dT = _pair_terms(params, coords, i, j, starts, P, n_basis, w=w)
         else:
             shifted = coords.copy()
             shifted[j] = coords_b[j]
-            dH, dT = _pair_terms(params, shifted, i, j, starts, P, n_basis)
+            dH, dT = _pair_terms(params, shifted, i, j, starts, P, n_basis, w=w)
         sA, nA = starts[i], params[i].n_basis
         sB, nB = starts[j], params[j].n_basis
         total = 0.0

@@ -211,7 +211,7 @@ def _use_mlx(n_pairs: int) -> bool:
     return True
 
 
-def rotate_pairs(pair_params, pair_coords):
+def rotate_pairs(pair_params, pair_coords, *, fused_metal=False):
     """Rotated tensors for a heterogeneous list of sp pairs.
 
     Args:
@@ -223,6 +223,9 @@ def rotate_pairs(pair_params, pair_coords):
         they are just slices of it: ``e1b = -Z_B * w[:, :, 0, 0]`` and
         ``e2a = -Z_A * w[0, 0, :, :]``, which holds for every pair type
         (verified to round-off against the scalar routine).
+
+    ``fused_metal=True`` opts into float32 heavy-heavy rotations. It is for
+    batched SCF throughput; displaced-gradient evaluation keeps float64.
 
     Pairs are grouped by type — HH, XH, XX — because each has its own set of
     local-frame integrals, and each group is rotated in one vectorised call.
@@ -263,11 +266,16 @@ def rotate_pairs(pair_params, pair_coords):
         if sel.size == 0:
             continue
         if pair_type == "XX":
-            if _use_mlx(sel.size):
+            if fused_metal or _use_mlx(sel.size):
                 import mlx.core as mx
                 arrs = [mx.array(a[sel].astype(np.float32))
                         for a in (ri_all, r0, r1, r2)]
-                out[sel] = np.asarray(rotate_xx_batch_mlx(*arrs), dtype=np.float64)
+                if fused_metal:
+                    from .rotation_metal import rotate_xx_batch_fused_metal
+                    result = rotate_xx_batch_fused_metal(*arrs)
+                else:
+                    result = rotate_xx_batch_mlx(*arrs)
+                out[sel] = np.asarray(result, dtype=np.float64)
             else:
                 out[sel] = rotate_xx_batch(ri_all[sel], r0[sel], r1[sel], r2[sel])
         elif pair_type == "XH":

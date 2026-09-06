@@ -171,7 +171,9 @@ def _onecx_tables():
             raise FileNotFoundError(
                 f"g-xTB one-centre exchange table not found: {_ONECX_PATH}\n"
                 "The terms that need it (use_aes, use_aniso_h0, "
-                "use_twobody_third_order) cannot run without it."
+                "use_twobody_third_order) cannot run without it. "
+                "Restore data/gxtb_onecxints_extracted.npz from the matching "
+                "mlxmolkit checkout."
             )
         _ONEC = _np.load(_ONECX_PATH)
     return _ONEC["onecxints"], _ONEC["lidx"]   # (103, 10), (4, 4)

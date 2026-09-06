@@ -88,9 +88,13 @@ def test_the_sp_charge_separation_is_dewar_thiels():
     dipoles built on it were what a 0.17 D mean dipole error came from."""
     p = M.get_params("PM6")[6]
     assert _dd_dewar_thiel(p) == pytest.approx(0.7536, abs=2e-4)
-    # and the module uses it: the hybrid dipole of water must equal
-    # -2 DD P(s,p) summed, which the reassembled molecular dipole exposes.
-    q, dip = _mlx(*H2O, "PM6")
+    # Exercise production with a nonzero s-p density. The former SCF call
+    # discarded its dipole, so even zero multipoles passed without MOPAC.
+    density = np.zeros((4, 4))
+    density[0, 1:] = density[1:, 0] = [0.1, -0.2, 0.3]
+    _, dip, _ = atomic_multipoles_from_density([6], [p], density)
+    np.testing.assert_allclose(dip[0], -2 * _dd_dewar_thiel(p) * density[0, 1:],
+                               rtol=1e-12, atol=1e-12)
     old = (2 * 2 + 1) * np.sqrt(p.zeta_s * p.zeta_p) / ((p.zeta_s + p.zeta_p) ** 2 * np.sqrt(3.0))
     assert _dd_dewar_thiel(p) / old > 1.9          # the factor-two is real
 

@@ -330,7 +330,10 @@ def prepare_batch(
     # Doing it inside the per-molecule loop meant one scalar rotation per pair,
     # which was ~69% of prepare_batch.
     from .rotation_batch import rotate_pairs
-    pair_w = rotate_pairs(sp_params, sp_coords) if sp_ids.size else None
+    import os
+    fused_rotation = os.environ.get("MLXMOLKIT_BATCH_ROTATION_METAL", "0") == "1"
+    pair_w = (rotate_pairs(sp_params, sp_coords, fused_metal=fused_rotation)
+              if sp_ids.size else None)
 
     # d-bearing pairs the same way. two_elec_two_center_int is vectorised over
     # a pair axis, so asking it for one pair at a time cost 2.58 ms each and

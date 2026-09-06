@@ -1,13 +1,10 @@
 """
 Multi-method support for NDDO semi-empirical calculations.
 
-Supported methods:
-  - 'RM1': Recife Model 1 (Rocha et al. 2006) — default
-  - 'AM1': Austin Model 1 (Dewar et al. 1985)
-  - 'AM1_STAR': Geometry-corrected AM1 (Ong et al. 2025, CL=500)
-
-Each method uses the same NDDO framework but different parameters.
-Parameters are loaded from params.py (RM1) or defined here (AM1, AM1*).
+METHOD_PARAMS is the authoritative registry, including MNDO, RM1, AM1,
+PM3, PM6 and its corrected variants, and AM1*/RM1*. Core repulsion and
+post-SCF corrections are selected separately by the method name.
+PM5 is unavailable in OpenMOPAC and is explicitly rejected.
 """
 from __future__ import annotations
 
@@ -633,8 +630,40 @@ def _augment_pm3_from_mopac_csv() -> None:
 _augment_pm3_from_mopac_csv()
 
 
+def _load_mndo_params() -> Dict[int, ElementParams]:
+    """MNDO sp subset from OpenMOPAC 1d9d92b0283f197616f1e9e76d1ee09e2bc21e72.
+
+    Apache-2.0, copyright 2021 Virginia Polytechnic Institute and State
+    University. Reproduce with tools/import_mndo_params.py. These eleven
+    elements use the original MNDO core-core form without Gaussians.
+    Missing tables deliberately raise rather than remove a method silently.
+    """
+    from .atomic_heats import atomic_heat
+
+    path = Path(__file__).resolve().parent / 'data' / 'parameters_MNDO_MOPAC.csv'
+    result = {}
+    with path.open(newline='') as handle:
+        for row in csv.DictReader(handle):
+            z = int(row.pop('Z'))
+            symbol = row.pop('symbol')
+            valence = int(row.pop('n_valence'))
+            p = ElementParams(
+                Z=z, symbol=symbol, n_basis=1 if z == 1 else 4,
+                n_valence=valence, eheat=atomic_heat(z),
+                gauss_K=[0.0] * 4, gauss_L=[0.0] * 4, gauss_M=[0.0] * 4,
+                **{key: float(value) for key, value in row.items()},
+            )
+            p.eisol = _compute_eisol(p)
+            result[z] = p
+    return result
+
+
+MNDO_PARAMS = _load_mndo_params()
+
+
 # Method registry.  d-PM6 is the ONLY PM6 exposed: sp-only mis-charges P/S/halogens (drops their d-orbitals).
 METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
+    'MNDO': MNDO_PARAMS,
     'RM1': RM1_PARAMS,
     'AM1': AM1_PARAMS,
     'PM3': PM3_PARAMS,
@@ -658,13 +687,6 @@ METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
     'PM6_D3': PM6_FULL_PARAMS,
     'PM6_D3H4': PM6_FULL_PARAMS,
     'PM6_D3H4X': PM6_FULL_PARAMS,
-    # PM6_ORG is NOT registered yet. Its parameters (PM6_ORG_PARAMS) and its
-    # core-core (pwcct.pm6_org_pair_repulsion) are in place and the SCF runs,
-    # but the post-SCF corrections are not: on methanol MOPAC implies +3.2793
-    # kcal/mol of correction where the PM6-D3H4 composite gives +6.2673. The
-    # H-H repulsion alone is +6.3315, so PM6-ORG evidently carries its own
-    # H-H parameters through v_par_org rather than reusing PM6-D3H4's.
-    # Registering it would hand out energies ~3 kcal/mol wrong.
     'AM1_STAR': AM1_STAR_PARAMS,
     'RM1_STAR': RM1_STAR_PARAMS,
 }
@@ -674,12 +696,17 @@ def get_params(method: str = 'RM1') -> Dict[int, ElementParams]:
     """Get parameter dictionary for a given method.
 
     Args:
-        method: 'RM1', 'AM1', or 'AM1_STAR'
+        method: A name in METHOD_PARAMS; hyphens and '*' are normalized.
 
     Returns:
         Dict mapping atomic number → ElementParams
     """
     method = method.upper().replace('-', '_').replace('*', '_STAR')
+    if method == 'PM5':
+        raise ValueError(
+            'PM5 is not available: OpenMOPAC does not include the proprietary '
+            'PM5 model or parameters. It must not be substituted with PM6/PM7.'
+        )
     if method not in METHOD_PARAMS:
         raise ValueError(f"Unknown method '{method}'. Available: {list(METHOD_PARAMS.keys())}")
     return METHOD_PARAMS[method]

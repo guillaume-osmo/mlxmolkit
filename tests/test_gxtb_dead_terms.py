@@ -43,18 +43,19 @@ def test_gxtb_aes_imports_without_the_untracked_table():
     assert hasattr(gxtb_aes, "_onecx_tables")
 
 
-@pytest.mark.skipif(
-    gxtb_aes._os.path.exists(gxtb_aes._ONECX_PATH),
-    reason="the onecxints table is present here, so the missing-file path cannot be exercised",
-)
-def test_missing_onecx_table_explains_itself():
+def test_missing_onecx_table_explains_itself(monkeypatch, tmp_path):
+    # Exercise this even on a complete installation, without moving the
+    # user's real parameter table or retaining a cache from another test.
+    monkeypatch.setattr(gxtb_aes, '_ONEC', None)
+    monkeypatch.setattr(gxtb_aes, '_ONECX_PATH',
+                        str(tmp_path / 'gxtb_onecxints_extracted.npz'))
     with pytest.raises(FileNotFoundError) as excinfo:
         gxtb_aes._onecx_tables()
     msg = str(excinfo.value)
     assert "gxtb_onecxints_extracted.npz" in msg
     # It must say what breaks and how to get the table back, not just print a path.
     assert "use_aes" in msg
-    assert "libxtb" in msg
+    assert "Restore" in msg
 
 
 @pytest.mark.parametrize(

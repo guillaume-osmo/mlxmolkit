@@ -4,9 +4,10 @@ Frozen geometries from geom.npz so every commit sees identical input.
 Emits one JSON line so results can be collected across a commit series.
 """
 import json, os, sys, time
+from pathlib import Path
 import numpy as np
 
-B = "/Users/tgg/Github/_mlxmolkit_safety/bench"
+B = Path(__file__).resolve().parent
 G = np.load(f"{B}/geom.npz")
 LABEL = os.environ.get("BENCH_LABEL", "?")
 res = {"label": LABEL}
@@ -46,11 +47,14 @@ def bench_nddo():
             lo, med, sp, n = timed(lambda: nddo_energy(Z, R, method="PM6"), 5)
             out = nddo_energy(Z, R, method="PM6")
             if isinstance(out, dict):
-                for k in ("heat_of_formation", "E_total", "energy", "Etot"):
+                for k in ("energy_eV", "heat_of_formation", "E_total", "energy", "Etot"):
                     if k in out:
                         res[f"scf_{name}_E"] = round(float(out[k]), 6)
                         break
                 res[f"scf_{name}_iters"] = out.get("n_iter") or out.get("iterations")
+                res[f"scf_{name}_converged"] = out.get("converged")
+                if "heat_of_formation_kcal" in out:
+                    res[f"scf_{name}_hof_kcal"] = float(out["heat_of_formation_kcal"])
             res[f"scf_{name}_ms"] = round(lo, 1)
             res[f"scf_{name}_med"] = round(med, 1)
             res[f"scf_{name}_spread"] = round(sp, 1)

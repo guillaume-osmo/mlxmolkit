@@ -100,6 +100,7 @@ include = ["mlxmolkit", "mlxmolkit.*", "opencheese", "opencheese.*"]
 mlxmolkit = [
     "*.metal",
     "nddo/data/*.csv",
+    "nddo/data/*.txt",
     "nddo/data/*.npz",
     # riYY_table.json sits at nddo/ level, not under nddo/data/ — the old
     # "rm1/*.json" glob was for exactly this file.

@@ -57,14 +57,12 @@ def mopac_heat_of_formation(atoms, coords, tmp_path) -> float:
     job = tmp_path / "parity.mop"
     job.write_text("\n".join(lines) + "\n")
     subprocess.run([str(MOPAC), job.name], cwd=tmp_path,
-                   capture_output=True, timeout=600)
+                   capture_output=True, timeout=600, check=True)
     out = job.with_suffix(".out")
-    if not out.exists():
-        pytest.skip("MOPAC produced no output")
+    assert out.exists(), "Installed MOPAC produced no output"
     found = re.search(r"FINAL HEAT OF FORMATION =\s+(-?\d+\.\d+)\s*KCAL",
                       out.read_text())
-    if found is None:
-        pytest.skip("MOPAC did not report a heat of formation")
+    assert found is not None, "Installed MOPAC did not report a heat of formation"
     return float(found.group(1))
 
 

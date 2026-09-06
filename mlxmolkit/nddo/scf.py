@@ -2093,6 +2093,11 @@ def rm1_energy_batch_mlx(
         converged_np = np.zeros(N, dtype=bool)
         pending: list[tuple[int, mx.array, mx.array | None, mx.array]] = []
 
+    fused_update = (not use_sign and os.environ.get("MLXMOLKIT_SCF_FUSED_UPDATE", "0") == "1")
+    if fused_update:
+        from .scf_update_metal import density_update
+        n_iter_gpu = mx.array(n_iter_arr)
+
     F = None
     eigvals_final = None
     for iteration in range(max_iter):
@@ -2161,7 +2166,19 @@ def rm1_energy_batch_mlx(
         if tr_err is not None:
             new_conv = new_conv & (tr_err < 0.25)
 
-        if not use_sign:
+        if fused_update:
+            P, converged_mask, n_iter_gpu, dP = density_update(
+                P, P_new, converged_mask, n_iter_gpu, iteration, conv_tol)
+            if verbose and iteration % 5 == 0:
+                mx.eval(P, converged_mask, dP)
+                print(f"  SCF iter {iteration + 1}: {int(mx.sum(converged_mask).item())}/{N} "
+                      f"converged, max dP = {float(mx.max(dP).item()):.2e}")
+            if bool(mx.all(converged_mask).item()):
+                break
+            F = F_for_eigh
+            eigvals_final = eigvals
+        elif not use_sign:
+            converged_before = converged_mask
             # Mark first-time-converged molecules with the current iteration count.
             first_conv = new_conv & (~converged_mask)
             if mx.any(first_conv).item():
@@ -2172,9 +2189,13 @@ def rm1_energy_batch_mlx(
 
             # 6. Density mixing for first 2 iterations.
             if iteration < 2:
-                P = 0.5 * P_new + 0.5 * P
+                candidate = 0.5 * P_new + 0.5 * P
             else:
-                P = P_new
+                candidate = P_new
+
+            # A cumulative convergence flag is valid only if its accepted
+            # density stays fixed while harder molecules keep iterating.
+            P = mx.where(converged_before[:, None, None], P, candidate)
 
             if verbose and (iteration % 5 == 0):
                 n_conv = int(mx.sum(converged_mask.astype(mx.int32)).item())
@@ -2254,9 +2275,16 @@ def rm1_energy_batch_mlx(
 
     P_np_out = np.array(P)
     F_np_out = np.array(F_final)
-    E_elec_np = np.array(E_elec_mx)
+    # These arrays are already needed on the host for the returned density.
+    # Accumulate the final energy in float64: float32 summation followed by
+    # subtraction of atomic energies loses hundredths of a kcal/mol.
+    E_elec_np = 0.5 * np.sum(
+        P_np_out.astype(np.float64) * (batch.H_core + F_np_out.astype(np.float64)),
+        axis=(-2, -1), dtype=np.float64)
     if not use_sign:
         converged_np = np.array(converged_mask)
+    if fused_update:
+        n_iter_arr = np.array(n_iter_gpu)
 
     results = []
     for mol_idx in range(N):
@@ -2370,7 +2398,14 @@ def _pulay_diis_extrap(F_hist, e_hist, solve_lu) -> mx.array:
     coeffs_full = solve_lu(A, rhs)                 # (N, nd+1, 1)
     coeffs = coeffs_full[..., :nd, 0]              # (N, nd)
     # F_extrap[..., n, m] = sum_i c_i F_stack[i, ..., n, m]
-    return mx.einsum("...i,i...nm->...nm", coeffs, F_stack)
+    extrapolated = mx.einsum("...i,i...nm->...nm", coeffs, F_stack)
+    # Linearly dependent (including exactly zero) commutator histories make
+    # the Pulay system singular. A GPU LU can return NaNs without raising;
+    # feeding these into Jacobi can yield identity eigenvectors and a false
+    # converged density (H2 became H- / H+). Fall back per molecule, entirely
+    # on-device, to the current physical Fock matrix.
+    valid = mx.all(mx.isfinite(extrapolated), axis=(-2, -1))
+    return mx.where(valid[..., None, None], extrapolated, F_hist[-1])
 
 
 # --- Back-compat aliases (the function was named rm1_energy before this PR

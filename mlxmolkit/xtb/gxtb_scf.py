@@ -2952,7 +2952,7 @@ def _kmat_shell_of(basis, gamma_mfx):
     return kmat
 
 
-def gxtb_energy(
+def _gxtb_energy_steps(
     atomic_numbers: list[int] | np.ndarray,
     coords_ang: np.ndarray,
     *,
@@ -3302,7 +3302,7 @@ def gxtb_energy(
         else:
             F_use = F
 
-        eigvals, C = _solve_generalized(F_use, S)
+        eigvals, C = (yield (F_use, S))
         C_occ = C[:, :n_occ]
         P_new = 2.0 * (C_occ @ C_occ.T)
         qsh_new = _mulliken_shell_charges(P_new, S, basis.bf_to_shell, n_shell, z_ref)
@@ -3407,7 +3407,7 @@ def gxtb_energy(
     E_aes = E_aes_f
     if _F_aes_f is not None:
         F = F + _F_aes_f
-    eigvals, C = _solve_generalized(F, S)
+    eigvals, C = (yield (F, S))
     P = 2.0 * (C[:, :n_occ] @ C[:, :n_occ].T)
     qsh = _mulliken_shell_charges(P, S, basis.bf_to_shell, n_shell, z_ref)
     q_at = np.bincount(basis.shell_atom, weights=qsh, minlength=atoms.size)
@@ -3454,7 +3454,7 @@ def gxtb_energy(
                 _Ff = _Ff + _gke_f(P, S, basis, atoms,
                                    gamma_mfx[np.ix_(_first_f, _first_f)],
                                    qsh, coords_ang=coords)
-            eigvals, C = _solve_generalized(_Ff, S)
+            eigvals, C = (yield (_Ff, S))
             P = 2.0 * (C[:, :n_occ] @ C[:, :n_occ].T)
             _qsh_new = _mulliken_shell_charges(P, S, basis.bf_to_shell,
                                                n_shell, z_ref)
@@ -3712,6 +3712,24 @@ def gxtb_energy(
             "gradient": "central finite difference",
         },
     }
+
+
+
+from functools import wraps as _wraps
+
+
+@_wraps(_gxtb_energy_steps)
+def gxtb_energy(*args, **kwargs):
+    """Run the same SCF state machine with the scalar generalized eigensolver."""
+    steps = _gxtb_energy_steps(*args, **kwargs)
+    try:
+        request = next(steps)
+        while True:
+            request = steps.send(_solve_generalized(*request))
+    except StopIteration as done:
+        return done.value
+    finally:
+        steps.close()
 
 
 def gxtb_gradient_numerical(

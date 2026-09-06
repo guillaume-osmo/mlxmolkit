@@ -4730,7 +4730,10 @@ def diatom_overlap_matrixD(ni, nj, xij, rij, zeta_a, zeta_b, qn_int, qnD_int):
             for _v, (_la, _lb, _m, _ia, _ib, _nsa, _nsb) in _spec.items():
                 _na = na_d if _nsa == "d" else na_s
                 _nb = nb_d if _nsb == "d" else nb_s
-                if _na == 0 or _nb == 0:
+                if _na == 0 or _nb == 0 or za[_ia] == 0 or zb[_ib] == 0:
+                    # Zero exponent denotes an absent shell (e.g. MNDO I
+                    # has no d orbitals). Do not integrate its zero norm.
+                    _Svars[_v][_idx] = 0.0
                     continue
                 _Svars[_v][_idx] = _sgn[_v] * _ro(_na, _la, _nb, _lb, _m, za[_ia], zb[_ib], R_b)
 
