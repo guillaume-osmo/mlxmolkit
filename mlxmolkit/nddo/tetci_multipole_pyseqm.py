@@ -24,7 +24,7 @@ import numpy as np
 
 from .w_integrals import slater_condon_parameter as _SC
 
-EV = 27.21
+from .constants import HARTREE_TO_EV as EV
 EV2 = EV / 4.0
 
 # PYSEQM PM6 "tail" exponents for d-orbital atoms (s_orb_exp_tail, p_, d_)

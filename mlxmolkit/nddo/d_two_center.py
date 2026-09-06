@@ -93,8 +93,10 @@ def _col_from_params(name, plist, csv):
             v = tail[_TAIL_SLOT[name]] if tail else row.get(name, 0.0)
         elif name in _CSV_TO_PARAM:
             v = getattr(p, _CSV_TO_PARAM[name], 0.0)
-            if not v:
+            if not v and p.rho_core is None:
                 v = row.get(name, 0.0)
+        elif name == 'rho_core' and p.rho_core is not None:
+            v = p.rho_core
         else:
             v = row.get(name, 0.0)
         out.append(float(v))
@@ -107,7 +109,8 @@ def _param_fingerprint(p):
     tails -- share a cache entry."""
     tail = getattr(p, "tail_exponents", None)
     return (float(p.zeta_s), float(p.zeta_p), float(getattr(p, "zeta_d", 0.0)),
-            tuple(tail) if tail else None)
+            tuple(tail) if tail else None, p.gss, p.gpp, p.gp2, p.hsp,
+            p.F0SD, p.G2SD, p.rho_core, p.feather)
 
 
 def _pair_key(p1, p2, c1, c2):
@@ -422,7 +425,11 @@ def _yy_pair_w(pA, pB, coordA, coordB):
     n = packed_size(9)
     # TETCI indexes [second centre pair, first centre pair].
     W = unpack(w[:n, :n].T, 9, 9)
-    return W if first_is_A else W.transpose(2, 3, 0, 1)
+    W = W if first_is_A else W.transpose(2, 3, 0, 1)
+    if pA.feather and pB.feather:
+        from .point_charge import tensor
+        W = tensor(W, np.linalg.norm(coordB-coordA), 9, 9)
+    return W
 
 
 def _yx_pair_w(p_d, p_sp, coord_d, coord_sp):
@@ -435,7 +442,11 @@ def _yx_pair_w(p_d, p_sp, coord_d, coord_sp):
     if w is None:
         return None
     from .packing import unpack, packed_size
-    return unpack(w[:packed_size(4), :packed_size(9)].T, 9, 4)
+    W = unpack(w[:packed_size(4), :packed_size(9)].T, 9, 4)
+    if p_d.feather and p_sp.feather:
+        from .point_charge import tensor
+        W = tensor(W, np.linalg.norm(coord_sp-coord_d), 9, 4)
+    return W
 
 
 def d_pair_effective_w(pA, pB, coordA, coordB, w_sp):

@@ -406,6 +406,9 @@ def _gradient_body(atoms, coords, method, step, molecular_charge, scf_result,
         np.add.at(gradient[:, d], ib, deriv)
         np.add.at(gradient[:, d], ia, -deriv)
 
+    if normalize_method(method) == 'PM7':
+        from .pm7_corrections import correction_gradient
+        gradient += correction_gradient(atoms, coords, step=step)
     return result, gradient
 
 
@@ -426,4 +429,9 @@ def _energy_frozen_density(atoms, coords, P, PARAMS, method='RM1', molecular_cha
     # frozen-density gradient is consistent with the energy it differentiates).
     E_nuc = nuclear_repulsion_for_method(atoms, coords, PARAMS, method)
 
-    return E_elec + E_nuc
+    correction = 0.
+    if normalize_method(method) == 'PM7':
+        from .pm7_corrections import corrections
+        from .params import EV_TO_KCAL
+        correction = sum(corrections(atoms, coords).values()) / EV_TO_KCAL
+    return E_elec + E_nuc + correction

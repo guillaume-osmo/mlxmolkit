@@ -17,8 +17,8 @@ import numpy as np
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, EV_TO_KCAL, principal_qn
 
 # Physical constants
-EV = 27.21  # Hartree to eV (MOPAC convention)
-A0 = 0.529167  # Bohr radius in Angstrom
+from .constants import HARTREE_TO_EV as EV
+from .constants import BOHR_TO_ANG as A0
 
 
 def _charge_separations(p: ElementParams) -> tuple[float, float]:
@@ -286,6 +286,10 @@ def nuclear_repulsion_for_method(
     drift apart again.
     """
     canonical = normalize_method(method)
+    if canonical == 'PM7':
+        from .pm7 import pair_repulsion
+        return sum(pair_repulsion(params[atoms[i]], params[atoms[j]], coords[i], coords[j])
+                   for i in range(len(atoms)) for j in range(i + 1, len(atoms)))
     if canonical == 'PM6_ORG':
         from .pwcct import pm6_org_pair_repulsion
         coords = np.asarray(coords, dtype=np.float64)
@@ -360,6 +364,9 @@ def pair_repulsion_for_method(atoms, coords, i, j, params, method) -> float:
     one place is what stops a gradient differentiating a different energy from
     the one the SCF minimised.
     """
+    if normalize_method(method) == 'PM7':
+        from .pm7 import pair_repulsion
+        return pair_repulsion(params[atoms[i]], params[atoms[j]], coords[i], coords[j])
     if normalize_method(method) in PM6_CORE_CORE_METHODS:
         from .pwcct import pm6_pair_repulsion
         return pm6_pair_repulsion(atoms[i], atoms[j],

@@ -22,7 +22,7 @@ from typing import NamedTuple
 import numpy as np
 from .params import RM1_PARAMS, ElementParams, ANG_TO_BOHR, principal_qn
 
-EV = 27.21  # Hartree to eV (MOPAC convention)
+from .constants import HARTREE_TO_EV as EV
 
 
 def _compute_multipole_params(p: ElementParams) -> tuple[float, float, float, float, float]:
@@ -398,7 +398,7 @@ def multipole_table(params):
     """Per-atom arrays of everything the two-centre integrals read.
 
     Returns:
-        tab: (n_atoms, 5) of (da, qa, rho0, rho1, rho2) -- what
+        tab: (n_atoms, 6) of (da, qa, rho0, rho1, rho2, feather) -- what
             :func:`_compute_multipole_params` returns, gathered per atom;
         zval: (n_atoms,) valence electron counts;
         nb: (n_atoms,) basis sizes.
@@ -411,11 +411,12 @@ def multipole_table(params):
     pair.
     """
     n = len(params)
-    tab = np.zeros((n, 5))
+    tab = np.zeros((n, 6))
     zval = np.empty(n)
     nb = np.empty(n, dtype=np.int64)
     for i, p in enumerate(params):
-        tab[i] = _compute_multipole_params(p)
+        tab[i, :5] = _compute_multipole_params(p)
+        tab[i, 5] = p.feather
         zval[i] = float(p.n_valence)
         nb[i] = p.n_basis
     return tab, zval, nb

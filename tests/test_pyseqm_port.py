@@ -1,15 +1,14 @@
-"""Bit-exactness tests for the vendored NumPy PYSEQM port.
+"""Regression tests for the vendored NumPy PYSEQM port with CODATA constants.
 
 These tests guard the critical numerical invariants:
-  - diatom_overlap_matrixD reproduces PYSEQM to machine precision
-  - two_elec_two_center_int reproduces PYSEQM to machine precision
-  - the per-pair W tensor (9x9x4x4 / 9x9x9x9) is bit-exact
+  - stable diatomic overlaps across shell combinations
+  - stable two-center integrals and per-pair W tensors
+  - symmetry and atom-order invariants
 
-Reference values were captured from PYSEQM 2.0.0 (LANL, BSD-3) on
-2026-05-24 and hardcoded so the tests run without a PYSEQM dependency.
-
-If you change ANY of the vendored code in mlxmolkit/nddo/_pyseqm_port/
-and these tests break, the change has introduced a numerical regression.
+The original PYSEQM 2.0.0 snapshots used MOPAC7 physical constants.
+These numerical regression snapshots were refreshed for current CODATA
+constants on 2026-09-06. They test port stability, not independent physical
+accuracy; test_pm7_port and test_nddo_constants provide MOPAC oracle gates.
 """
 from __future__ import annotations
 
@@ -29,23 +28,17 @@ from mlxmolkit.nddo import d_two_center as d2c
 # ----------------------------------------------------------------------
 # Reference ri[22] values from PYSEQM for S(16) - C(6) at 1.81 Angstrom
 # ----------------------------------------------------------------------
-PYSEQM_RI_SC_181 = np.array([
-    6.41906011, -1.71769045, 6.836261, 6.11038893, 0.82042947,
-    -0.42182828, 0.28938924, 0.81424411, 0.69971552, -0.12677308,
-    6.63592222, 6.23091175, -1.9740089, -1.51914103, 0.17309119,
-    6.93383935, 6.23640056, 6.53693353, 5.98955012, -0.10001204,
-    5.94975255, 0.01989879,
-])
+CODATA_RI_SC_181 = np.array([6.41935368614589, -1.7177798903676198, 6.836552033713134, 6.110662164081101, 0.8204469726271593, -0.42184008720054744, 0.28941142842854806, 0.8142468429594021, 0.6997252561058145, -0.12678114395692885, 6.636209759069869, 6.231194860956338, -1.9740987335352518, -1.5192118183705328, 0.17310724216093054, 6.934099003502048, 6.2366612209428585, 6.537206583496737, 5.989819490581849, -0.10001902847146282, 5.95001810728794, 0.019900691646954183])
 
 
 # Reference W[mu,nu,lam,sig] for S-C YX pair at 1.81 A
-# (captured from the bit-exact-to-PYSEQM NumPy port)
-PYSEQM_W0000_SC_181 = 6.4190601117  # (s_S s_S | s_C s_C)
-PYSEQM_W0133_SC_181 = 1.5191410329  # (s_S p_x_S | p_z_C p_z_C) — canary
-PYSEQM_W4400_SC_181 = 7.3996011663  # (d_z2_S d_z2_S | s_C s_C)
-PYSEQM_W4433_SC_181 = 7.1276100208  # (d_z2_S d_z2_S | p_z_C p_z_C)
-PYSEQM_W1000_SC_181 = 1.7176904473  # (p_x_S s_S | s_C s_C) — was 0 before fix
-PYSEQM_W4000_SC_181 = 0.0437972432  # (d_z2_S s_S | s_C s_C)
+# (captured from the regression-to-PYSEQM NumPy port)
+CODATA_W0000_SC_181 = 6.41935368614589  # (s_S s_S | s_C s_C)
+CODATA_W0133_SC_181 = 1.5192118183705328  # (s_S p_x_S | p_z_C p_z_C) — canary
+CODATA_W4400_SC_181 = 7.400058114056704  # (d_z2_S d_z2_S | s_C s_C)
+CODATA_W4433_SC_181 = 7.128042369512873  # (d_z2_S d_z2_S | p_z_C p_z_C)
+CODATA_W1000_SC_181 = 1.7177798903676198  # (p_x_S s_S | s_C s_C) — was 0 before fix
+CODATA_W4000_SC_181 = 0.04379776054364283  # (d_z2_S s_S | s_C s_C)
 
 
 def _build_const():
@@ -63,26 +56,26 @@ def _build_const():
 
 
 # =====================================================================
-# Overlap NumPy port — bit-exactness vs PYSEQM (qn=1..5)
+# Overlap NumPy port — regressionness vs PYSEQM (qn=1..5)
 # =====================================================================
 
 OVERLAP_REFERENCE_S00 = {
-    # (ZA, ZB, R_ang) -> S[0, 0] computed via the bit-exact-to-PYSEQM
+    # (ZA, ZB, R_ang) -> S[0, 0] computed via the regression-to-PYSEQM
     # NumPy port; frozen as a regression reference for the port itself.
-    (1, 1, 0.74): 0.6485607837,    # H-H jcall=2
-    (6, 1, 1.09): 0.4243448006,    # C-H jcall=3
-    (6, 6, 1.54): 0.1918218199,    # C-C jcall=4
-    (16, 1, 1.336): 0.3709841294,  # S-H jcall=431
-    (16, 6, 1.81): 0.1590158869,   # S-C jcall=5
-    (16, 16, 2.05): 0.1429354931,  # S-S jcall=6
+    (1, 1, 0.74): 0.648570310283831,    # H-H jcall=2
+    (6, 1, 1.09): 0.4243573066024346,    # C-H jcall=3
+    (6, 6, 1.54): 0.19183290562951075,    # C-C jcall=4
+    (16, 1, 1.336): 0.3709970229025872,  # S-H jcall=431
+    (16, 6, 1.81): 0.1590264134553709,   # S-C jcall=5
+    (16, 16, 2.05): 0.14294593695156932,  # S-S jcall=6
 }
 
 
 @pytest.mark.parametrize("ZA,ZB,R_ang,expected_S00", [
     (ZA, ZB, R, S) for (ZA, ZB, R), S in OVERLAP_REFERENCE_S00.items()
 ])
-def test_overlap_matches_pyseqm_S00(ZA, ZB, R_ang, expected_S00):
-    """Diatomic overlap[0,0] must match PYSEQM to 1e-5 for the jcall paths
+def test_overlap_matches_codata_snapshot_S00(ZA, ZB, R_ang, expected_S00):
+    """Diatomic overlap[0,0] must match the CODATA port snapshot to 1e-5 for the jcall paths
     we have hand-derived (qn=1..3)."""
     PARAMS = METHOD_PARAMS['PM6_D']
     pA, pB = PARAMS[ZA], PARAMS[ZB]
@@ -120,11 +113,11 @@ def test_overlap_is_symmetric_under_atom_label_swap():
 
 
 # =====================================================================
-# TETCI local-frame ri (the 22-element sp integral) bit-exactness
+# TETCI local-frame ri (the 22-element sp integral) regressionness
 # =====================================================================
 
-def test_tetci_ri_sc_bit_exact():
-    """All 22 ri[k] values for S-C at 1.81 A must match PYSEQM to 1e-7.
+def test_tetci_ri_sc_regression():
+    """All 22 ri[k] values for S-C at 1.81 A must match the CODATA port snapshot to 1e-7.
 
     This was the canary test that caught the int-dtype bug:
       ri[1] = -1.717..., NOT zero. If you see all zeros except ri[0]/[2]/[3],
@@ -148,29 +141,29 @@ def test_tetci_ri_sc_bit_exact():
 
     assert 'ri' in captured, "TETCI did not call w_withquaternion"
     ri = captured['ri'][0]  # first pair
-    diff = np.abs(ri - PYSEQM_RI_SC_181)
+    diff = np.abs(ri - CODATA_RI_SC_181)
     assert diff.max() < 1e-7, (
         f"ri mismatch (max diff {diff.max()}):\n"
         f"  got:      {ri}\n"
-        f"  expected: {PYSEQM_RI_SC_181}\n"
+        f"  expected: {CODATA_RI_SC_181}\n"
         f"  diff:     {diff}"
     )
 
 
 # =====================================================================
-# W tensor (9x9x4x4 / 9x9x9x9) bit-exactness
+# W tensor (9x9x4x4 / 9x9x9x9) regressionness
 # =====================================================================
 
 @pytest.mark.parametrize("mu,nu,lam,sig,expected", [
-    (0, 0, 0, 0, PYSEQM_W0000_SC_181),
-    (0, 1, 3, 3, PYSEQM_W0133_SC_181),  # canary: was 0 before dtype fix
-    (1, 0, 0, 0, PYSEQM_W1000_SC_181),  # canary: was 0 before dtype fix
-    (4, 4, 0, 0, PYSEQM_W4400_SC_181),
-    (4, 4, 3, 3, PYSEQM_W4433_SC_181),
-    (4, 0, 0, 0, PYSEQM_W4000_SC_181),
+    (0, 0, 0, 0, CODATA_W0000_SC_181),
+    (0, 1, 3, 3, CODATA_W0133_SC_181),  # canary: was 0 before dtype fix
+    (1, 0, 0, 0, CODATA_W1000_SC_181),  # canary: was 0 before dtype fix
+    (4, 4, 0, 0, CODATA_W4400_SC_181),
+    (4, 4, 3, 3, CODATA_W4433_SC_181),
+    (4, 0, 0, 0, CODATA_W4000_SC_181),
 ])
-def test_yx_w_element_bit_exact(mu, nu, lam, sig, expected):
-    """Per-element W[mu,nu,lam,sig] for S-C YX pair must match PYSEQM."""
+def test_yx_w_element_regression(mu, nu, lam, sig, expected):
+    """Per-element W[mu,nu,lam,sig] for S-C YX pair must match the CODATA port snapshot."""
     PARAMS = METHOD_PARAMS['PM6_D']
     W = d2c._yx_pair_w(PARAMS[16], PARAMS[6],
                               np.array([0., 0., 0.]),

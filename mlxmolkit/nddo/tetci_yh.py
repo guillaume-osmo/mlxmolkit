@@ -27,7 +27,7 @@ from .two_center_integrals import (
 )
 from .tetci_multipole_pyseqm import pyseqm_d_params
 
-EV = 27.21
+from .constants import HARTREE_TO_EV as EV
 EV1 = EV / 2.0
 EV2 = EV / 4.0
 
@@ -128,6 +128,9 @@ def yh_rotated_integral_matrix(
             packed = INDX[i] + j
             W[i, j] = core_mol[packed]
             W[j, i] = W[i, j]
+    if pA.feather and pB.feather:
+        from .point_charge import matrix
+        W = matrix(W, R)
     return W
 
 
@@ -328,6 +331,9 @@ def yh_e1b_contribution(
             if j != i:
                 e1b[i, j] = val  # mirror upper to lower → symmetric
     # H_core convention: V_munu = -Z_B * integral, so negate
+    if pA.feather and pB.feather:
+        from .point_charge import matrix
+        e1b = matrix(e1b, R, pB.n_valence)
     return -e1b
 
 
@@ -441,4 +447,9 @@ def yh_e1b_batch(pair_params, pair_coords) -> NDArray[np.float64]:
 
     # e1b[i, j] = rotated[pack_index(i, j)] — the scalar's INDX[i] + j is the
     # lower-triangle index, so the double loop is one gather.
-    return -rotated[:, index_matrix(9)]
+    result = -rotated[:, index_matrix(9)]
+    selected = np.array([a.feather and b.feather for a, b in pair_params])
+    if selected.any():
+        from .point_charge import matrix
+        result[selected] = matrix(result[selected], R_ang[selected], -Z_B[selected])
+    return result

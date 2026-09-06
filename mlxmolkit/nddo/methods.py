@@ -659,10 +659,13 @@ def _load_mndo_params() -> Dict[int, ElementParams]:
 
 
 MNDO_PARAMS = _load_mndo_params()
+from .pm7 import load_params as _load_pm7_params
+PM7_PARAMS = _load_pm7_params()
 
 
 # Method registry.  d-PM6 is the ONLY PM6 exposed: sp-only mis-charges P/S/halogens (drops their d-orbitals).
 METHOD_PARAMS: Dict[str, Dict[int, ElementParams]] = {
+    'PM7': PM7_PARAMS,
     'MNDO': MNDO_PARAMS,
     'RM1': RM1_PARAMS,
     'AM1': AM1_PARAMS,

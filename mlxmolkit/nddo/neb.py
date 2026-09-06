@@ -37,7 +37,7 @@ import numpy as np
 
 from .gradient import nddo_gradient
 
-EV_TO_KCAL = 23.060541945329334
+from .constants import EV_TO_KCAL
 
 
 # --------------------------------------------------------------------------------------

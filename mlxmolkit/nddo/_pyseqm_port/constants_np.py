@@ -11,15 +11,14 @@ is irrelevant for the NumPy port. Tables reproduced verbatim from
 """
 import numpy as np
 
-# PYSEQM uses MOPAC7-vintage values for these constants
-ev = 27.21
-a0 = 0.529167
-ev_kcalpmol = 23.061
+# Use the same current MOPAC constants as the surrounding native engine.
+from ..constants import (HARTREE_TO_EV as ev, BOHR_TO_ANG as a0,
+                         EV_TO_KCAL as ev_kcalpmol,
+                         ELEMENTARY_CHARGE as charge_on_electron,
+                         SPEED_OF_LIGHT as speed_of_light)
 overlap_cutoff = 40.0
-charge_on_electron = 1.60217733e-19
-speed_of_light = 2.99792458e8
 to_debye = charge_on_electron * 1e-10 * speed_of_light / 1e-21
-debye_to_AU = 0.393456
+debye_to_AU = 1.0 / (to_debye * a0)
 
 
 # Principal quantum number of the valence sp shell, indexed by Z.

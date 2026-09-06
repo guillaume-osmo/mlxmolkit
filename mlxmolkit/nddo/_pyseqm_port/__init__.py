@@ -2,7 +2,8 @@
 
 Source: https://github.com/lanl/PYSEQM
 
-Bit-exact to PYSEQM (~1e-15) — verified by tests/test_pyseqm_port.py.
+Uses current MOPAC CODATA physical constants. The algorithms retain their
+PYSEQM provenance; tests/test_pyseqm_port.py freezes numerical regression values.
 
 Exports
 -------

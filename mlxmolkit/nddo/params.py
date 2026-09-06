@@ -72,6 +72,8 @@ class ElementParams:
     F0SD: float = 0.0        # Slater-Condon F0 for s-d interaction
     G2SD: float = 0.0        # Slater-Condon G2 for s-d interaction
     has_d: bool = False       # True if element uses d-orbitals in PM6
+    feather: bool = False  # Smooth PM7 transition to point-charge integrals
+    rho_core: float | None = None  # Explicit MOPAC pocord, including zero; None uses legacy table.
 
 
 # RM1 parameters from MOPAC (Apache 2.0)
@@ -203,9 +205,7 @@ RM1_PARAMS: Dict[int, ElementParams] = {
 SYMBOL_TO_Z = {p.symbol: p.Z for p in RM1_PARAMS.values()}
 
 # Physical constants (matching MOPAC conventions)
-EV_TO_KCAL = 23.061      # 1 eV = 23.061 kcal/mol
-BOHR_TO_ANG = 0.529167   # 1 bohr = 0.529167 Angstrom
-ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
+from .constants import EV_TO_KCAL, BOHR_TO_ANG, ANG_TO_BOHR
 
 
 def principal_qn(Z: int) -> int:

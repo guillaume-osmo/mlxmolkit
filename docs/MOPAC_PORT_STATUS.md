@@ -3,6 +3,9 @@
 Worktree: `codex/nddo-review-speed`, based on `fix/nddo-mopac-gates`
 at `0a508e98f958fcffea1483179e8d69cca8a2c751`. Integrated with the published optimization stack; see BRANCH_INTEGRATION.md.
 
+The subsequent [PM7 port and CODATA migration](PM7_PORT.md) adds native PM7.
+The MNDO measurements below are historical, before that constants migration.
+
 ## Implemented in this update
 
 **MNDO**, for H, C, N, O, F, Si, P, S, Cl, Br and I. The port uses its
@@ -41,7 +44,8 @@ against central differences, and ethanol optimization convergence.
 | AM1, RM1, PM3 | Existing native ports, included in the full regression run. |
 | PM6, PM6-ORG, PM6-D3/H4/X variants | Existing native ports; PM6_D is an alias, not another Hamiltonian. |
 | MNDO/d | Not ported: requires method-specific d/core parameters and diatomic repulsion, with independent energy/gradient gates. |
-| PM7 and PM7-TS | Not ported: require their own core terms, integral modifications and empirical corrections; changing PM6 parameters alone is insufficient. |
+| PM7 | Native eleven-element main-group port, complete corrections/gradient and CPU/Metal batch; see [validation](PM7_PORT.md). |
+| PM7-TS | Not ported; requires its own model parameters and validation. |
 | PM8 | Present in the inspected current OpenMOPAC source, not ported here. Needs source/version-specific validation. |
 | INDO and Sparkles | Not ported; these need their own model/basis semantics and validation. |
 

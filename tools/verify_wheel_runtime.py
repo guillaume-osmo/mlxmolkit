@@ -40,9 +40,14 @@ from mlxmolkit.nddo import nddo_energy
 result = nddo_energy([1, 1], np.array([[0., 0., 0.], [0., 0., .74]]), method='MNDO')
 assert result['converged']
 np.testing.assert_allclose(result['charges'], [0, 0], atol=1e-6)
+pm7 = nddo_energy([8, 1, 1], np.array([[0., 0., 0.], [.9584, 0., 0.],
+                                     [-.2396, .9275, 0.]]), method='PM7')
+assert pm7['converged']
+assert abs(pm7['energy_eV']-pm7['scf_energy_eV']-pm7['geometry_correction_eV']) < 1e-10
+assert np.isfinite(pm7['heat_of_formation_kcal'])
 print(json.dumps(dict(gxtb_molecules=len(cases), gxtb_atoms=len(errors),
                      gxtb_charge_mae_e=mae, gxtb_charge_max_error_e=max(errors),
-                     onecentre_table=True, d4srev=True, mndo=True), indent=2))
+                     onecentre_table=True, d4srev=True, mndo=True, pm7=True), indent=2))
 '''
 
 

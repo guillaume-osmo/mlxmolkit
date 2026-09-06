@@ -1,7 +1,7 @@
 """
 Unit tests for RM1/AM1/PM6 SCF engine.
 
-Validates against PYSEQM reference values (exact to < 0.001 eV).
+Validates against current MOPAC reference values (exact to < 0.001 eV).
 """
 import sys; sys.path.insert(0, '.')
 import numpy as np
@@ -18,35 +18,20 @@ MOLS = {
     'NH3': ([7,1,1,1], np.array([[0,0,0],[.9377,-.3816,0],[-.4689,.8119,0],[-.4689,-.4303,.8299]])),
 }
 
-# PYSEQM reference values (exact)
-PYSEQM_REF = {
-    'RM1': {
-        'H2':  {'E_elec': -42.279154, 'E_nuc': 13.780913, 'E_tot': -28.498242},
-        'H2O': {'E_elec': -488.951381, 'E_nuc': 143.380852, 'E_tot': -345.570528},
-        'CH4': {'E_elec': -391.804076, 'E_nuc': 209.044867, 'E_tot': -182.759209},
-        'NH3': {'E_elec': -439.119959, 'E_nuc': 186.812105, 'E_tot': -252.307854},
-    },
-    'AM1': {
-        'H2':  {'E_elec': -40.847729, 'E_nuc': 13.376394, 'E_tot': -27.471336},
-        'H2O': {'E_elec': -493.546003, 'E_nuc': 144.984542, 'E_tot': -348.561461},
-        'CH4': {'E_elec': -386.849762, 'E_nuc': 203.668120, 'E_tot': -183.181642},
-        'NH3': {'E_elec': -433.776574, 'E_nuc': 185.943634, 'E_tot': -247.832940},
-    },
-    'PM6': {
-        'H2':  {'E_elec': -43.504671, 'E_nuc': 15.391764, 'E_tot': -28.112907},
-        'H2O': {'E_elec': -457.613320, 'E_nuc': 138.540585, 'E_tot': -319.072734},
-        'CH4': {'E_elec': -393.765398, 'E_nuc': 216.596686, 'E_tot': -177.168712},
-        'NH3': {'E_elec': -409.149911, 'E_nuc': 189.328518, 'E_tot': -219.821393},
-    },
-}
+# Current MOPAC default (CODATA) reference values, libmopac v23.2.
+# Captured from molkst_C elect/enuclr after single-point calculations on MOLS.
+import json
+from pathlib import Path
+MOPAC_REF = json.loads((Path(__file__).parents[1] /
+    'docs/validation/nddo_codata_mopac_references.json').read_text())['results']
 
 
 @pytest.mark.parametrize("method", ["RM1", "AM1", "PM6"])
 @pytest.mark.parametrize("mol_name", ["H2", "H2O", "CH4", "NH3"])
-def test_energy_vs_pyseqm(method, mol_name):
-    """Test that energies match PYSEQM to < 0.001 eV."""
+def test_energy_vs_mopac(method, mol_name):
+    """Test that energies match current MOPAC to < 0.001 eV."""
     atoms, coords = MOLS[mol_name]
-    ref = PYSEQM_REF[method][mol_name]
+    ref = MOPAC_REF[method][mol_name]
 
     result = nddo_energy(list(atoms), coords, method=method, max_iter=200, conv_tol=1e-8)
 

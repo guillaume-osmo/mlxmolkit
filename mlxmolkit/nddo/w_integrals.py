@@ -13,7 +13,7 @@ from functools import lru_cache
 
 import numpy as np
 
-EV = 27.21  # Hartree to eV
+from .constants import HARTREE_TO_EV as EV
 
 
 def _binom(a: int, b: int) -> float:

@@ -34,8 +34,8 @@ RDLogger.DisableLog("rdApp.*")
 # and the MOPAC comparisons are built on. The kernel puts CSC hundreds of eV
 # out — the original report had it at -786.50 where the NumPy path gives -501.
 D_BEARING_REFERENCES = {
-    "CSC": -500.9532912,
-    "CSc1ccccc1": -1139.7806569,
+    "CSC": -500.9551544747129,
+    "CSc1ccccc1": -1139.7860375425698,
 }
 
 

@@ -148,7 +148,15 @@ def _two_centre_packed(pA, pB, rA, rB, dense=None, tetci=None) -> np.ndarray:
         if w is not None:
             pa, pb = packed_size(nA), packed_size(nB)
             # TETCI indexes [second centre pair, first centre pair].
-            return (w.T[:pa, :pb] if first_is_A else w[:pa, :pb]).copy()
+            result = (w.T[:pa, :pb] if first_is_A else w[:pa, :pb]).copy()
+            if pA.feather and pB.feather:
+                from .point_charge import factors
+                keep, point = factors(np.linalg.norm(rB-rA))
+                result *= keep
+                da = np.arange(nA)*(np.arange(nA)+3)//2
+                db = np.arange(nB)*(np.arange(nB)+3)//2
+                result[np.ix_(da, db)] += point
+            return result
 
     if dense is None:
         dense, _, _ = rotate_integrals_to_molecular_frame(pA, pB, rA, rB)

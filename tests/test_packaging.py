@@ -23,7 +23,7 @@ PACKAGE = ROOT / "mlxmolkit"
 
 # Extensions that are loaded at runtime rather than imported. A .py file is
 # picked up by package discovery; these are not.
-DATA_SUFFIXES = {".csv", ".npz", ".json", ".metal", ".txt"}
+DATA_SUFFIXES = {".csv", ".npz", ".npy", ".json", ".metal", ".txt"}
 
 
 def _package_data_globs() -> list[str]:

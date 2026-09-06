@@ -11,7 +11,7 @@ quantum chemistry.
 |---|---|---|
 | **Conformers** | Drop-in for RDKit `EmbedMolecules`: DG (4D) → ETK (3D) → MMFF94, all on Metal. 8 ETKDG variants. N×k parallel | `generate_conformers_nk` |
 | **Clustering** | Morgan FP → Tanimoto → Butina, at 150k+ molecules with divide-and-conquer memory | `butina_tanimoto_mlx` |
-| **NDDO semi-empirical** | MNDO, RM1, AM1, PM3, PM6 and corrected variants; scalar and batched SCF, gradients/geometry optimization | `mlxmolkit.nddo` |
+| **NDDO semi-empirical** | MNDO, RM1, AM1, PM3, PM6, PM7 and corrected variants; scalar and batched SCF, gradients/geometry optimization | `mlxmolkit.nddo` |
 | **xTB** | GFN0/1/2 and g-xTB energies, analytical gradients, ANCOPT geometry optimization, ALPB water solvation | `mlxmolkit.xtb` |
 | **COSMO / COSMO-RS** | σ-profiles, σ-potentials, activity coefficients, solubility in solvent mixtures | `mlxmolkit.xtb` (σ), `mlxmolkit.cosmo` (ddCOSMO) |
 | **Similarity & descriptors** | ERG fingerprints, dense cosine, CHEESE embeddings, Connolly surfaces, dipole atom features | top-level exports |
@@ -125,6 +125,7 @@ See [MOPAC port status](docs/MOPAC_PORT_STATUS.md) for validation and remaining 
 | RM1 | H, C, N, O, F, P, S, Cl, Br, I |
 | AM1 | H, C, N, O, F, Si, P, S, Cl, Br, I |
 | PM3 | 25 elements in `get_params('PM3')` |
+| PM7 | H, C, N, O, F, Si, P, S, Cl, Br, I; complete correction energy/gradient, scalar and MLX batch |
 | PM6 | 40 elements, including d orbitals where parameterized |
 | PM6_D | Alias for PM6; `PM6_SP` is not a registered method |
 | PM6-ORG | Its own 18-element parameter set and corrections |
@@ -132,6 +133,10 @@ See [MOPAC port status](docs/MOPAC_PORT_STATUS.md) for validation and remaining 
 | PM6-D3 / PM6-D3H4 / PM6-D3H4X | PM6 SCF with post-SCF energy corrections |
 
 Parameter coverage does not imply equal validation across all elements.
+Native NDDO uses current OpenMOPAC CODATA physical constants. PM7 includes its
+point-charge transition, dispersion, hydrogen bonding and geometry corrections
+in both `energy_eV` and the optimization gradient.
+
 PM5 is unavailable: OpenMOPAC does not ship its proprietary implementation.
 The PM6-family geometry-dependent heat corrections still need their matching
 optimization gradients; the current optimizer differentiates `energy_eV`.
@@ -139,9 +144,9 @@ optimization gradients; the current optimizer differentiates `energy_eV`.
 - **Full d-orbital support** — P, S, Cl (qn=3) and Br (qn=4) via the 22-integral
   local frame, rotated to the molecular frame with Wigner D-matrices. Covers YH,
   YX and YY pair types.
-- **Bit-exactness** — the per-pair W tensor matches PYSEQM to 2.66e-15 (machine
-  epsilon); 27/27 SCF charge tests pass against frozen PYSEQM/MOPAC references,
-  guarded by 23 frozen-reference regression tests.
+- **Current MOPAC constants** — all NDDO integral paths share CODATA values.
+  Energy, charge, correction, and gradient comparisons against MOPAC are tested;
+  see [PM7 validation](docs/PM7_PORT.md) for scope and numerical limits.
 - **DIIS + adaptive damping** — converges on hard cases (CCl₄, SF₆, DMSO) where
   plain mixing freezes in the wrong basin.
 

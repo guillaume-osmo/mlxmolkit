@@ -12,7 +12,7 @@ import numpy as np
 import json
 import os
 
-EV = 27.21
+from .constants import HARTREE_TO_EV as EV
 ev = EV
 ev1 = ev / 2.0
 ev2 = ev / 4.0

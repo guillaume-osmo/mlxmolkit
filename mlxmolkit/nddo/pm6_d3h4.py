@@ -37,10 +37,9 @@ import numpy as np
 # Constants
 # ---------------------------------------------------------------------------
 
-BOHR = 0.5291772083            # Å per Bohr (MOPAC's a0)
-AU_TO_KCAL = 627.5094740631    # 1 Hartree → kcal/mol
-KCAL_TO_EV = 1.0 / 23.060547830619
-AU_TO_EV = AU_TO_KCAL * KCAL_TO_EV  # ≈ 27.211
+from .constants import BOHR_TO_ANG as BOHR, HARTREE_TO_EV as AU_TO_EV, EV_TO_KCAL
+AU_TO_KCAL = AU_TO_EV * EV_TO_KCAL
+KCAL_TO_EV = 1.0 / EV_TO_KCAL
 
 # PM6-D3H4 dispersion parameters (MOPAC parameters_for_PM6 v_par6(7..11))
 PM6_D3H4_DISP = dict(s6=0.880, alp=22.0, rs6=1.180, s8=0.0, rs8=1.0)

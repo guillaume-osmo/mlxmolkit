@@ -52,7 +52,7 @@ def _rotation_matrix(v: np.ndarray) -> np.ndarray:
     return R
 
 
-def rotate_integrals_to_molecular_frame(
+def _rotate_integrals_raw(
     pA: ElementParams,
     pB: ElementParams,
     coordA: np.ndarray,
@@ -148,7 +148,7 @@ def rotate_integrals_to_molecular_frame(
     if pair_type == 'HX':
         # A=H(s), B=heavy(sp)
         # Swap and transpose
-        w_swap, e1b_swap, e2a_swap = rotate_integrals_to_molecular_frame(pB, pA, coordB, coordA)
+        w_swap, e1b_swap, e2a_swap = _rotate_integrals_raw(pB, pA, coordB, coordA)
         # Transpose: w(kl|mn) → w(mn|kl)
         w_t = np.transpose(w_swap, (2, 3, 0, 1))
         return w_t, e2a_swap, e1b_swap
@@ -245,3 +245,15 @@ def rotate_integrals_to_molecular_frame(
             e2a[nu, mu] = e2a[mu, nu]
 
     return w, e1b, e2a
+
+
+def rotate_integrals_to_molecular_frame(pA, pB, coordA, coordB):
+    """Rotated integrals including the model's point-charge transition."""
+    w, e1, e2 = _rotate_integrals_raw(pA, pB, coordA, coordB)
+    if pA.feather and pB.feather:
+        from .point_charge import tensor
+        r = np.linalg.norm(coordB-coordA)
+        if r > 1e-10:
+            w = tensor(w, r, min(pA.n_basis, 4), min(pB.n_basis, 4))
+            e1, e2 = -pB.n_valence*w[:, :, 0, 0], -pA.n_valence*w[0, 0, :, :]
+    return w, e1, e2

@@ -286,6 +286,12 @@ def rotate_pairs(pair_params, pair_coords, *, fused_metal=False):
     flip = np.flatnonzero(swapped & live)
     if flip.size:
         out[flip] = np.transpose(out[flip], (0, 3, 4, 1, 2))
+    selected = np.array([a.feather and b.feather for a, b in pair_params]) & live
+    if selected.any():
+        from .point_charge import tensor
+        out[selected] = tensor(out[selected], np.linalg.norm(cb[selected]-ca[selected], axis=1),
+                               np.array([min(a.n_basis, 4) for a, _ in pair_params])[selected],
+                               np.array([min(b.n_basis, 4) for _, b in pair_params])[selected])
     return out
 
 
@@ -351,6 +357,12 @@ def rotate_pairs_indexed(tab, zval, nb, xyz, ia, ja):
     flip = np.flatnonzero(swapped & live)
     if flip.size:
         out[flip] = np.transpose(out[flip], (0, 3, 4, 1, 2))
+    if tab.shape[1] > 5:
+        selected = (tab[ia, 5] != 0) & (tab[ja, 5] != 0) & live
+        if selected.any():
+            from .point_charge import tensor
+            out[selected] = tensor(out[selected], dist[selected],
+                                   np.minimum(nb[ia[selected]], 4), np.minimum(nb[ja[selected]], 4))
     return out
 
 

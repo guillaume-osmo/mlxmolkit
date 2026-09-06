@@ -30,7 +30,7 @@ import math
 from typing import Dict, Tuple
 from .params import ANG_TO_BOHR
 
-EV = 27.21
+from .constants import HARTREE_TO_EV as EV
 
 # MOPAC's v_par6(1) and v_par6(2), from src/models/parameters_for_PM6_C.F90,
 # where they are commented "Used in ccrep for scalar/exponent correction of C-C

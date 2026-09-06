@@ -1082,7 +1082,7 @@ def _pm6d_via_pyseqm(atoms: list[int], coords: np.ndarray) -> dict:
         "n_iter": -1,  # PYSEQM doesn't expose; signal external
         "heat_of_formation_eV": hof_ev,
         "energy_eV": hof_ev,
-        "energy_kcal": hof_ev * 23.060547830619,
+        "energy_kcal": hof_ev * EV_TO_KCAL,
         "backend": "pyseqm",
     }
 
@@ -1097,8 +1097,8 @@ def _pm6_heat_corrections(atoms, coords, method) -> float:
         if (method_pm6 .and. N_3_present) atheat = atheat + nsp2_correction()
         atheat = atheat + sum_dihed             ! htype*sin(angle)**2 over O=C-N-H
 
-    The Si-O-H correction is PM7-only and post_scf_corrections applies to the
-    dispersion/hydrogen-bonding variants, so neither belongs here.
+    PM7 dispatches to its complete correction model before the PM6 cases,
+    including Si-O-H and the PM7 dispersion/hydrogen-bonding terms.
 
     None of these exist in PYSEQM, which is why the vendored port never had
     them, and why an mlxmolkit total energy could agree with MOPAC's own ENPART
@@ -1106,6 +1106,9 @@ def _pm6_heat_corrections(atoms, coords, method) -> float:
     """
     from .pwcct import DISPERSION_METHODS
     canonical = normalize_method(method)
+    if canonical == 'PM7':
+        from .pm7_corrections import corrections
+        return sum(corrections(atoms, coords).values())
     if (canonical not in PM6_CORE_CORE_METHODS
             and canonical not in DISPERSION_METHODS):
         return 0.0
@@ -1137,26 +1140,16 @@ def nddo_energy(
         coords: (N, 3) coordinates in Angstrom
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
-        method: 'RM1', 'AM1', 'AM1_STAR', 'PM6_SP', 'PM6_D'
-        molecular_charge: net molecular charge used to set the closed-shell
-            electron count.
-        native: For ``method='PM6_D'``, force the native mlxmolkit path
-            instead of delegating to PYSEQM. The native path matches
-            PYSEQM to machine precision on the test set after the
-            2026-05-24 fixes (qn per Z, symmetric H_core, YH/YX/YY d-orb
-            Fock J/K + e-n attraction, PYSEQM-delegated diatomic overlap
-            for qn≥3). PYSEQM is still imported as a thin BSD-3-Clause
-            library for the W-integral, overlap, and per-pair w-tensor
-            computations; a fully self-contained build is documented in
-            ``NATIVE_STATUS.md``.
+        method: Registered NDDO method, including PM7 (11 main-group elements).
+        molecular_charge: net charge used to set the closed-shell electron count.
+        native: retained for compatibility; all methods run natively.
 
     Returns:
-        dict with 'energy_eV', 'energy_kcal', 'converged', 'n_iter', 'density'
-
-    Note:
-        For ``method='PM6_D'`` by default the d-orbital SCF is delegated
-        to PYSEQM (validated against the MOPAC binary). Set
-        ``native=True`` to run the mlxmolkit path instead.
+        Energy, heat of formation, density, charges and convergence metadata.
+        For PM7, energy_eV includes all geometry corrections and is the
+        optimization objective. scf_energy_eV is electronic_eV + nuclear_eV;
+        geometry_correction_eV is the separately reported correction.
+        Other methods retain their existing energy_eV conventions.
     """
     from .d_two_center import pair_cache, _TETCI_CACHE
 
@@ -1217,28 +1210,14 @@ def _nddo_energy_at_geometry(
         coords: (N, 3) coordinates in Angstrom
         max_iter: max SCF iterations
         conv_tol: density matrix convergence threshold
-        method: 'RM1', 'AM1', 'AM1_STAR', 'PM6_SP', 'PM6_D'
-        molecular_charge: net molecular charge used to set the closed-shell
-            electron count.
-        native: For ``method='PM6_D'``, force the native mlxmolkit path
-            instead of delegating to PYSEQM. The native path matches
-            PYSEQM to machine precision on the test set after the
-            2026-05-24 fixes (qn per Z, symmetric H_core, YH/YX/YY d-orb
-            Fock J/K + e-n attraction, PYSEQM-delegated diatomic overlap
-            for qn≥3). PYSEQM is still imported as a thin BSD-3-Clause
-            library for the W-integral, overlap, and per-pair w-tensor
-            computations; a fully self-contained build is documented in
-            ``NATIVE_STATUS.md``.
+        method: Registered native NDDO method. See nddo_energy.
+        molecular_charge: closed-shell molecular charge.
+        native: compatibility argument, currently a no-op.
 
     Returns:
-        dict with 'energy_eV', 'energy_kcal', 'converged', 'n_iter', 'density'
-
-    Note:
-        For ``method='PM6_D'`` by default the d-orbital SCF is delegated
-        to PYSEQM (validated against the MOPAC binary). Set
-        ``native=True`` to run the mlxmolkit path instead.
+        Same energy conventions and metadata as nddo_energy.
     """
-    # PM6_D is bit-exact via the vendored numpy PYSEQM port
+    # PM6_D uses the vendored NumPy PYSEQM algorithms with CODATA constants
     # (mlxmolkit/nddo/_pyseqm_port/), so the native path is always used.
     # `native` kw is kept for back-compat but is now a no-op.
     _ = native
@@ -1459,8 +1438,11 @@ def _nddo_energy_at_geometry(
     # `atheat = atheat + C_triple_bond_C()` in src/compfg.F90). It is not part
     # of the SCF energy, which is why our total energy already agreed with
     # MOPAC's ENPART ETOT to 0.003 eV while the heat of formation did not.
-    eheat_total = eheat_total + _pm6_heat_corrections(atoms, coords, method)
+    correction = _pm6_heat_corrections(atoms, coords, method)
+    eheat_total = eheat_total + correction
     E_hof_eV = E_binding_eV + eheat_total / EV_TO_KCAL
+    if normalize_method(method) == 'PM7':
+        E_total += correction / EV_TO_KCAL
 
     # Mulliken partial charges (NDDO/ZDO): q_A = Z_valence(A) - Σ_{μ∈A} P_μμ.
     # Returned by default so the toolkit is drop-in usable like OpenMOPAC (which prints
@@ -1483,6 +1465,8 @@ def _nddo_energy_at_geometry(
     return {
         'energy_eV': E_total,
         'energy_kcal': E_total * EV_TO_KCAL,
+        'scf_energy_eV': E_elec + E_nuc,
+        'geometry_correction_eV': correction / EV_TO_KCAL,
         'electronic_eV': E_elec,
         'nuclear_eV': E_nuc,
         'heat_of_formation_eV': E_hof_eV,
@@ -1903,9 +1887,12 @@ def nddo_energy_batch(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + _pm6_heat_corrections(
+        correction = _pm6_heat_corrections(
             atoms, batch.coords_list[mol_idx], method)
+        eheat += correction
         E_hof = E_binding + eheat / EV_TO_KCAL
+        if normalize_method(method) == 'PM7':
+            E_total += correction / EV_TO_KCAL
 
         # Eigenvalues
         eigvals, _ = np.linalg.eigh(F)
@@ -1923,6 +1910,8 @@ def nddo_energy_batch(
         results.append({
             'energy_eV': E_total,
             'energy_kcal': E_total * EV_TO_KCAL,
+            'scf_energy_eV': E_elec + E_nuc,
+            'geometry_correction_eV': correction / EV_TO_KCAL,
             'electronic_eV': E_elec,
             'nuclear_eV': E_nuc,
             'heat_of_formation_eV': E_hof,
@@ -2297,9 +2286,12 @@ def rm1_energy_batch_mlx(
         E_isol = sum(PARAMS[z].eisol for z in atoms)
         eheat = sum(PARAMS[z].eheat for z in atoms)
         E_binding = E_total - E_isol
-        eheat = eheat + _pm6_heat_corrections(
+        correction = _pm6_heat_corrections(
             atoms, batch.coords_list[mol_idx], method)
+        eheat += correction
         E_hof = E_binding + eheat / EV_TO_KCAL
+        if normalize_method(method) == 'PM7':
+            E_total += correction / EV_TO_KCAL
         # Drop the spurious huge eigenvalues from padding.
         eigvals_active = eigvals_np[mol_idx, :nb]
         charges = np.empty(len(atoms))
@@ -2315,6 +2307,8 @@ def rm1_energy_batch_mlx(
         results.append({
             'energy_eV': E_total,
             'energy_kcal': E_total * EV_TO_KCAL,
+            'scf_energy_eV': E_elec + E_nuc,
+            'geometry_correction_eV': correction / EV_TO_KCAL,
             'electronic_eV': E_elec,
             'nuclear_eV': E_nuc,
             'heat_of_formation_eV': E_hof,

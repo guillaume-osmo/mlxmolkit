@@ -55,7 +55,7 @@ def _neighbour_counts(atoms, coords, scale: float = 1.25):
     return counts
 
 
-def pm6_dh_dispersion(atoms, coords) -> float:
+def pm6_dh_dispersion(atoms, coords, *, pm7=False, neighbour_counts=None) -> float:
     """PM6-DH+ dispersion energy, kcal/mol (negative).
 
     Port of ``PM6_DH_Disp``. The combining rule and damping are
@@ -76,7 +76,8 @@ def pm6_dh_dispersion(atoms, coords) -> float:
     """
     z = [int(a) for a in atoms]
     xyz = np.asarray(coords, dtype=np.float64)
-    counts = _neighbour_counts(z, xyz)
+    counts = _neighbour_counts(z, xyz) if neighbour_counts is None else neighbour_counts
+    alpha, s, cscale = (15.450118, 1.226593, 2.286419) if pm7 else (_ALPHA, _S, _CSCALE)
     total = 0.0
     for i in range(len(z)):
         zi = z[i]
@@ -102,6 +103,6 @@ def pm6_dh_dispersion(atoms, coords) -> float:
                      + (c6j * ni ** 2) ** (1.0 / 3.0)))
             r0 = (ri ** 3 + rj ** 3) / (ri ** 2 + rj ** 2) / 1000.0 * 2.0
             rij = float(np.linalg.norm(xyz[j] - xyz[i])) * 0.1      # A -> nm
-            damp = 1.0 / (1.0 + math.exp(-_ALPHA * (rij / (_S * r0) - 1.0)))
+            damp = 1.0 / (1.0 + math.exp(-alpha * (rij / (s * r0) - 1.0)))
             total -= c6 / rij ** 6 * damp / (1000.0 * 4.184)
-    return total * _CSCALE
+    return total * cscale

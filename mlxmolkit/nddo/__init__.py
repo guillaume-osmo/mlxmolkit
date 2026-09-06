@@ -1,4 +1,4 @@
-"""mlxmolkit.nddo — PM6_D / RM1 semi-empirical SCF on Apple Silicon.
+"""mlxmolkit.nddo — NDDO semi-empirical SCF on Apple Silicon.
 
 Public API — only the entry points covered by the test suite.
 Lower-level internals are reachable via submodule imports but are not
@@ -10,12 +10,12 @@ Tested entry points
 SCF
     nddo_energy(atoms, coords, method='RM1') -> dict
         Single-molecule SCF. Returns electronic + nuclear + heat-of-formation
-        energies plus the converged density. Methods: 'RM1', 'AM1', 'PM3',
-        'PM6_SP' (sp-only), 'PM6_D' (full d-orbital, requires the vendored
-        NumPy PYSEQM port — no external dep).
+        energies plus the converged density. Methods include MNDO, RM1, AM1,
+        PM3, PM6 and PM7. PM6_D aliases PM6. PM7 covers 11 main-group elements
+        and includes geometry corrections in its energy and gradient.
         Tests: tests/test_rm1_scf.py, tests/test_pm6_d_native.py
 
-    nddo_energy_batch(atoms_list, coords_list, method='RM1') -> list[dict]
+    nddo_energy_batch(molecules, method='RM1') -> list[dict]
         Batched version. Tests: tests/test_rm1_scf.py
 
 PM6-D3H4 corrections (post-SCF)
@@ -47,9 +47,9 @@ Parameters
     ElementParams
         Dataclass holding one element's NDDO parameters.
 
-Bit-exact reference primitives (vendored from PYSEQM, BSD-3, LANL)
-    These match PYSEQM to machine precision; the regression suite in
-    tests/test_pyseqm_port.py asserts this on every commit.
+Integral primitives (vendored from PYSEQM, BSD-3, LANL)
+    These use current MOPAC CODATA constants. Port regression snapshots and
+    independent MOPAC comparisons are tested separately.
 
     from mlxmolkit.nddo._pyseqm_port import (
         diatom_overlap_matrixD,     # qn=1..6 diatomic overlap (incl. d)

@@ -277,7 +277,7 @@ class additive_term_rho2(torch.autograd.Function):
         dhpp/dD2 = D2/4/(D2^2+rho2^2)^(3/2) - D2/4/(2*D2^2+rho2^2)^(3/2)
         """
 
-        # 1 hatree  = 27.21 eV
+        # Hartree-to-eV conversion uses shared current MOPAC constants
         rho2, D2 = ctx.saved_tensors
         tmp1 = 1.0 / (D2**2 + rho2**2) ** 1.5
         tmp2 = 1.0 / (2.0 * D2**2 + rho2**2) ** 1.5
