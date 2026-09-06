@@ -394,6 +394,75 @@ def _ri_core_xh(daA, qaA, rho0A, rho0B, rho1A, rho2A, R, ZA, ZB):
 
 
 
+def multipole_table(params):
+    """Per-atom arrays of everything the two-centre integrals read.
+
+    Returns:
+        tab: (n_atoms, 5) of (da, qa, rho0, rho1, rho2) -- what
+            :func:`_compute_multipole_params` returns, gathered per atom;
+        zval: (n_atoms,) valence electron counts;
+        nb: (n_atoms,) basis sizes.
+
+    One :func:`_compute_multipole_params` per DISTINCT element (it is memoised
+    on exactly the parameters it reads), so this is a handful of solves for a
+    molecule of any size. A 9-function atom gets its sp row: both this and the
+    scalar entry point clamp such an atom to its sp block and use the ordinary
+    multipole parameters, which is what makes an S-C pair arithmetically an X-X
+    pair.
+    """
+    n = len(params)
+    tab = np.zeros((n, 5))
+    zval = np.empty(n)
+    nb = np.empty(n, dtype=np.int64)
+    for i, p in enumerate(params):
+        tab[i] = _compute_multipole_params(p)
+        zval[i] = float(p.n_valence)
+        nb[i] = p.n_basis
+    return tab, zval, nb
+
+
+# Pair kinds as integers, in the order `two_center_integrals` classifies them.
+KIND_HH, KIND_XH, KIND_HX, KIND_XX = 0, 1, 2, 3
+
+
+def pair_kinds(nb, ia, ja):
+    """(P,) kind codes for pairs (ia, ja), matching `two_center_integrals`."""
+    a, b = nb[ia] == 1, nb[ja] == 1
+    return np.where(a & b, KIND_HH, np.where(a, KIND_HX, np.where(b, KIND_XH, KIND_XX)))
+
+
+def ri_batch_indexed(tab, zval, nb, ia, ja, R_bohr, kinds=None):
+    """(P, 22) local-frame integrals for pairs addressed by atom index.
+
+    The array-addressed twin of :func:`two_center_integrals_batch`: same
+    helpers, same column order, same grouping, no per-pair Python. HX is XH
+    with the pair reversed, exactly as the scalar and list forms handle it.
+    """
+    if kinds is None:
+        kinds = pair_kinds(nb, ia, ja)
+    ri = np.zeros((len(ia), 22))
+    for kind in (KIND_HH, KIND_XH, KIND_HX, KIND_XX):
+        sel = np.flatnonzero(kinds == kind)
+        if sel.size == 0:
+            continue
+        # For HX the heavy atom is the FIRST argument, as in the scalar routine.
+        first = ja[sel] if kind == KIND_HX else ia[sel]
+        second = ia[sel] if kind == KIND_HX else ja[sel]
+        A, B = tab[first], tab[second]
+        ZA, ZB, Rs = zval[first], zval[second], R_bohr[sel]
+        if kind == KIND_HH:
+            block, _ = _ri_core_hh(A[:, 2], B[:, 2], Rs, ZA, ZB)
+        elif kind == KIND_XX:
+            block, _ = _ri_core_xx(A[:, 0], B[:, 0], A[:, 1], B[:, 1],
+                                   A[:, 2], B[:, 2], A[:, 3], B[:, 3],
+                                   A[:, 4], B[:, 4], Rs, ZA, ZB)
+        else:
+            block, _ = _ri_core_xh(A[:, 0], A[:, 1], A[:, 2], B[:, 2],
+                                   A[:, 3], A[:, 4], Rs, ZA, ZB)
+        ri[sel[:, None], np.arange(block.shape[1])[None, :]] = block
+    return ri, kinds
+
+
 def two_center_integrals_batch(pair_params, R_ang):
     """Local-frame two-centre integrals for many pairs at once.
 

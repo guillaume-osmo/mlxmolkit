@@ -50,6 +50,43 @@ void augmented_overlap_axis(
   }
 }
 
+// ⚠️ The overlap alone, and the reason it is worth its own kernel: the
+// multipole version drives the 1-D recurrence to `la + 2` because the
+// QUADRUPOLES need those two extra rows, then throws them away when only S is
+// wanted. `S[i][j]` depends only on entries with a row index <= i, so
+// truncating `la_max` back to `la` leaves `S[la][lb]` bit-identical -- this is
+// the same arithmetic, not an approximation of it.
+void overlap_primitive(
+    double alpha_a,
+    const double* A,
+    const int32_t* la,
+    double alpha_b,
+    const double* B,
+    const int32_t* lb,
+    double& S_out) {
+  const double p = alpha_a + alpha_b;
+  const double mu = alpha_a * alpha_b / p;
+  const double P[3] = {
+      (alpha_a * A[0] + alpha_b * B[0]) / p,
+      (alpha_a * A[1] + alpha_b * B[1]) / p,
+      (alpha_a * A[2] + alpha_b * B[2]) / p,
+  };
+  const double dx = A[0] - B[0];
+  const double dy = A[1] - B[1];
+  const double dz = A[2] - B[2];
+  const double R2 = dx * dx + dy * dy + dz * dz;
+  const double base = std::pow(M_PI / p, 1.5) * std::exp(-mu * R2);
+
+  double Sx[6][6];
+  double Sy[6][6];
+  double Sz[6][6];
+  augmented_overlap_axis(p, P[0], A[0], B[0], la[0], lb[0], Sx);
+  augmented_overlap_axis(p, P[1], A[1], B[1], la[1], lb[1], Sy);
+  augmented_overlap_axis(p, P[2], A[2], B[2], la[2], lb[2], Sz);
+
+  S_out = base * Sx[la[0]][lb[0]] * Sy[la[1]][lb[1]] * Sz[la[2]][lb[2]];
+}
+
 void multipole_primitive(
     double alpha_a,
     const double* A,
@@ -285,6 +322,254 @@ void primitive_overlap_grad(
   dB[0] = base * (twob * sxbp - static_cast<double>(lb[0]) * sxbm) * sy * sz;
   dB[1] = base * sx * (twob * sybp - static_cast<double>(lb[1]) * sybm) * sz;
   dB[2] = base * sx * sy * (twob * szbp - static_cast<double>(lb[2]) * szbm);
+}
+
+PyObject* overlap_from_arrays(PyObject*, PyObject* args) {
+  PyObject* centers_obj = nullptr;
+  PyObject* lxyz_obj = nullptr;
+  PyObject* offsets_obj = nullptr;
+  PyObject* alphas_obj = nullptr;
+  PyObject* coeffs_obj = nullptr;
+
+  if (!PyArg_ParseTuple(args, "OOOOO", &centers_obj, &lxyz_obj, &offsets_obj,
+                        &alphas_obj, &coeffs_obj)) {
+    return nullptr;
+  }
+
+  PyArrayObject* centers = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(centers_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* lxyz = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(lxyz_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* offsets = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(offsets_obj, NPY_INTP, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* alphas = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(alphas_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* coeffs = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(coeffs_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+
+  if (!centers || !lxyz || !offsets || !alphas || !coeffs) {
+    Py_XDECREF(centers); Py_XDECREF(lxyz); Py_XDECREF(offsets);
+    Py_XDECREF(alphas); Py_XDECREF(coeffs);
+    return nullptr;
+  }
+
+  const npy_intp n = PyArray_DIM(centers, 0);
+  if (PyArray_NDIM(centers) != 2 || PyArray_DIM(centers, 1) != 3 ||
+      PyArray_NDIM(lxyz) != 2 || PyArray_DIM(lxyz, 1) != 3 ||
+      PyArray_DIM(lxyz, 0) != n || PyArray_NDIM(offsets) != 1 ||
+      PyArray_DIM(offsets, 0) != n + 1 || PyArray_NDIM(alphas) != 1 ||
+      PyArray_NDIM(coeffs) != 1 ||
+      PyArray_DIM(alphas, 0) != PyArray_DIM(coeffs, 0)) {
+    PyErr_SetString(PyExc_ValueError, "inconsistent basis arrays");
+    Py_DECREF(centers); Py_DECREF(lxyz); Py_DECREF(offsets);
+    Py_DECREF(alphas); Py_DECREF(coeffs);
+    return nullptr;
+  }
+
+  const auto fail = [&](const char* msg) -> PyObject* {
+    PyErr_SetString(PyExc_ValueError, msg);
+    Py_DECREF(centers); Py_DECREF(lxyz); Py_DECREF(offsets);
+    Py_DECREF(alphas); Py_DECREF(coeffs);
+    return nullptr;
+  };
+
+  const auto* centers_data = static_cast<const double*>(PyArray_DATA(centers));
+  const auto* lxyz_data = static_cast<const int32_t*>(PyArray_DATA(lxyz));
+  const auto* offsets_data = static_cast<const npy_intp*>(PyArray_DATA(offsets));
+  const auto* alphas_data = static_cast<const double*>(PyArray_DATA(alphas));
+  const auto* coeffs_data = static_cast<const double*>(PyArray_DATA(coeffs));
+
+  if (offsets_data[0] != 0 || offsets_data[n] != PyArray_DIM(alphas, 0)) {
+    return fail("offsets do not span the primitive arrays");
+  }
+  for (npy_intp mu = 0; mu < n; ++mu) {
+    const int32_t* lmu = lxyz_data + 3 * mu;
+    // ⚠️ The multipole kernel needs `l + 2` rows and checks against that; this
+    // one only needs `l`, but the bound is kept IDENTICAL so the two accept
+    // exactly the same basis sets and cannot diverge on an edge case.
+    if (lmu[0] + 2 >= 6 || lmu[1] + 2 >= 6 || lmu[2] + 2 >= 6) {
+      return fail("angular momentum is too large for this C++ kernel");
+    }
+  }
+
+  npy_intp s_dims[2] = {n, n};
+  PyObject* S_obj = PyArray_SimpleNew(2, s_dims, NPY_DOUBLE);
+  if (!S_obj) {
+    Py_DECREF(centers); Py_DECREF(lxyz); Py_DECREF(offsets);
+    Py_DECREF(alphas); Py_DECREF(coeffs);
+    return nullptr;
+  }
+  auto* S = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(S_obj)));
+  for (npy_intp i = 0; i < n * n; ++i) {
+    S[i] = 0.0;
+  }
+
+  for (npy_intp mu = 0; mu < n; ++mu) {
+    const double* A = centers_data + 3 * mu;
+    const int32_t* la = lxyz_data + 3 * mu;
+    const npy_intp mu0 = offsets_data[mu];
+    const npy_intp mu1 = offsets_data[mu + 1];
+
+    for (npy_intp nu = mu; nu < n; ++nu) {
+      const double* B = centers_data + 3 * nu;
+      const int32_t* lb = lxyz_data + 3 * nu;
+      const npy_intp nu0 = offsets_data[nu];
+      const npy_intp nu1 = offsets_data[nu + 1];
+
+      double S_mn = 0.0;
+      // Same loop order and same accumulation order as the multipole kernel:
+      // that is what keeps the result bit-identical to its `[0]`.
+      for (npy_intp i = mu0; i < mu1; ++i) {
+        for (npy_intp j = nu0; j < nu1; ++j) {
+          double s = 0.0;
+          overlap_primitive(alphas_data[i], A, la, alphas_data[j], B, lb, s);
+          S_mn += coeffs_data[i] * coeffs_data[j] * s;
+        }
+      }
+
+      S[mu * n + nu] = S_mn;
+      S[nu * n + mu] = S_mn;
+    }
+  }
+
+  Py_DECREF(centers); Py_DECREF(lxyz); Py_DECREF(offsets);
+  Py_DECREF(alphas); Py_DECREF(coeffs);
+  return S_obj;
+}
+
+// The vector-Jacobian product of the contracted overlap with respect to the
+// CONTRACTION COEFFICIENTS.
+//
+// `S_uv = sum_{i in u, j in v} c_i c_j s_ij` is BILINEAR in the coefficients
+// and the primitive integrals `s_ij` do not depend on them at all, so the
+// adjoint is the same double loop with one coefficient dropped:
+//
+//     dL/dc_i += w * c_j * s_ij      dL/dc_j += w * c_i * s_ij
+//
+// with `w` the incoming gradient on that block. ⚠️ The forward writes BOTH
+// `S[u][v]` and `S[v][u]` from one evaluation, so off the diagonal `w` must
+// collect both entries of the incoming gradient; on the diagonal it must not.
+//
+// This is the derivative the position-only `overlap_gradients_from_arrays`
+// does not provide, and in the g-xTB model it is not optional: the q-vSZP
+// contraction depends on the EEQ-BC charges, which depend on the geometry, so
+// omitting it leaves a force that is wrong by tens of percent while the energy
+// stays exact.
+PyObject* overlap_coeff_vjp_from_arrays(PyObject*, PyObject* args) {
+  PyObject* centers_obj = nullptr;
+  PyObject* lxyz_obj = nullptr;
+  PyObject* offsets_obj = nullptr;
+  PyObject* alphas_obj = nullptr;
+  PyObject* coeffs_obj = nullptr;
+  PyObject* gbar_obj = nullptr;
+
+  if (!PyArg_ParseTuple(args, "OOOOOO", &centers_obj, &lxyz_obj, &offsets_obj,
+                        &alphas_obj, &coeffs_obj, &gbar_obj)) {
+    return nullptr;
+  }
+
+  PyArrayObject* centers = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(centers_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* lxyz = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(lxyz_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* offsets = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(offsets_obj, NPY_INTP, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* alphas = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(alphas_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* coeffs = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(coeffs_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+  PyArrayObject* gbar = reinterpret_cast<PyArrayObject*>(
+      PyArray_FROM_OTF(gbar_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
+
+  if (!centers || !lxyz || !offsets || !alphas || !coeffs || !gbar) {
+    Py_XDECREF(centers); Py_XDECREF(lxyz); Py_XDECREF(offsets);
+    Py_XDECREF(alphas); Py_XDECREF(coeffs); Py_XDECREF(gbar);
+    return nullptr;
+  }
+
+  const auto release = [&]() {
+    Py_DECREF(centers); Py_DECREF(lxyz); Py_DECREF(offsets);
+    Py_DECREF(alphas); Py_DECREF(coeffs); Py_DECREF(gbar);
+  };
+  const auto fail2 = [&](const char* msg) -> PyObject* {
+    PyErr_SetString(PyExc_ValueError, msg);
+    release();
+    return nullptr;
+  };
+
+  const npy_intp n = PyArray_DIM(centers, 0);
+  const npy_intp np_ = PyArray_DIM(alphas, 0);
+  if (PyArray_NDIM(centers) != 2 || PyArray_DIM(centers, 1) != 3 ||
+      PyArray_NDIM(lxyz) != 2 || PyArray_DIM(lxyz, 1) != 3 ||
+      PyArray_DIM(lxyz, 0) != n || PyArray_NDIM(offsets) != 1 ||
+      PyArray_DIM(offsets, 0) != n + 1 || PyArray_NDIM(alphas) != 1 ||
+      PyArray_NDIM(coeffs) != 1 || PyArray_DIM(coeffs, 0) != np_ ||
+      PyArray_NDIM(gbar) != 2 || PyArray_DIM(gbar, 0) != n ||
+      PyArray_DIM(gbar, 1) != n) {
+    return fail2("inconsistent basis arrays or gradient shape");
+  }
+
+  const auto* centers_data = static_cast<const double*>(PyArray_DATA(centers));
+  const auto* lxyz_data = static_cast<const int32_t*>(PyArray_DATA(lxyz));
+  const auto* offsets_data = static_cast<const npy_intp*>(PyArray_DATA(offsets));
+  const auto* alphas_data = static_cast<const double*>(PyArray_DATA(alphas));
+  const auto* coeffs_data = static_cast<const double*>(PyArray_DATA(coeffs));
+  const auto* g_data = static_cast<const double*>(PyArray_DATA(gbar));
+
+  if (offsets_data[0] != 0 || offsets_data[n] != np_) {
+    return fail2("offsets do not span the primitive arrays");
+  }
+  for (npy_intp mu = 0; mu < n; ++mu) {
+    const int32_t* lmu = lxyz_data + 3 * mu;
+    if (lmu[0] + 2 >= 6 || lmu[1] + 2 >= 6 || lmu[2] + 2 >= 6) {
+      return fail2("angular momentum is too large for this C++ kernel");
+    }
+  }
+
+  npy_intp g_dims[1] = {np_};
+  PyObject* gc_obj = PyArray_SimpleNew(1, g_dims, NPY_DOUBLE);
+  if (!gc_obj) {
+    release();
+    return nullptr;
+  }
+  auto* gc = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(gc_obj)));
+  for (npy_intp i = 0; i < np_; ++i) {
+    gc[i] = 0.0;
+  }
+
+  for (npy_intp mu = 0; mu < n; ++mu) {
+    const double* A = centers_data + 3 * mu;
+    const int32_t* la = lxyz_data + 3 * mu;
+    const npy_intp mu0 = offsets_data[mu];
+    const npy_intp mu1 = offsets_data[mu + 1];
+
+    for (npy_intp nu = mu; nu < n; ++nu) {
+      const double* B = centers_data + 3 * nu;
+      const int32_t* lb = lxyz_data + 3 * nu;
+      const npy_intp nu0 = offsets_data[nu];
+      const npy_intp nu1 = offsets_data[nu + 1];
+
+      const double w = (mu == nu)
+                           ? g_data[mu * n + nu]
+                           : (g_data[mu * n + nu] + g_data[nu * n + mu]);
+      if (w == 0.0) {
+        continue;
+      }
+
+      for (npy_intp i = mu0; i < mu1; ++i) {
+        for (npy_intp j = nu0; j < nu1; ++j) {
+          double s = 0.0;
+          overlap_primitive(alphas_data[i], A, la, alphas_data[j], B, lb, s);
+          const double ws = w * s;
+          gc[i] += ws * coeffs_data[j];
+          gc[j] += ws * coeffs_data[i];
+        }
+      }
+    }
+  }
+
+  release();
+  return gc_obj;
 }
 
 PyObject* multipole_matrices_from_arrays(PyObject*, PyObject* args) {
@@ -1243,6 +1528,18 @@ PyMethodDef methods[] = {
         overlap_gradients_from_arrays,
         METH_VARARGS,
         "Compute float64 CAO overlap derivative tensors.",
+    },
+    {
+        "overlap_coeff_vjp_from_arrays",
+        overlap_coeff_vjp_from_arrays,
+        METH_VARARGS,
+        "Adjoint of the contracted overlap w.r.t. the contraction coefficients.",
+    },
+    {
+        "overlap_from_arrays",
+        overlap_from_arrays,
+        METH_VARARGS,
+        "Contracted CAO overlap only, without the dipole and quadrupole work.",
     },
     {nullptr, nullptr, 0, nullptr},
 };

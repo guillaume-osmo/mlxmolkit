@@ -2,7 +2,7 @@ import numpy as np
 
 from mlxmolkit.xtb.params_gxtb import (
     GXTB_PARAMS,
-    GXTB_REPULSION_LITERAL_BY_ADDR,
+    GXTB_REPULSION_LITERALS,
     GXTB_REPULSION_LITERAL_SEQUENCE,
     SHELL_LABELS,
 )
@@ -20,20 +20,29 @@ def test_gxtb_parameter_shapes_and_global_tables():
 
 
 def test_gxtb_repulsion_scalar_literals_from_add_repulsion():
-    expected = {
-        0x73B268: 1.5,
-        0x73B270: 2.068,
-        0x73B278: 2.0,
-        0x73B280: 0.73,
-        0x73B288: 0.0046511298,
-        0x73B290: 0.011607795128002491,
-        0x73B298: 0.011095539524126988,
-        0x73B2A0: 0.012098131381864387,
-        0x73B2A8: 0.008544252691968662,
-    }
+    """The constants the recovered repulsion routine uses, by name.
 
-    assert GXTB_REPULSION_LITERAL_BY_ADDR == expected
-    np.testing.assert_allclose(GXTB_REPULSION_LITERAL_SEQUENCE, tuple(expected.values()))
+    The two exponential powers and their scale and weight are what
+    ``damp = exp(-(rr**p1 * zz)) + exp(-(rr**p2 * zz * s)) * w`` needs; the
+    cubic and quartic coefficients multiply the polynomial in ``rad/r``.
+    ``erf_cn_steepness`` shares the block but belongs to the coordination
+    number, which is why it is not one of the repulsion powers.
+    """
+
+    lit = GXTB_REPULSION_LITERALS
+
+    assert lit["exp_power_1"] == 1.5
+    assert lit["exp_power_2"] == 2.0
+    assert lit["exp2_scale"] == 0.73
+    assert lit["exp2_weight"] == 0.0046511298
+    assert lit["cubic_coeff"] == 0.011095539524126988
+    assert lit["quartic_coeff"] == 0.011607795128002491
+    assert lit["erf_cn_steepness"] == 2.068
+
+    # The sequence is the block's own order, which the constants builder and
+    # the C++ extension both index positionally.
+    assert GXTB_REPULSION_LITERAL_SEQUENCE == tuple(lit.values())
+    assert len(GXTB_REPULSION_LITERAL_SEQUENCE) == 9
 
 
 def test_gxtb_h_c_o_s_element_views():

@@ -223,9 +223,14 @@ def test_known_defect_jacobi_solver_diverges_and_reports_nothing():
     assert n_iter == 200
     assert np.abs(q_jac - q_exact).max() > 1e-3
 
-    # And it gets worse, not better, with more iterations.
-    q_more, _, _ = _jacobi_diis_solve(A, rhs, max_iter=2000, tol=1e-10)
-    assert np.abs(q_more - q_exact).max() > np.abs(q_jac - q_exact).max()
+    # And more iterations do not rescue it. (Not "it gets strictly worse":
+    # after 2000 divergent sweeps the iterate is a chaotic function of the
+    # input -- a 1e-14 change in the PM6 density flipped the old strict
+    # comparison from 0.1197 > 0.1163 to the reverse -- so the stable
+    # statement is that the error is still large, not that it grew.)
+    q_more, _, converged_more = _jacobi_diis_solve(A, rhs, max_iter=2000, tol=1e-10)
+    assert not converged_more
+    assert np.abs(q_more - q_exact).max() > 1e-3
 
 
 @pytest.mark.slow

@@ -55,11 +55,10 @@ try:
 except ImportError:
     _HAVE_GXTB_CPP = False
 
-_ONECX = (_pathlib.Path(__file__).resolve().parent.parent
-          / "data" / "gxtb_onecxints_extracted.npz")
+from mlxmolkit.xtb.gxtb_aes import _ONECX_PATH
+_ONECX = _pathlib.Path(_ONECX_PATH)
 
-# The extension needs `build_ext --inplace` and the .npz is untracked, so
-# neither is present in a clean clone.
+# The table ships as package data; source checkouts need build_ext --inplace.
 _needs_gxtb_cpp = pytest.mark.skipif(
     not _HAVE_GXTB_CPP or not _ONECX.exists(),
     reason=f"needs the _gxtb_cpp extension (built={_HAVE_GXTB_CPP}) and "

@@ -1,20 +1,18 @@
 # Copyright (c) 2026 Guillaume
 # SPDX-License-Identifier: MIT
 
-"""Clean-room g-xTB parameter accessors from the release binary.
+"""Typed accessors for the g-xTB v2.0.1 element parameters.
 
-The data in ``params/gxtb_binary_params.npz`` is extracted from the public
-g-xTB release ``libxtb.dylib`` symbol table/constant section by
-``tools/gxtb_disasm_pseudocpp.py``. This module intentionally does not claim
-to be a source port of save_tblite; it is a typed, testable view of the
-constants we can observe from the binary.
+The tables live in ``params/gxtb_v2.npz`` under the reference
+implementation's own names: ``pa_*`` per atom, ``ps_*`` per shell, ``pg_*``
+global per angular momentum. This module is a typed, testable view of those
+constants, not a source port.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import json
 import os
 from typing import Mapping
 
@@ -25,21 +23,25 @@ SHELL_LABELS = ("s", "p", "d", "f")
 SHELL_ANGULAR = (0, 1, 2, 3)
 MAX_Z = 103
 
-GXTB_REPULSION_LITERAL_BY_ADDR = {
-    0x73B268: 1.5,
-    0x73B270: 2.068,
-    0x73B278: 2.0,
-    0x73B280: 0.73,
-    0x73B288: 0.0046511298,
-    0x73B290: 0.011607795128002491,
-    0x73B298: 0.011095539524126988,
-    0x73B2A0: 0.012098131381864387,
-    0x73B2A8: 0.008544252691968662,
+#: The nine literals the reference implementation keeps in one block for the
+#: repulsion, in its own order. ``erf_cn_steepness`` is the odd one out: it
+#: belongs to the erf coordination number, not to the repulsion, and only
+#: shares the block.
+GXTB_REPULSION_LITERALS = {
+    "exp_power_1": 1.5,
+    "erf_cn_steepness": 2.068,
+    "exp_power_2": 2.0,
+    "exp2_scale": 0.73,
+    "exp2_weight": 0.0046511298,
+    "quartic_coeff": 0.011607795128002491,
+    "cubic_coeff": 0.011095539524126988,
+    "light_pair_coeff": 0.012098131381864387,
+    "heavy_pair_coeff": 0.008544252691968662,
 }
 
-GXTB_REPULSION_LITERAL_SEQUENCE = tuple(GXTB_REPULSION_LITERAL_BY_ADDR.values())
+GXTB_REPULSION_LITERAL_SEQUENCE = tuple(GXTB_REPULSION_LITERALS.values())
 
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "params", "gxtb_binary_params.npz")
+from .param_archive import ARCHIVE_PATH as _DATA_PATH, load_tables  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -103,20 +105,12 @@ class GXTBElementParams:
 class GXTBParameterSet:
     """Typed access to extracted g-xTB release constants."""
 
-    def __init__(self, arrays: Mapping[str, np.ndarray], meta: tuple[dict, ...] = ()) -> None:
+    def __init__(self, arrays: Mapping[str, np.ndarray]) -> None:
         self.arrays = dict(arrays)
-        self.meta = meta
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "GXTBParameterSet":
-        if path is None:
-            path = _DATA_PATH
-        with np.load(path, allow_pickle=False) as data:
-            arrays = {name: data[name].copy() for name in data.files if name != "__meta_json__"}
-            meta: tuple[dict, ...] = ()
-            if "__meta_json__" in data.files:
-                meta = tuple(json.loads(str(data["__meta_json__"])))
-        return cls(arrays, meta)
+        return cls(load_tables("gxtb", path))
 
     def __getitem__(self, name: str) -> np.ndarray:
         return self.arrays[name]

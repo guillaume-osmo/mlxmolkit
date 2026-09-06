@@ -1,0 +1,47 @@
+................................s....................................... [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+............................s........................................... [ 32%]
+........s............................................................... [ 38%]
+..................................x..................................... [ 44%]
+........................................................................ [ 51%]
+........................................................................ [ 57%]
+........................................................................ [ 64%]
+........................................................................ [ 70%]
+........................................................................ [ 77%]
+........................................................................ [ 83%]
+........................................................................ [ 89%]
+....................sssssss.ssss........................................ [ 96%]
+..........ssssssss.......x...x....x......                                [100%]
+=============================== warnings summary ===============================
+tests/test_cosmo.py::test_activity_coefficients_pure_component_reference_is_zero
+tests/test_cosmo.py::test_activity_coefficients_identical_components_are_ideal
+  <checkout>/mlxmolkit/cosmo/cosmors.py:219: RuntimeWarning: overflow encountered in exp
+    tau = np.exp(-A_int / (_P.R_GAS * T))
+
+tests/test_cosmo_integration.py::test_ddcosmo_cavity_is_solver_independent
+  <checkout>/mlxmolkit/cosmo/ddcosmo.py:479: RuntimeWarning: Jacobi/DIIS did not converge in 200 iterations on a 883-segment COSMO matrix; falling back to a direct solve. The COSMO matrix is not diagonally dominant, so this is expected — prefer solver='direct' or 'sh'.
+    seg_charge = ddcosmo_charges(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_cross_toolkit.py:19: PYSEQM not installed
+SKIPPED [1] tests/test_xtb_alpb_optimize.py:9: could not import 'tblite.interface': No module named 'tblite'
+SKIPPED [1] tests/test_alpb_native.py:83: needs the optional 'dftd4' package (conda install -c conda-forge dftd4-python)
+SKIPPED [1] tests/test_dispersion_d4_gradient.py:26: needs the optional 'dftd4' package (conda install -c conda-forge dftd4-python)
+SKIPPED [1] tests/test_gradient_aes_gfn2.py:24: needs the optional 'dftd4' package (conda install -c conda-forge dftd4-python)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:197: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:200: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:223: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:203: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:228: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:218: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [1] tests/test_semiempirical_mopac_parity.py:206: needs OpenMOPAC at <conda>/bin/mopac and the AM1-BCC table (mopac=True, bcc_table=False)
+SKIPPED [4] tests/test_sigma_features_binary_pipeline.py:176: no xtb build accepting --gxtb was found (set MLXMOLKIT_XTB to one)
+SKIPPED [8] tests/test_xtb_eeq.py:22: could not import 'xtb': No module named 'xtb'
+XFAIL tests/test_gxtb_reconstructed.py::test_reconstructed_repulsion_builder_uses_geometric_rvdw_scale_and_k1_linear - the builder combines the rvdw scales arithmetically while this module documents a geometric combination; the two agree for homonuclear pairs and the reference pair-radius table that would settle the heteronuclear case is not available
+XFAIL tests/test_xtb_energy_smoke.py::test_h2o_runs_and_yields_sane_energies - n_basis is 8, not the 6 this test expects: the comment says 'with auxiliary shells skipped', so either the auxiliary shells are no longer skipped or the expectation is stale. See #63.
+XFAIL tests/test_xtb_energy_smoke.py::test_dispersion_and_srb_flagged_as_deferred - dispersion_eV is 0.0, not None. The test pins a 'Phase A0' contract where unimplemented terms surface None so consumers ignore them; 0.0 is silently indistinguishable from a computed zero. See #63.
+XFAIL tests/test_xtb_params.py::test_carbon_shells - carbon KCNS parses as -0.55477603 against an expected -5.5477603 — exactly 10x, so a parser field-width or scaling error rather than drift. Whichever side is wrong, GFN0 carbon is currently using one of them. See #63.
+1095 passed, 24 skipped, 4 xfailed, 3 warnings in 69.71s (0:01:09)

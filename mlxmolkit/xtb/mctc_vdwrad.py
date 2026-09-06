@@ -12,7 +12,7 @@ import numpy as np
 
 
 MAX_Z = 103
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "params", "mctc_vdwrad.npz")
+from .param_archive import ARCHIVE_PATH as _DATA_PATH, load_tables  # noqa: E402
 
 
 @lru_cache(maxsize=1)
@@ -26,8 +26,7 @@ def load_mctc_vdwrad_packed() -> np.ndarray:
     Values are pair radii in Bohr. The diagonal is twice the atomic vdW radius.
     """
 
-    with np.load(_DATA_PATH, allow_pickle=False) as data:
-        packed = np.asarray(data["vdwrad_pair_packed"], dtype=np.float64)
+    packed = np.asarray(load_tables("mctc")["vdwrad_pair_packed"], dtype=np.float64)
     expected = MAX_Z * (MAX_Z + 1) // 2
     if packed.shape != (expected,):
         raise ValueError(f"expected {expected} packed vdW radii, got shape {packed.shape}")

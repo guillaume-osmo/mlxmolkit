@@ -12,12 +12,12 @@ with GFN2 — i.e. the same charge-dipole
 
 g-xTB differs from GFN2 only in:
   * the pair damping (``get_damping_pair``): erf switching on ``R - mrad_pair``
-    instead of GFN2's polynomial.  Verified form (binary 0x73b550..0x73b570):
+    instead of GFN2's polynomial.  Verified form:
         damp_k = mag_k * 0.5 * (1 + erf((R_ij - mrad_pair_ij) * scale_k))
     channels (mag, scale): (0.3405910191, 0.5), (0.1691310614, 1.0),
                            (0.074034339, 1.0), (-0.02, 1.0)
   * the multipole radius:  mrad_pair[i,j] = vdw_pair(Zi,Zj) * avg(rvdw_scale_i, rvdw_scale_j)
-    (averager = the geometric/general one at binary 0x73b480)
+    (averager = the geometric/general one)
   * a CT/polarization kernel scaled by ``pa_aes_dip_scale`` (get_kernel_*).
 
 NB the precise channel->term mapping and the CT kernel are still being calibrated
@@ -36,7 +36,7 @@ from .multipole_integrals import multipole_matrices
 from .mctc_vdwrad import mctc_vdw_pair_matrix_bohr
 from .params_gxtb import GXTB_PARAMS
 
-# Binary-exact AES damping channels (libxtb __const 0x73b550..0x73b570).
+# AES damping channels, exact against the reference implementation.
 GXTB_AES_DAMP_MAG = np.array([0.3405910191, 0.1691310614, 0.074034339, -0.02])
 GXTB_AES_DAMP_SCALE = np.array([0.5, 1.0, 1.0, 1.0])
 
@@ -142,7 +142,7 @@ import numpy as _np
 import os as _os
 
 _ONECX_PATH = _os.path.join(
-    _os.path.dirname(__file__), "..", "..", "data", "gxtb_onecxints_extracted.npz"
+    _os.path.dirname(__file__), "data", "gxtb_onecxints_extracted.npz"
 )
 
 # This table is an extraction artifact with no regeneration script: `git log --
@@ -158,9 +158,8 @@ _ONECX_PATH = _os.path.join(
 # use_aes, use_aniso_h0 and use_twobody_third_order -- while the test suite
 # stayed green by skipping on the same missing file.
 #
-# The source data also survives in the shipped binary
-# (___tblite_data_onecxints_MOD_get_onecxints_{number,symbol} in libxtb.dylib),
-# so it is re-derivable the way the other tables were.
+# The reference implementation carries the same table, so it is
+# re-derivable the way the other parameter tables were.
 _ONEC = None
 
 
@@ -172,9 +171,9 @@ def _onecx_tables():
             raise FileNotFoundError(
                 f"g-xTB one-centre exchange table not found: {_ONECX_PATH}\n"
                 "The terms that need it (use_aes, use_aniso_h0, "
-                "use_twobody_third_order) cannot run without it. Re-extract from "
-                "___tblite_data_onecxints_MOD_get_onecxints_* in the g-xTB "
-                "libxtb.dylib, following tools/extract_qvszp_params.py."
+                "use_twobody_third_order) cannot run without it. "
+                "Restore mlxmolkit/xtb/data/gxtb_onecxints_extracted.npz "
+                "from the matching release or reinstall mlxmolkit."
             )
         _ONEC = _np.load(_ONECX_PATH)
     return _ONEC["onecxints"], _ONEC["lidx"]   # (103, 10), (4, 4)

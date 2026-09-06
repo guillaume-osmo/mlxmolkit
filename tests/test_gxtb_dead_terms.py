@@ -43,18 +43,19 @@ def test_gxtb_aes_imports_without_the_untracked_table():
     assert hasattr(gxtb_aes, "_onecx_tables")
 
 
-@pytest.mark.skipif(
-    gxtb_aes._os.path.exists(gxtb_aes._ONECX_PATH),
-    reason="the onecxints table is present here, so the missing-file path cannot be exercised",
-)
-def test_missing_onecx_table_explains_itself():
+def test_missing_onecx_table_explains_itself(monkeypatch, tmp_path):
+    # Exercise this even on a complete installation, without moving the
+    # user's real parameter table or retaining a cache from another test.
+    monkeypatch.setattr(gxtb_aes, '_ONEC', None)
+    monkeypatch.setattr(gxtb_aes, '_ONECX_PATH',
+                        str(tmp_path / 'gxtb_onecxints_extracted.npz'))
     with pytest.raises(FileNotFoundError) as excinfo:
         gxtb_aes._onecx_tables()
     msg = str(excinfo.value)
     assert "gxtb_onecxints_extracted.npz" in msg
     # It must say what breaks and how to get the table back, not just print a path.
     assert "use_aes" in msg
-    assert "libxtb" in msg
+    assert "Restore" in msg
 
 
 @pytest.mark.parametrize(
@@ -73,9 +74,11 @@ def test_previously_dead_term_runs(flag):
 def test_previously_dead_term_actually_changes_the_density(flag):
     """A term that runs but moves nothing would be dead in a subtler way.
 
-    ``use_aniso_h0`` is deliberately excluded: on water it shifts q(O) by only
-    ~0.002 e, which is real but too small to assert as a guard.
+    ⚠️ Switched around: these terms are ON in the default configuration now,
+    so enabling them is a no-op and the question is whether DISABLING them
+    moves anything. ``use_aniso_h0`` stays excluded: on water it shifts q(O)
+    by only ~0.002 e, which is real but too small to assert as a guard.
     """
     base = _q()
-    with_term = _q(**{flag: True})
-    assert np.abs(with_term - base).max() > 1e-3
+    without_term = _q(**{flag: False})
+    assert np.abs(without_term - base).max() > 1e-3

@@ -17,6 +17,11 @@ except Exception:  # pragma: no cover - depends on local extension build
 
 CPP_AVAILABLE = _multipole_cpp is not None
 
+_NOT_BUILT = (
+    "mlxmolkit.xtb._multipole_cpp is not built. Run "
+    "`python setup.py build_ext --inplace` first."
+)
+
 
 def multipole_matrices_cpp(
     basis: list[BasisFunction],
@@ -36,6 +41,41 @@ def multipole_matrices_cpp(
         offsets,
         alphas,
         coeffs,
+    )
+
+
+def overlap_matrix_cpp(basis):
+    """The contracted CAO overlap alone, from the C++ kernel.
+
+    WARNING: `multipole_matrices_cpp(basis)[0]` returns the same matrix -- and
+    pays for three dipole and six quadrupole matrices to do it, plus the two
+    extra rows of the 1-D recurrence that only the quadrupoles need. The two
+    are bit-identical; it is the caller that has to pick the cheaper one.
+    """
+    if _multipole_cpp is None:
+        raise ImportError(_NOT_BUILT)
+    centers, lxyz, offsets, alphas, coeffs = _basis_arrays(basis)
+    return _multipole_cpp.overlap_from_arrays(
+        centers, lxyz, offsets, alphas, coeffs
+    )
+
+
+def overlap_coeff_vjp_cpp(basis, gbar):
+    """Adjoint of the contracted overlap w.r.t. the contraction coefficients.
+
+    `gbar` is the incoming gradient on S, shape (n, n); the result is one
+    number per PRIMITIVE, in the order `_basis_arrays` flattens them.
+
+    This is the derivative `overlap_gradient_cpp` does not provide: that one
+    differentiates the two CENTRES. In g-xTB the q-vSZP contraction depends on
+    the EEQ-BC charges, which depend on the geometry, so a force built from
+    positions alone is wrong by tens of percent while the energy stays exact.
+    """
+    if _multipole_cpp is None:
+        raise ImportError(_NOT_BUILT)
+    centers, lxyz, offsets, alphas, coeffs = _basis_arrays(basis)
+    return _multipole_cpp.overlap_coeff_vjp_from_arrays(
+        centers, lxyz, offsets, alphas, coeffs, np.ascontiguousarray(gbar, dtype=np.float64)
     )
 
 

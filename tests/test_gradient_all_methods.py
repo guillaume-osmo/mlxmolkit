@@ -25,7 +25,7 @@ from mlxmolkit.nddo.scf import nddo_energy
 RDLogger.DisableLog("rdApp.*")
 
 # One from each core-core family, plus a d-bearing molecule for the spd path.
-METHODS = ["RM1", "AM1", "PM3", "PM6"]
+METHODS = ["MNDO", "RM1", "AM1", "PM3", "PM6"]
 STEP = 1e-4
 # Central differences carry their own O(step^2) truncation error, so this is a
 # bound on agreement, not on the analytic gradient alone.

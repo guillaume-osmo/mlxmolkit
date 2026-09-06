@@ -10,6 +10,7 @@ Two regressions are covered:
 import importlib
 
 import numpy as np
+import pytest
 
 
 def test_module_imports_without_touching_the_table():
@@ -25,6 +26,16 @@ def test_table_ships_with_the_repo():
         "gxtb_onecxints_extracted.npz is missing; it has no regeneration script, "
         "so it must be committed"
     )
+    from importlib.resources import files
+    assert files('mlxmolkit.xtb').joinpath('data/gxtb_onecxints_extracted.npz').is_file()
+
+
+def test_solver_cannot_silently_drop_missing_onsite_exchange(monkeypatch, tmp_path):
+    from mlxmolkit.xtb import gxtb_aes, gxtb_scf
+    monkeypatch.setattr(gxtb_aes, '_ONEC', None)
+    monkeypatch.setattr(gxtb_aes, '_ONECX_PATH', str(tmp_path / 'missing.npz'))
+    with pytest.raises(FileNotFoundError, match='one-centre exchange table'):
+        gxtb_scf._install_onecxints()
 
 
 def test_table_shapes_and_content():

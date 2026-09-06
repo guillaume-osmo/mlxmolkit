@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import json
 import os
 from typing import Mapping
 
@@ -19,7 +18,7 @@ MAX_SHELLS = 4
 MAX_PRIM = 12
 SHELL_LABELS = ("s", "p", "d", "f")
 
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "params", "qvszp_binary_params.npz")
+from .param_archive import ARCHIVE_PATH as _DATA_PATH, load_tables  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -49,20 +48,12 @@ class QVSZPElement:
 class QVSZPParameterSet:
     """Binary q-vSZP basis constants in element/shell/primitive layout."""
 
-    def __init__(self, arrays: Mapping[str, np.ndarray], meta: tuple[dict, ...] = ()) -> None:
+    def __init__(self, arrays: Mapping[str, np.ndarray]) -> None:
         self.arrays = dict(arrays)
-        self.meta = meta
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "QVSZPParameterSet":
-        if path is None:
-            path = _DATA_PATH
-        with np.load(path, allow_pickle=False) as data:
-            arrays = {name: data[name].copy() for name in data.files if name != "__meta_json__"}
-            meta: tuple[dict, ...] = ()
-            if "__meta_json__" in data.files:
-                meta = tuple(json.loads(str(data["__meta_json__"])))
-        return cls(arrays, meta)
+        return cls(load_tables("qvszp", path))
 
     def __getitem__(self, name: str) -> np.ndarray:
         return self.arrays[name]

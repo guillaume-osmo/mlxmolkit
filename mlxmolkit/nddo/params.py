@@ -61,6 +61,14 @@ class ElementParams:
     Udd: float = 0.0         # d orbital one-electron integral (eV)
     zeta_d: float = 0.0      # d orbital Slater exponent (Bohr^-1)
     beta_d: float = 0.0      # d orbital resonance integral (eV)
+    # ⚠️ The one-centre "tail" exponents (MOPAC's zsn/zpn/zdn), which a
+    # d-bearing atom uses for its one-centre two-electron integrals and its
+    # multipole charge separations INSTEAD of zeta_s/p/d. They belong to the
+    # METHOD's parameter set: PM6-ORG ships its own (S: 2.10/0.65/1.75 in its
+    # CSV), and looking every method up in the PM6 table put PM6-ORG's sulfur
+    # 2.7e-02 e from MOPAC and its phosphorus 2.2e-02 while its sp atoms sat at
+    # 2e-04. None -> fall back to the PM6 table (unchanged PM6 behaviour).
+    tail_exponents: tuple | None = None
     F0SD: float = 0.0        # Slater-Condon F0 for s-d interaction
     G2SD: float = 0.0        # Slater-Condon G2 for s-d interaction
     has_d: bool = False       # True if element uses d-orbitals in PM6

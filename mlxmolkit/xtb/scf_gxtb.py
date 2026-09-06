@@ -31,7 +31,7 @@ GXTB_TB3_KX = 1.3
 GXTB_TB3_REXP = 0.2093327496
 # 4th-order onsite hardness Gamma4_sh = shell_fourth * K4TH_SCALE, where
 # shell_fourth = pg_tb4_kshell[l] (NO pa_tb3_hubbard_derivs factor; see gxtb_basis).
-# Binary-exact: add_coulomb 0x41a0b4 loads DAT_005dbbe8 = 0.036 and multiplies
+# Exact against the reference implementation: add_coulomb scales by 0.036 and multiplies
 # pg_tb4_kshell directly -- no per-element hubbard factor. Energy = sum q^4 Gamma4/24,
 # potential = q^3 Gamma4/6 (the /6 and /24 below are the only divisors).
 GXTB_K4TH_SCALE = 0.036
@@ -41,7 +41,7 @@ GXTB_TB1_KS = 0.666666666
 GXTB_TB1_CN_EPS = 1.0e-12
 # Mulliken-Fock-exchange range-separation scalars. VERIFIED against the released
 # g-xTB binary: the exact constants new_exchange_fock receives are baked at
-# libxtb __const 0x73b4d8.. = {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
+# {gexp=1.38265972, lrscale=0.85, omega=0.2, frscale=0.15}.
 # NB: the public gp3.f90 source declares fock_omega=0.300, but that branch is STALE;
 # the released binary uses omega=0.2 (this value). Binary is authoritative.
 GXTB_MFX_FR_SCALE = 0.15
@@ -413,14 +413,14 @@ def _first_order_offsite(
     charge-independent, so it shifts every shell diagonal by O(xvec / R) with no
     feedback, and the magnitude is far too large: on water,
     ``use_first_order=True, use_first_order_offsite=True`` drives q(O) to -2.40
-    against the binary's -0.6312 (see tools/gxtb_charge_oracle.py).  The missing
-    piece is whatever scaling ``new_effective_coulomb`` applies to the x-vector;
-    until that is recovered from the binary this term is a placeholder.
+    against the reference implementation's -0.6312.  The missing piece is
+    whatever scaling ``new_effective_coulomb`` applies to the x-vector; until
+    that is settled this term is a placeholder.
 
     This went unnoticed because ``gxtb_energy`` gates the flag as
-    ``if use_first_order and use_first_order_offsite`` while every sweep arm in
-    tools/gxtb_flag_sweep.py used to pass only the second flag — so the term was
-    never actually executed by a benchmark.
+    ``if use_first_order and use_first_order_offsite`` while every benchmark arm
+    used to pass only the second flag — so the term was never actually
+    executed.
     """
 
     n_shell = shell_atom.size
@@ -444,7 +444,7 @@ def _first_order_offsite(
     return energy, potential
 
 
-def gxtb_energy(
+def _gxtb_energy_legacy(
     atomic_numbers: list[int] | np.ndarray,
     coords_ang: np.ndarray,
     *,
@@ -487,9 +487,8 @@ def gxtb_energy(
     p-ACP are explicit fallback/proxy components until their exact kernels are
     extracted.
 
-    Atomic-charge accuracy against the real ``xtb --gxtb`` binary, 20 molecules /
-    516 atoms, measured by tools/gxtb_charge_oracle.py (all with D4Srev off,
-    which cannot move a charge):
+    Atomic-charge accuracy against ``xtb --gxtb``, 20 molecules / 516 atoms
+    (all with D4Srev off, which cannot move a charge):
 
     ==================  =======  =======  =======  =======
     combo                   MAE     RMSE      max    s/mol
@@ -626,7 +625,7 @@ def gxtb_energy(
                     from .gxtb_aes import gxtb_onsite_potential
                     V_os = gxtb_onsite_potential(P, S, basis, atoms)
                 if onsite_diag == 2:
-                    # EXACT get_kfock fold (disasm-derived): M = 0.25*OS(V)+0.5*OS(V)+0.25*diag(V)
+                    # Exact get_kfock fold: M = 0.25*OS(V)+0.5*OS(V)+0.25*diag(V)
                     # where OS(V)[j,i]=V[i]*S[j,i] (overlap-sandwich daxpy column form);
                     # then fock = -0.125*(M+M^T) off-diag, -0.25*M diag.
                     M = 0.75 * (S * V_os[None, :])
@@ -901,3 +900,19 @@ def gxtb_energy_gradient(
         **energy_kwargs,
     )
     return res
+
+
+# ---------------------------------------------------------------------------
+# The g-xTB solver proper lives in `gxtb_scf`. The entry point below keeps
+# this module's public name and applies the validated configuration as its
+# defaults; any keyword the caller passes takes precedence.
+# ---------------------------------------------------------------------------
+from . import gxtb_scf as _gxtb_scf  # noqa: E402
+
+
+def gxtb_energy(atomic_numbers, coords_ang, **kwargs):
+    """g-xTB single point. See :func:`gxtb_scf.gxtb_energy` for the keywords."""
+
+    cfg = dict(_gxtb_scf.SOLVE_KWARGS)
+    cfg.update(kwargs)
+    return _gxtb_scf.gxtb_energy(atomic_numbers, coords_ang, **cfg)

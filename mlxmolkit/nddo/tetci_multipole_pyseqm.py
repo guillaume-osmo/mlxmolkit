@@ -186,8 +186,12 @@ def pyseqm_d_params(pA) -> dict:
     zeta_s = pA.zeta_s
     zeta_p = pA.zeta_p
     zeta_d = pA.zeta_d
-    # TAIL exponents (for Slater-Condon parameters in _pm6_d_param_from_key)
-    if z in PM6_TAIL_EXPONENTS:
+    # TAIL exponents (for Slater-Condon parameters in _pm6_d_param_from_key).
+    # ⚠️ The element's OWN set first: PM6-ORG ships its own tails, and looking
+    # every method up in the PM6 table put its S and P 2-3e-02 e from MOPAC 23.
+    if getattr(pA, "tail_exponents", None):
+        zs_tail, zp_tail, zd_tail = pA.tail_exponents
+    elif z in PM6_TAIL_EXPONENTS:
         zs_tail, zp_tail, zd_tail = PM6_TAIL_EXPONENTS[z]
     else:
         # Fall back to main exponents for non-PM6-tail elements

@@ -100,6 +100,7 @@ include = ["mlxmolkit", "mlxmolkit.*", "opencheese", "opencheese.*"]
 mlxmolkit = [
     "*.metal",
     "nddo/data/*.csv",
+    "nddo/data/*.txt",
     "nddo/data/*.npz",
     # riYY_table.json sits at nddo/ level, not under nddo/data/ — the old
     # "rm1/*.json" glob was for exactly this file.
@@ -108,6 +109,9 @@ mlxmolkit = [
     # g-xtb / GFN parameter tables, added with mlxmolkit/xtb/.
     "xtb/params/*.npz",
     "xtb/params/gfn0/*.txt",
+    # D4Srev reference tables live under xtb/data/, not xtb/params/.
+    "xtb/data/*.npz",
+    "xtb/data/*.npy",
 ]
 
 [tool.pytest.ini_options]

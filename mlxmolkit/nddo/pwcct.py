@@ -230,6 +230,7 @@ _CTB_PARAM1 = -5.0
 _CTB_PARAM2 = 25.0
 
 
+
 def c_triple_bond_correction(atoms, coords) -> float:
     """MOPAC's `C_triple_bond_C`, in kcal/mol.
 
@@ -255,21 +256,22 @@ def c_triple_bond_correction(atoms, coords) -> float:
     Returns:
         The correction in kcal/mol — zero for anything without a short C-C bond.
     """
-    carbons = [i for i, z in enumerate(atoms) if int(z) == 6]
-    if len(carbons) < 2:
+    carbons = np.flatnonzero(np.asarray(atoms, dtype=np.int64) == 6)
+    if carbons.size < 2:
         return 0.0
-    xyz = np.asarray(coords, dtype=np.float64)
-    total = 0.0
-    for a in range(len(carbons)):
-        for b in range(a):
-            r = float(np.linalg.norm(xyz[carbons[a]] - xyz[carbons[b]]))
-            if r < _CTB_RMIN:
-                total += 1.0
-            elif r < _CTB_RMAX:
-                t = (r - _CTB_RMIN) / (_CTB_RMAX - _CTB_RMIN)
-                total += (1.0 - 10.0 * t ** 3 + 15.0 * t ** 4 - 6.0 * t ** 5
-                          + (_CTB_PARAM1 + t * _CTB_PARAM2)
-                          * (t ** 3 - 3.0 * t ** 4 + 3.0 * t ** 5 - t ** 6))
+    xyz = np.asarray(coords, dtype=np.float64)[carbons]
+    # Only the pairs inside the taper can contribute, and there are a handful of
+    # them; the Python loop this replaces ran over all C(C-1)/2 -- 561 pairs on
+    # a 34-carbon molecule -- with a norm call each.
+    d = xyz[:, None, :] - xyz[None, :, :]
+    r = np.sqrt(np.einsum('abc,abc->ab', d, d))[np.triu_indices(carbons.size, 1)]
+    total = float((r < _CTB_RMIN).sum())
+    t = r[(r >= _CTB_RMIN) & (r < _CTB_RMAX)]
+    if t.size:
+        t = (t - _CTB_RMIN) / (_CTB_RMAX - _CTB_RMIN)
+        total += float((1.0 - 10.0 * t ** 3 + 15.0 * t ** 4 - 6.0 * t ** 5
+                        + (_CTB_PARAM1 + t * _CTB_PARAM2)
+                        * (t ** 3 - 3.0 * t ** 4 + 3.0 * t ** 5 - t ** 6)).sum())
     return total * C_TRIPLE_BOND_KCAL
 
 
@@ -283,28 +285,43 @@ def c_triple_bond_correction(atoms, coords) -> float:
 HTYPE_PM6 = 2.5000   # moldat.F90: `if (method_pm6) htype = 2.5000D0`
 
 
-def _bonded(atoms, coords, scale: float = 1.25):
+
+def _bonded(atoms, coords, scale: float = 1.25, dist=None):
     """Neighbour lists from covalent radii.
 
     MOPAC carries its own `nbonds`/`ibonds`; this reconstructs the same
     connectivity from geometry, which is what the corrections below need in
     order to ask "does this nitrogen have exactly three ligands".
+
+    `dist`: the (n, n) distance matrix when the caller already has it.
+
+    The pair loop this replaces did one `np.linalg.norm` per pair -- 5565 of
+    them on a 106-atom molecule, 9 ms, more than the whole Fock build. The
+    neighbour lists come out in ascending index order, which is what the loop
+    produced too: an atom's smaller-indexed partners were appended on earlier
+    outer iterations, its larger-indexed ones on its own.
     """
     from .pm6_d3h4 import RCOV
 
-    xyz = np.asarray(coords, dtype=np.float64)
-    n = len(atoms)
+    atoms = np.asarray(atoms, dtype=np.int64)
+    n = atoms.size
     radii = np.array([RCOV[int(z)] if int(z) < len(RCOV) else 1.5 for z in atoms])
-    neighbours = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if np.linalg.norm(xyz[i] - xyz[j]) < scale * (radii[i] + radii[j]):
-                neighbours[i].append(j)
-                neighbours[j].append(i)
-    return neighbours
+    if dist is None:
+        dist = _distance_matrix(coords)
+    adj = dist < scale * (radii[:, None] + radii[None, :])
+    np.fill_diagonal(adj, False)
+    return [np.flatnonzero(row).tolist() for row in adj]
 
 
-def nsp2_correction(atoms, coords) -> float:
+def _distance_matrix(coords):
+    """(n, n) Euclidean distances. The three corrections below share one."""
+    xyz = np.asarray(coords, dtype=np.float64)
+    d = xyz[:, None, :] - xyz[None, :, :]
+    return np.sqrt(np.einsum('abc,abc->ab', d, d))
+
+
+
+def nsp2_correction(atoms, coords, dist=None) -> float:
     """MOPAC's `nsp2_correction`, in kcal/mol.
 
     Port of openMOPAC v23 ``src/corrections/set_up_dentate.F90``. Every nitrogen
@@ -320,18 +337,20 @@ def nsp2_correction(atoms, coords) -> float:
     Args:
         atoms: atomic numbers.
         coords: (n, 3) in Angstrom.
+        dist: the (n, n) distance matrix, when the caller already has it.
 
     Returns:
         The correction in kcal/mol, zero when no qualifying nitrogen is present.
     """
+    z = np.asarray(atoms, dtype=np.int64)
+    if not (z == 7).any():
+        return 0.0
     xyz = np.asarray(coords, dtype=np.float64)
-    neighbours = _bonded(atoms, xyz)
+    neighbours = _bonded(z, xyz, dist=dist)
     total = 0.0
-    for i, z in enumerate(atoms):
-        if int(z) != 7 or len(neighbours[i]) != 3:
-            continue
+    for i in np.flatnonzero(z == 7).tolist():
         ligands = neighbours[i]
-        if sum(1 for j in ligands if int(atoms[j]) == 1) >= 2:
+        if len(ligands) != 3 or int((z[ligands] == 1).sum()) >= 2:
             continue
         angles = 0.0
         for a in range(3):
@@ -344,7 +363,7 @@ def nsp2_correction(atoms, coords) -> float:
     return total
 
 
-def nhco_dihedral_correction(atoms, coords, htype: float = HTYPE_PM6) -> float:
+def nhco_dihedral_correction(atoms, coords, htype: float = HTYPE_PM6, dist=None) -> float:
     """MOPAC's `sum_dihed` over O=C-N-H linkages, in kcal/mol.
 
     Port of ``setup_nhco`` in openMOPAC v23 ``src/moldat.F90`` plus the sum in
@@ -358,26 +377,37 @@ def nhco_dihedral_correction(atoms, coords, htype: float = HTYPE_PM6) -> float:
     those, :func:`nsp2_correction` is the whole story.
     """
     xyz = np.asarray(coords, dtype=np.float64)
-    z = [int(a) for a in atoms]
-    n = len(z)
-    dist = lambda a, b: float(np.linalg.norm(xyz[a] - xyz[b]))
+    zarr = np.asarray(atoms, dtype=np.int64)
+    n = zarr.size
+    # Same five nested loops, same order, same early exits -- but the candidate
+    # at each level is drawn from that element's index list instead of from
+    # range(n) with a type test, and the distances come from one matrix rather
+    # than a norm call apiece. Nothing about which quadruple is selected
+    # changes: the element lists are ascending, so the iteration order is the
+    # order the range() loops produced.
+    if dist is None:
+        dist = _distance_matrix(xyz)
+    carbons = np.flatnonzero(zarr == 6).tolist()
+    oxygens = np.flatnonzero(zarr == 8).tolist()
+    nitrogens = np.flatnonzero(zarr == 7).tolist()
+    hydrogens = np.flatnonzero(zarr == 1).tolist()
+    if not (carbons and oxygens and nitrogens and hydrogens):
+        return 0.0
 
     quads, claimed = [], set()
-    for j in range(n):                                   # carbon
-        if z[j] != 6:
-            continue
+    for j in carbons:                                    # carbon
         found = False
-        for i in range(n):                               # oxygen
-            if z[i] != 8 or dist(i, j) > 1.3:
+        for i in oxygens:                                # oxygen
+            if dist[i, j] > 1.3:
                 continue
-            for k in range(n):                           # nitrogen
-                if z[k] != 7 or dist(k, j) > 1.6:
+            for k in nitrogens:                          # nitrogen
+                if dist[k, j] > 1.6:
                     continue
-                for l in range(n):                       # hydrogen on N
-                    if z[l] != 1 or dist(k, l) > 1.3:
+                for l in hydrogens:                      # hydrogen on N
+                    if dist[k, l] > 1.3:
                         continue
                     for m in range(n):                   # the other substituent
-                        if m in (k, l, j) or dist(m, k) > 1.7:
+                        if m in (k, l, j) or dist[m, k] > 1.7:
                             continue
                         if k in claimed:                 # one entry per nitrogen
                             continue

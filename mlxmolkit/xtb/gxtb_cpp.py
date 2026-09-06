@@ -63,7 +63,7 @@ IMPLEMENTATION_STATUS: tuple[GXTBCppBlock, ...] = (
     GXTBCppBlock(
         "binary parameter tables",
         "implemented",
-        "103-element g-xTB arrays vendored in params/gxtb_binary_params.npz",
+        "103-element g-xTB arrays vendored in params/gxtb_v2.npz",
     ),
     GXTBCppBlock(
         "repulsion scalar helpers",

@@ -25,7 +25,7 @@ PARAMETER_NAMES = (
     "cap",
     "avg_cn",
 )
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "params", "eeqbc2025_params.npz")
+from .param_archive import ARCHIVE_PATH as _DATA_PATH, load_tables  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -60,11 +60,8 @@ class EEQBC2025ParameterSet:
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "EEQBC2025ParameterSet":
-        if path is None:
-            path = _DATA_PATH
-        with np.load(path, allow_pickle=False) as data:
-            arrays = {name: data[name].copy() for name in PARAMETER_NAMES}
-        return cls(arrays)
+        tables = load_tables("eeqbc", path)
+        return cls({name: tables[name] for name in PARAMETER_NAMES})
 
     def __getitem__(self, name: str) -> np.ndarray:
         return self.arrays[name]

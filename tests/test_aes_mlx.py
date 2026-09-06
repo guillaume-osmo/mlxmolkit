@@ -40,6 +40,13 @@ def test_fockelectro_mlx_matches_numpy_reference():
     S = rng.normal(size=(nao, nao))
     dpint = rng.normal(size=(3, nao, nao))
     qpint = rng.normal(size=(6, nao, nao))
+    # Symmetric in the AO pair, as the real density, overlap and multipole
+    # integrals are. The two implementations contract in different orders,
+    # which is only equivalent on symmetric input.
+    P = 0.5 * (P + P.T)
+    S = 0.5 * (S + S.T)
+    dpint = 0.5 * (dpint + dpint.transpose(0, 2, 1))
+    qpint = 0.5 * (qpint + qpint.transpose(0, 2, 1))
     aoat = np.array([0, 0, 1, 1, 1, 2, 2], dtype=np.int64)
     vs = rng.normal(size=nat)
     vd = rng.normal(size=(3, nat))
@@ -58,8 +65,9 @@ def test_fockelectro_mlx_matches_numpy_reference():
     )
     mx.eval(F_mx, e_mx)
 
-    np.testing.assert_allclose(np.asarray(F_mx), F_np, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(float(np.asarray(e_mx)), e_np, rtol=1e-6, atol=1e-6)
+    # MLX computes in float32.
+    np.testing.assert_allclose(np.asarray(F_mx), F_np, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(float(np.asarray(e_mx)), e_np, rtol=1e-4, atol=1e-5)
 
 
 def test_mmomgabzero_mlx_matches_numpy_reference():

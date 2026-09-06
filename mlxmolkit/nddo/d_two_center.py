@@ -62,9 +62,57 @@ _ROT_CACHE: dict | None = None
 _YH_CACHE: dict | None = None
 
 
+_CSV_TO_PARAM = {"zeta_s": "zeta_s", "zeta_p": "zeta_p", "zeta_d": "zeta_d",
+                 "g_ss": "gss", "g_pp": "gpp", "g_p2": "gp2", "h_sp": "hsp",
+                 "F0SD": "F0SD", "G2SD": "G2SD", "alpha": "alpha"}
+_TAIL_SLOT = {"s_orb_exp_tail": 0, "p_orb_exp_tail": 1, "d_orb_exp_tail": 2}
+
+
+def _col_from_params(name, plist, csv):
+    """Per-atom parameter column, from the atoms' OWN ElementParams.
+
+    ⚠️ This used to read every column from the PM6 CSV by Z, whatever the
+    method -- so PM6-ORG's d-bearing pairs were integrated with PM6's zetas,
+    g's and tails, and its S and P sat 2-3e-02 e from MOPAC 23 while sp atoms
+    were at 2e-04. The CSV is kept only for what ElementParams does not carry
+    (rho_core), and as the fallback for a zero/missing field.
+    """
+    out = []
+    for p in plist:
+        if isinstance(p, (int, np.integer)):
+            # ⚠️ The phantom H that `_tetci_pair_w` appends to odd-electron
+            # pairs has no ElementParams -- it is a bare Z=1 at 1000 A. It
+            # takes the CSV row, as it always did; forgetting it here made
+            # `Zs` three long and this column two, and TETCI raised IndexError
+            # on CH3Cl (test_pm6_d_native).
+            out.append(float(csv.get(int(p), {}).get(name, 0.0)))
+            continue
+        row = csv.get(int(p.Z), {})
+        if name in _TAIL_SLOT:
+            tail = getattr(p, "tail_exponents", None)
+            v = tail[_TAIL_SLOT[name]] if tail else row.get(name, 0.0)
+        elif name in _CSV_TO_PARAM:
+            v = getattr(p, _CSV_TO_PARAM[name], 0.0)
+            if not v:
+                v = row.get(name, 0.0)
+        else:
+            v = row.get(name, 0.0)
+        out.append(float(v))
+    return np.asarray(out, dtype=np.float64)
+
+
+def _param_fingerprint(p):
+    """What makes two ElementParams of the same Z different integrals: the
+    exponents. Z alone let PM6 and PM6-ORG -- same Z, different zetas and
+    tails -- share a cache entry."""
+    tail = getattr(p, "tail_exponents", None)
+    return (float(p.zeta_s), float(p.zeta_p), float(getattr(p, "zeta_d", 0.0)),
+            tuple(tail) if tail else None)
+
+
 def _pair_key(p1, p2, c1, c2):
     """Cache key for an ordered pair at a fixed geometry."""
-    return (int(p1.Z), int(p2.Z),
+    return (int(p1.Z), int(p2.Z), _param_fingerprint(p1), _param_fingerprint(p2),
             np.asarray(c1, dtype=np.float64).tobytes(),
             np.asarray(c2, dtype=np.float64).tobytes())
 
@@ -75,7 +123,7 @@ def _tetci_key(pa, pb, ca, cb):
 
 
 @contextmanager
-def pair_cache(pair_specs):
+def pair_cache(pair_specs, rotations=True):
     """Precompute every geometry-dependent pair quantity in `pair_specs`.
 
     Each of these routines is written for a batch and was being called one pair
@@ -154,10 +202,15 @@ def pair_cache(pair_specs):
             pA, pB, cA, cB = spec
             overlaps[_pair_key(pA, pB, cA, cB)] = S
             overlaps[_pair_key(pB, pA, cB, cA)] = S.T
-        ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
-                          [(c, d) for _a, _b, c, d in sp_specs])
-        for spec, w in zip(sp_specs, ws):
-            rot[_pair_key(*spec)] = w
+        # `rotations=False` when the caller rotates every pair itself in one
+        # indexed call (`scf._all_pair_w`), which a single point now does: the
+        # rotations computed here would then be built and keyed a second time
+        # for nothing -- 5565 `_pair_key` tuples on a 106-atom molecule.
+        if rotations:
+            ws = rotate_pairs([(a, b) for a, b, _c, _d in sp_specs],
+                              [(c, d) for _a, _b, c, d in sp_specs])
+            for spec, w in zip(sp_specs, ws):
+                rot[_pair_key(*spec)] = w
 
     prev = (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE, _YH_CACHE)
     (_TETCI_CACHE, _OVERLAP_CACHE, _E1B_CACHE, _ROT_CACHE,
@@ -224,8 +277,10 @@ def _tetci_pair_w(p1, p2, coord1, coord2):
 
     # Load PM6 params from bundled CSV (PYSEQM MOPAC values, BSD-3 Clause).
     csv = _load_pm6_csv_params()
+    _plist = [pa, pb] + [1] * (len(Zs) - 2)      # + le H fantome eventuel
+
     def col(name):
-        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+        return _col_from_params(name, _plist, csv)
 
     zetas = col('zeta_s')
     zetap = col('zeta_p')
@@ -287,11 +342,13 @@ def _tetci_pairs_w(pair_specs):
         return []
 
     Zs, coords, order = [], [], []
+    _plist = []
     for p1, p2, c1, c2 in pair_specs:
         first_is_A = p1.Z >= p2.Z
         pa, pb = (p1, p2) if first_is_A else (p2, p1)
         ca, cb = (c1, c2) if first_is_A else (c2, c1)
         Zs.extend([int(pa.Z), int(pb.Z)])
+        _plist.extend([pa, pb])
         coords.extend([np.asarray(ca, dtype=np.float64),
                        np.asarray(cb, dtype=np.float64)])
         order.append(first_is_A)
@@ -307,8 +364,9 @@ def _tetci_pairs_w(pair_specs):
     xij = diff / R_ang[:, None]
 
     csv = _load_pm6_csv_params()
+
     def col(name):
-        return np.asarray([csv[z].get(name, 0.0) for z in Zs], dtype=np.float64)
+        return _col_from_params(name, _plist, csv)
 
     zetas, zetap, zetad = col('zeta_s'), col('zeta_p'), col('zeta_d')
     zs, zp, zd = col('s_orb_exp_tail'), col('p_orb_exp_tail'), col('d_orb_exp_tail')
@@ -378,6 +436,59 @@ def _yx_pair_w(p_d, p_sp, coord_d, coord_sp):
         return None
     from .packing import unpack, packed_size
     return unpack(w[:packed_size(4), :packed_size(9)].T, 9, 4)
+
+
+def d_pair_effective_w(pA, pB, coordA, coordB, w_sp):
+    """The whole two-centre term of a d-bearing pair as ONE (nA, nA, nB, nB) tensor.
+
+    On every branch that has its integrals, :func:`d_two_center_fock` runs the
+    same three contractions as the sp routine -- J on A from P_BB, J on B from
+    P_AA, K from P_AB -- over the FULL block, then subtracts the sp corner that
+    ``scf._pair_fock_twocentre`` has already added from the rotated sp tensor
+    ``w_sp``. All three are linear in the tensor, so
+
+        sp(w_sp) + full(W) - corner(W[:a, :a, :b, :b])  ==  full(Weff),
+        Weff = W with W[:a, :a, :b, :b] := w_sp[:a, :a, :b, :b],   a, b = min(n, 4)
+
+    and a d pair becomes an ordinary NDDO pair contraction, hoisted out of the
+    SCF loop like the sp pairs. Branch by branch of the routine it replaces:
+
+    * YY (9, 9): W is the TETCI block, the corner W[:4, :4, :4, :4];
+    * YX (9, 4) and XY (4, 9): W from :func:`_yx_pair_w`, XY transposed into
+      (A, B) order, the corner W[:4, :4, :, :];
+    * YH (9, 1) and HY (1, 9): W is the 9x9 (mu nu_A | s_B s_B) matrix as
+      (9, 9, 1, 1); the routine's explicit loops are exactly "full minus the
+      (mu < 4 and nu < 4) corner" for J_A, J_B and K, both orderings.
+
+    Returns None when TETCI has no block for the pair: that branch of the
+    routine is a monopole approximation, not linear in one tensor, and the
+    caller keeps calling ``d_two_center_fock`` for such a pair.
+    ``tests/test_nddo_fock_plan.py`` checks the identity on random densities
+    for every kind.
+    """
+    nA, nB = pA.n_basis, pB.n_basis
+    if nA == 9 and nB == 9:
+        W = _yy_pair_w(pA, pB, coordA, coordB)
+    elif nA == 9 and nB == 4:
+        W = _yx_pair_w(pA, pB, coordA, coordB)
+    elif nA == 4 and nB == 9:
+        W = _yx_pair_w(pB, pA, coordB, coordA)
+        if W is not None:
+            W = np.transpose(W, (2, 3, 0, 1))
+    elif nA == 9 and nB == 1:
+        from .tetci_yh import yh_rotated_integral_matrix
+        W = np.asarray(yh_rotated_integral_matrix(pA, pB, coordA, coordB)).reshape(9, 9, 1, 1)
+    elif nA == 1 and nB == 9:
+        from .tetci_yh import yh_rotated_integral_matrix
+        W = np.asarray(yh_rotated_integral_matrix(pB, pA, coordB, coordA)).reshape(1, 1, 9, 9)
+    else:
+        return None
+    if W is None:
+        return None
+    Weff = np.array(W, dtype=np.float64)          # a copy: the TETCI blocks are cached
+    a, b = min(nA, 4), min(nB, 4)
+    Weff[:a, :a, :b, :b] = w_sp[:a, :a, :b, :b]
+    return Weff
 
 
 def compute_d_two_center(

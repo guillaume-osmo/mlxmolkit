@@ -535,8 +535,8 @@ def test_repulsion_energy_gradient_matches_matrix_and_fd():
     #     vrep = 0.5 * mat @ scaled_zeff ;  E_i = vrep_i * scaled_zeff_i
     # so E = 0.5 * z.mat.z, while `matvec` is the un-halved `mat @ z` that the
     # POTENTIAL path wants.  This used to omit the half and pinned an energy
-    # exactly twice the binary's; the kernel was corrected to match
-    # (gxtb-recovery walk stage 20a: 0.339949745213 on both sides, against
+    # exactly twice the reference implementation's; the kernel was
+    # corrected to match (0.339949745213 on both sides, against
     # 0.679898990425 before).
     assert energy == pytest.approx(0.5 * float(scaled @ matvec), rel=0.0, abs=1e-15)
 
@@ -617,8 +617,8 @@ def test_repulsion_energy_gradient_asm_matches_matrix_and_fd():
     #     vrep = 0.5 * mat @ scaled_zeff ;  E_i = vrep_i * scaled_zeff_i
     # so E = 0.5 * z.mat.z, while `matvec` is the un-halved `mat @ z` that the
     # POTENTIAL path wants.  This used to omit the half and pinned an energy
-    # exactly twice the binary's; the kernel was corrected to match
-    # (gxtb-recovery walk stage 20a: 0.339949745213 on both sides, against
+    # exactly twice the reference implementation's; the kernel was
+    # corrected to match (0.339949745213 on both sides, against
     # 0.679898990425 before).
     assert energy == pytest.approx(0.5 * float(scaled @ matvec), rel=0.0, abs=1e-15)
 

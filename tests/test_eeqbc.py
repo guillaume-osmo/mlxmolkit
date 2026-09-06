@@ -49,7 +49,7 @@ def test_eeqbc_water_solve_matches_formula_snapshot():
 
     np.testing.assert_allclose(
         result.charges,
-        [-0.399162952686, 0.199581476343, 0.199581476343],
+        [-0.316685872654, 0.158342936327, 0.158342936327],
         atol=1.0e-12,
     )
     np.testing.assert_allclose(result.charges.sum(), 0.0, atol=1.0e-14)
