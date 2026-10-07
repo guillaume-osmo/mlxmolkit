@@ -203,3 +203,104 @@ def test_blockwise_large_n_memory():
     assert off_bw[-1] == off_fused[-1], (
         f"Edge count mismatch: blockwise={off_bw[-1]} fused={off_fused[-1]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# RDKit parity
+# ---------------------------------------------------------------------------
+
+def _rdkit_cluster(dist_matrix, n, thresh, reordering):
+    from rdkit.ML.Cluster import Butina
+    return [tuple(int(x) for x in c) for c in
+            Butina.ClusterData(dist_matrix, n, thresh, isDistData=True,
+                               reordering=reordering)]
+
+
+@pytest.mark.parametrize("reordering", [False, True])
+def test_greedy_matches_rdkit_exactly(reordering):
+    """The greedy step reproduces RDKit tuple-for-tuple, given the same graph.
+
+    Distances are exactly 0.0 or 1.0 with a 0.5 threshold, so the neighbor
+    graph is unambiguous and this isolates the greedy from any float
+    thresholding question.
+    """
+    rng = np.random.default_rng(7)
+    N = 300
+    adj = rng.random((N, N)) < 0.02
+    adj = adj | adj.T
+    np.fill_diagonal(adj, False)
+
+    dist = np.where(adj, 0.0, 1.0)
+    np.fill_diagonal(dist, 0.0)
+
+    offsets = np.zeros(N + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(adj.sum(axis=1))
+    indices = np.concatenate([np.flatnonzero(adj[i]) for i in range(N)]).astype(np.int64)
+
+    ours = butina_from_neighbor_list_csr(
+        offsets, indices, N, cutoff=0.5, reordering=reordering
+    ).clusters
+    theirs = _rdkit_cluster(dist, N, 0.5, reordering)
+
+    assert ours == theirs
+
+
+def _graded_fingerprints(seed=3, N=400, nbits=1024, nset=80, k=8, restart=50):
+    """Fingerprints with graded, overlapping similarity.
+
+    A random walk that flips ``k`` bits per step and restarts every
+    ``restart`` molecules -- several connected components with genuinely
+    overlapping neighborhoods, which is what makes the centroid choice (and
+    therefore the tie-break) observable.  Uniform-random fingerprints will not
+    do: at any useful cutoff they have no edges at all.
+    """
+    rng = np.random.default_rng(seed)
+    bits = np.zeros((N, nbits), dtype=np.uint8)
+    cur = None
+    for i in range(N):
+        if cur is None or i % restart == 0:
+            cur = np.zeros(nbits, dtype=np.uint8)
+            cur[rng.choice(nbits, nset, replace=False)] = 1
+        else:
+            cur = cur.copy()
+            cur[rng.choice(nbits, k, replace=False)] ^= 1
+        bits[i] = cur
+    return np.packbits(bits, axis=1, bitorder="little")
+
+
+@pytest.mark.parametrize("reordering", [False, True])
+def test_butina_tanimoto_mlx_matches_rdkit(reordering):
+    """Full GPU pipeline reproduces RDKit tuple-for-tuple.
+
+    The cutoff is deliberately not a short decimal: pairs whose exact Tanimoto
+    equals the cutoff are the one case where the two sides legitimately differ
+    (RDKit tests ``1 - sim <= distThresh`` in double, which rejects an exact
+    hit; we test ``sim >= cutoff``, which accepts it).
+    """
+    from rdkit import DataStructs
+    from rdkit.DataStructs import cDataStructs
+
+    fp_u8 = _graded_fingerprints()
+    N = fp_u8.shape[0]
+
+    bits = np.unpackbits(fp_u8, axis=1, bitorder="little")
+    ebvs = []
+    for row in bits:
+        bv = cDataStructs.ExplicitBitVect(bits.shape[1])
+        bv.SetBitsFromList([int(j) for j in np.flatnonzero(row)])
+        ebvs.append(bv)
+
+    cutoff = 0.6180339887
+    dist = np.zeros((N, N))
+    for i in range(N):
+        dist[i] = 1.0 - np.asarray(DataStructs.BulkTanimotoSimilarity(ebvs[i], ebvs))
+
+    ours = butina_tanimoto_mlx(
+        mx.array(fp_u8), cutoff=cutoff, reordering=reordering
+    ).clusters
+    theirs = _rdkit_cluster(dist, N, 1.0 - cutoff, reordering)
+
+    # Guard against a vacuous fixture: this must be real clustering work.
+    assert max(len(c) for c in ours) > 5
+    assert sum(len(c) == 1 for c in ours) > 0
+    assert ours == theirs
