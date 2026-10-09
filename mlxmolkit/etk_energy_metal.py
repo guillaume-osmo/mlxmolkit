@@ -4,10 +4,11 @@
 Five energy terms for stage 5 of ETKDG:
   1. CSD torsion preferences: 6-term Fourier series
      E = Σ_{k=1}^{6} V_k * (1 + sign_k * cos(k * φ)) / 2
-  2. Improper torsion (planarity): E = w * (1 - cos(2ω))
-  3. 1-2 distance constraints: flat-bottom with harmonic penalty
-  4. 1-3 distance constraints: flat-bottom with harmonic penalty
-  5. 1-4 distance constraints: flat-bottom with harmonic penalty
+  2. Improper (planarity), RDKit's UFF inversion: E = w * (1 - sin Y)
+  3. 1-2 distance constraints: flat-bottom, 0.5 * w * (d - bound)^2
+  4. 1-3 distance constraints: flat-bottom, 0.5 * w * (d - bound)^2
+  5. long-range distance constraints: flat-bottom, 0.5 * w * (d - bound)^2
+  (No linear-centre angle constraints: that term exists only in etk_metal.)
 
 All threads compute both energy AND gradient (parallel scatter).
 One thread per (global_atom, 3D_coord).
@@ -146,79 +147,47 @@ for (uint ti = tor_start; ti < tor_end; ti++) {{
     else grad_val += dE_dphi * dp3;
 }}
 
-// ======== Improper torsion (planarity) ========
+// ======== Improper: RDKit's UFF inversion, E = w * (1 - sin Y) ========
+// (I, J = sp2 centre, K, L); Y is the angle of J->L to the plane (I, J, K).
 uint imp_start = (uint)improper_starts[mol_id];
 uint imp_end   = (uint)improper_starts[mol_id + 1];
 
 for (uint ii = imp_start; ii < imp_end; ii++) {{
-    uint ic = (uint)improper_i[ii * 4 + 0];
-    uint i0 = (uint)improper_i[ii * 4 + 1];
-    uint i1 = (uint)improper_i[ii * 4 + 2];
-    uint i2 = (uint)improper_i[ii * 4 + 3];
+    uint iI = (uint)improper_i[ii * 4 + 0];
+    uint iJ = (uint)improper_i[ii * 4 + 1];
+    uint iK = (uint)improper_i[ii * 4 + 2];
+    uint iL = (uint)improper_i[ii * 4 + 3];
 
-    bool involved = (global_atom == ic || global_atom == i0 ||
-                     global_atom == i1 || global_atom == i2);
+    bool involved = (global_atom == iI || global_atom == iJ ||
+                     global_atom == iK || global_atom == iL);
     if (!involved) continue;
 
-    // Improper dihedral: ic-i0-i1-i2
-    float b1x = pos[i0*3+0]-pos[ic*3+0], b1y = pos[i0*3+1]-pos[ic*3+1], b1z = pos[i0*3+2]-pos[ic*3+2];
-    float b2x = pos[i1*3+0]-pos[i0*3+0], b2y = pos[i1*3+1]-pos[i0*3+1], b2z = pos[i1*3+2]-pos[i0*3+2];
-    float b3x = pos[i2*3+0]-pos[i1*3+0], b3y = pos[i2*3+1]-pos[i1*3+1], b3z = pos[i2*3+2]-pos[i1*3+2];
-
-    float n1x = b1y*b2z - b1z*b2y;
-    float n1y = b1z*b2x - b1x*b2z;
-    float n1z = b1x*b2y - b1y*b2x;
-
-    float n2x = b2y*b3z - b2z*b3y;
-    float n2y = b2z*b3x - b2x*b3z;
-    float n2z = b2x*b3y - b2y*b3x;
-
-    float n1_len = sqrt(n1x*n1x + n1y*n1y + n1z*n1z + 1e-12f);
-    float n2_len = sqrt(n2x*n2x + n2y*n2y + n2z*n2z + 1e-12f);
-    float b2_len = sqrt(b2x*b2x + b2y*b2y + b2z*b2z + 1e-12f);
-
-    float cos_w = (n1x*n2x + n1y*n2y + n1z*n2z) / (n1_len * n2_len);
-    cos_w = clamp(cos_w, -1.0f, 1.0f);
-
-    float b2hx = b2x/b2_len, b2hy = b2y/b2_len, b2hz = b2z/b2_len;
-    float m1x = n1y*b2hz - n1z*b2hy;
-    float m1y = n1z*b2hx - n1x*b2hz;
-    float m1z = n1x*b2hy - n1y*b2hx;
-    float sin_w = (m1x*n2x + m1y*n2y + m1z*n2z) / (n1_len * n2_len);
-    float omega = atan2(sin_w, cos_w);
-
-    float w = improper_w[ii];
-
-    // E = w * (1 - cos(2ω))
-    float E_imp = w * (1.0f - cos(2.0f * omega));
-    if (coord == 0u && global_atom == ic) e_contrib += E_imp;
-
-    float dE_dw = w * 2.0f * sin(2.0f * omega);
-
-    float n1_sq = n1x*n1x + n1y*n1y + n1z*n1z + 1e-12f;
-    float n2_sq = n2x*n2x + n2y*n2y + n2z*n2z + 1e-12f;
-    float b2_sq = b2x*b2x + b2y*b2y + b2z*b2z + 1e-12f;
-
-    float f0 = -b2_len / n1_sq;
-    float f3 =  b2_len / n2_sq;
-    float b1_dot_b2 = b1x*b2x + b1y*b2y + b1z*b2z;
-    float b3_dot_b2 = b3x*b2x + b3y*b2y + b3z*b2z;
-    float f1a = b1_dot_b2 / b2_sq - 1.0f;
-    float f1b = -b3_dot_b2 / b2_sq;
-    float f2a = b3_dot_b2 / b2_sq - 1.0f;
-    float f2b = -b1_dot_b2 / b2_sq;
-
-    float dp0, dp1, dp2, dp3;
-    if (coord == 0u) {{ dp0 = f0*n1x; dp3 = f3*n2x; }}
-    else if (coord == 1u) {{ dp0 = f0*n1y; dp3 = f3*n2y; }}
-    else {{ dp0 = f0*n1z; dp3 = f3*n2z; }}
-    dp1 = f1a * dp0 + f1b * dp3;
-    dp2 = f2a * dp3 + f2b * dp0;
-
-    if (global_atom == ic)  grad_val += dE_dw * dp0;
-    else if (global_atom == i0) grad_val += dE_dw * dp1;
-    else if (global_atom == i1) grad_val += dE_dw * dp2;
-    else grad_val += dE_dw * dp3;
+    float u[3], v[3], w3[3];
+    for (uint d = 0; d < 3u; d++) {{
+        u[d] = pos[iI*3+d] - pos[iJ*3+d];
+        v[d] = pos[iK*3+d] - pos[iJ*3+d];
+        w3[d] = pos[iL*3+d] - pos[iJ*3+d];
+    }}
+    float cx = u[1]*v[2]-u[2]*v[1], cy = u[2]*v[0]-u[0]*v[2], cz = u[0]*v[1]-u[1]*v[0];
+    float lc = sqrt(cx*cx + cy*cy + cz*cz);
+    float lw = sqrt(w3[0]*w3[0] + w3[1]*w3[1] + w3[2]*w3[2]);
+    if (lc < 1e-8f || lw < 1e-8f) continue;
+    float c = clamp((cx*w3[0] + cy*w3[1] + cz*w3[2]) / (lc * lw), -1.0f, 1.0f);
+    float sy = sqrt(max(1.0f - c*c, 0.0f));
+    float wt = improper_w[ii];
+    if (coord == 0u && global_atom == iJ) e_contrib += wt * c*c / (1.0f + sy);
+    if (sy < 1e-8f) continue;
+    float dE = wt * c / sy;
+    float nh[3] = {cx/lc, cy/lc, cz/lc};
+    float wh[3] = {w3[0]/lw, w3[1]/lw, w3[2]/lw};
+    float gw[3], gc[3];
+    for (uint d = 0; d < 3u; d++) {{ gw[d] = (nh[d]-c*wh[d])/lw; gc[d] = (wh[d]-c*nh[d])/lc; }}
+    float gu[3] = {v[1]*gc[2]-v[2]*gc[1], v[2]*gc[0]-v[0]*gc[2], v[0]*gc[1]-v[1]*gc[0]};
+    float gv[3] = {gc[1]*u[2]-gc[2]*u[1], gc[2]*u[0]-gc[0]*u[2], gc[0]*u[1]-gc[1]*u[0]};
+    if (global_atom == iI) grad_val += dE * gu[coord];
+    else if (global_atom == iK) grad_val += dE * gv[coord];
+    else if (global_atom == iL) grad_val += dE * gw[coord];
+    else grad_val -= dE * (gu[coord] + gv[coord] + gw[coord]);
 }}
 
 // ======== 1-2 Distance constraints ========

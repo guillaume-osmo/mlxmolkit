@@ -2,8 +2,9 @@
 N×k parallel ETK (3D torsion) minimization with shared constraints.
 
 Same TPM=32 threadgroup architecture as conformer_metal.py (DG stage),
-but with ETK energy terms: CSD torsion preferences (6-term Fourier),
-improper torsion (planarity), and 1-4 distance constraints.
+but with RDKit's ETK energy terms: CSD / flat-ring torsions (6-term Fourier),
+UFF inversions (planarity at sp2 centres), and 1-2, 1-3 and long-range
+distance constraints.
 
 Constraint indices are LOCAL [0, n_atoms_mol). The kernel pre-adds
 ``atom_off = conf_atom_starts[conf_idx]`` before calling helpers.
@@ -108,25 +109,71 @@ inline void torsion_g(const device float* pos, device float* grad,
     grad[i4*dim+0]+=g4x;grad[i4*dim+1]+=g4y;grad[i4*dim+2]+=g4z;
 }
 
-// ---- Improper torsion (planarity) energy: E = w * (1 - cos(2ω)) ----
-// Identity: with c = cos(ω) = calc_cos_phi(ic,i0,i1,i2),  1-cos(2ω) = 2-2c^2,
-// which is exactly torsion_e(c, V=[0,w,0,0,0,0], s=[0,-1,0,0,0,0]).  Delegating to the
-// (finite-difference-verified) torsion energy/gradient keeps E and dE/dx consistent.
-// The previous standalone improper_g used a Blondel-Karplus dφ/dx that did NOT match this
-// ω definition (FD error ~150) — which silently zeroed the ETK refinement.
-inline float improper_e(const device float* pos,
-    int ic,int i0,int i1,int i2, float wt, int dim
+// ---- Improper (out-of-plane) term: RDKit's UFF::InversionContrib ----
+// Atoms (I, J, K, L) with J the sp2 centre; Y is the angle between J->L and the
+// normal of the plane (I, J, K). For C/N/O, UFF's C0 = 1, C1 = -1, C2 = 0, so
+// E = kf * (1 - sin Y), zero when L lies in that plane. Degenerate geometries
+// (a zero bond vector, collinear I-J-K) give cos Y = 0, as calculateCosY does.
+inline float inversion_cos_y(const device float* pos, int I, int J, int K, int L, int dim,
+    thread float* u, thread float* v, thread float* w
 ) {
-    float c = calc_cos_phi(pos, ic,i0,i1,i2, dim);
-    return torsion_e(c, 0.0f,wt,0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f);
+    for (int d=0;d<3;d++) {
+        u[d]=pos[I*dim+d]-pos[J*dim+d]; v[d]=pos[K*dim+d]-pos[J*dim+d]; w[d]=pos[L*dim+d]-pos[J*dim+d];
+    }
+    float lu=u[0]*u[0]+u[1]*u[1]+u[2]*u[2], lv=v[0]*v[0]+v[1]*v[1]+v[2]*v[2];
+    float lw=w[0]*w[0]+w[1]*w[1]+w[2]*w[2];
+    if (lu<1e-16f||lv<1e-16f||lw<1e-16f) return 0.0f;
+    float cx=u[1]*v[2]-u[2]*v[1], cy=u[2]*v[0]-u[0]*v[2], cz=u[0]*v[1]-u[1]*v[0];
+    float lc=cx*cx+cy*cy+cz*cz;
+    if (lc<1e-16f*lu*lv) return 0.0f;
+    return clamp((cx*w[0]+cy*w[1]+cz*w[2])*rsqrt(lc*lw), -1.0f, 1.0f);
 }
 
-// ---- Improper torsion gradient (delegates to fixed torsion_g) ----
-inline void improper_g(const device float* pos, device float* grad,
-    int ic,int i0,int i1,int i2, float wt, int dim
+inline float inversion_e(const device float* pos, int I, int J, int K, int L, float kf, int dim) {
+    float u[3], v[3], w[3];
+    float c = inversion_cos_y(pos, I, J, K, L, dim, u, v, w);
+    // 1 - sin Y written as cos^2 Y / (1 + sin Y): no cancellation near planarity.
+    return kf * c*c / (1.0f + sqrt(max(1.0f - c*c, 0.0f)));
+}
+
+// Gradient as the four role vectors (I, J, K, L) -> out[0..11]: the exact
+// derivative of inversion_e. A degenerate term stores -0.0f (adds nothing).
+template <typename OutT>
+inline void inversion_g_roles(const device float* pos, OutT out,
+    int I, int J, int K, int L, float kf, int dim
 ) {
-    torsion_g(pos, grad, ic,i0,i1,i2,
-        0.0f,wt,0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f, dim);
+    float u[3], v[3], w[3];
+    float c = inversion_cos_y(pos, I, J, K, L, dim, u, v, w);
+    float sy = sqrt(max(1.0f - c*c, 0.0f));
+    float cx=u[1]*v[2]-u[2]*v[1], cy=u[2]*v[0]-u[0]*v[2], cz=u[0]*v[1]-u[1]*v[0];
+    float lc=sqrt(cx*cx+cy*cy+cz*cz), lw=sqrt(w[0]*w[0]+w[1]*w[1]+w[2]*w[2]);
+    if (c == 0.0f || sy < 1e-8f || lc == 0.0f || lw == 0.0f) {
+        for (int k=0;k<12;k++) out[k]=-0.0f;
+        return;
+    }
+    float dE = kf * c / sy;                        // dE / d cos Y
+    float nh[3]={cx/lc, cy/lc, cz/lc}, wh[3]={w[0]/lw, w[1]/lw, w[2]/lw};
+    float gw[3], gc[3];
+    for (int d=0;d<3;d++) { gw[d]=(nh[d]-c*wh[d])/lw; gc[d]=(wh[d]-c*nh[d])/lc; }
+    float gu[3]={v[1]*gc[2]-v[2]*gc[1], v[2]*gc[0]-v[0]*gc[2], v[0]*gc[1]-v[1]*gc[0]};
+    float gv[3]={gc[1]*u[2]-gc[2]*u[1], gc[2]*u[0]-gc[0]*u[2], gc[0]*u[1]-gc[1]*u[0]};
+    for (int d=0;d<3;d++) {
+        out[d]   = dE*gu[d];
+        out[3+d] = -dE*(gu[d]+gv[d]+gw[d]);
+        out[6+d] = dE*gv[d];
+        out[9+d] = dE*gw[d];
+    }
+}
+
+// Serial reference: the same role vectors, added atom by atom.
+inline void inversion_g(const device float* pos, device float* grad,
+    int I, int J, int K, int L, float kf, int dim
+) {
+    float r[12];
+    inversion_g_roles(pos, r, I, J, K, L, kf, dim);
+    for (int d=0;d<3;d++) {
+        grad[I*dim+d]+=r[d]; grad[J*dim+d]+=r[3+d]; grad[K*dim+d]+=r[6+d]; grad[L*dim+d]+=r[9+d];
+    }
 }
 
 // ---- Distance constraint: flat-bottom harmonic, 0.5 * k * (d - bound)^2 ----
@@ -391,8 +438,7 @@ _ETK_BODY = r"""
         for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm) { \
             int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off; \
             int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off; \
-            torsion_g_roles(out_pos,&scr_imp[12*(t-imp_s)],ic,i0,i1,i2, \
-                0.0f,improper_w[t],0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f, dim); \
+            inversion_g_roles(out_pos,&scr_imp[12*(t-imp_s)],ic,i0,i1,i2,improper_w[t],dim); \
         } \
         for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm) \
             scr_d12[t-d12_s]=dist14_pf(out_pos,d12_pairs[t*2]+atom_off,d12_pairs[t*2+1]+atom_off, \
@@ -433,7 +479,7 @@ _ETK_BODY = r"""
                 torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5], \
                     torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);} \
             for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off; \
-                improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);} \
+                inversion_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);} \
             for (int t=d12_s;t<d12_e;t++){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off; \
                 dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);} \
             for (int t=d13_s;t<d13_e;t++){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off; \
@@ -461,7 +507,7 @@ _ETK_BODY = r"""
     for (int t=imp_s+(int)tid; t<imp_e; t+=(int)tpm) {
         int ic=improper_quads[t*4]+atom_off, i0=improper_quads[t*4+1]+atom_off;
         int i1=improper_quads[t*4+2]+atom_off, i2=improper_quads[t*4+3]+atom_off;
-        local_e += improper_e(out_pos, ic,i0,i1,i2, improper_w[t], dim);
+        local_e += inversion_e(out_pos, ic,i0,i1,i2, improper_w[t], dim);
     }
     // 1-2 bond distance energy
     for (int t=d12_s+(int)tid; t<d12_e; t+=(int)tpm) {
@@ -538,7 +584,7 @@ _ETK_BODY = r"""
                     torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5]);}
             for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm){
                 int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-                lte+=improper_e(out_pos,ic,i0,i1,i2,improper_w[t],dim);}
+                lte+=inversion_e(out_pos,ic,i0,i1,i2,improper_w[t],dim);}
             for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm){
                 int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
                 lte+=dist14_e(out_pos,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}

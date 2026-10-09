@@ -58,8 +58,8 @@ class ETKParams:
     torsion_V: np.ndarray        # (n_torsions, 6) float32 — Fourier coefficients
     torsion_signs: np.ndarray    # (n_torsions, 6) int32 — sign multipliers
 
-    # Improper torsions (planarity at sp2): E = w * (1 - cos(2ω))
-    improper_idx: np.ndarray     # (n_improper, 4) int32 — center,n1,n2,n3
+    # Impropers, UFF inversion: E = w * (1 - sin Y), Y the angle of J->L to plane (I, J, K)
+    improper_idx: np.ndarray     # (n_improper, 4) int32 — I, J (sp2 centre), K, L
     improper_weight: np.ndarray  # (n_improper,) float32
 
     # 1-2 distance constraints (bonds): flat-bottom harmonic
@@ -258,19 +258,17 @@ def extract_etk_params(
         torsion_V = np.zeros((0, 6), dtype=np.float32)
         torsion_signs = np.zeros((0, 6), dtype=np.int32)
 
-    # --- Improper torsions (planarity at sp2 centers) ---
-    # Only included when use_basic_knowledge is True (ETKDG/KDG, not ETDG/DG)
+    # --- Impropers: RDKit's UFF inversion terms at sp2 centres ---
+    # Only with basic knowledge (ETKDG/KDG, not ETDG/DG). TorsionPreferences.cpp takes C/N/O
+    # atoms that are SP2 with exactly three neighbours; addImproperTorsionTerms gives each
+    # three UFF::InversionContrib terms (I, J = centre, K, L) over the neighbours n0, n1, n2 in
+    # RDKit's order -- (n0, n1, n2), (n0, n2, n1), (n1, n2, n0) -- each with force constant
+    # oobForceScalingFactor (improper_weight, 10) * K_UFF / 3, K_UFF = 50 for a carbon bound
+    # to an SP2 oxygen (isBoundToSP2O, any degree), else 6.
     improper_idx_list = []
     improper_w_list = []
-
-    # RDKit's ETKDG expands each sp2 center into THREE UFF out-of-plane inversion terms (the 3
-    # cyclic neighbour permutations), giving ~3x the planarity restraint of a single improper.
-    # With one improper/center sp2 centres are under-restrained (~1/3 the out-of-plane stiffness)
-    # and pucker under torsion refinement, so we emit all three permutations to match RDKit.
     if use_basic_knowledge:
         for atom in mol.GetAtoms():
-            # RDKit restricts inversion/improper centers to C/N/O with EXACTLY 3 neighbours
-            # (TorsionPreferences.cpp); the port previously flattened any sp2 deg>=3 atom (e.g. boron).
             if atom.GetAtomicNum() not in (6, 7, 8):
                 continue
             if atom.GetHybridization() != Chem.HybridizationType.SP2:
@@ -278,21 +276,14 @@ def extract_etk_params(
             neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(neighbors) != 3:
                 continue
-
-            # RDKit boosts the force constant ~50/6x for sp2-C bonded to a terminal sp2 O
-            # (carbonyl/amide/ester/carboxylate) — isBoundToSP2O.
-            w = improper_weight
-            if atom.GetAtomicNum() == 6:
-                for nb in atom.GetNeighbors():
-                    if (nb.GetAtomicNum() == 8 and nb.GetHybridization() == Chem.HybridizationType.SP2
-                            and nb.GetDegree() == 1):
-                        w = improper_weight * (50.0 / 6.0)
-                        break
-
+            bound_to_sp2_o = atom.GetAtomicNum() == 6 and any(
+                nb.GetAtomicNum() == 8 and nb.GetHybridization() == Chem.HybridizationType.SP2
+                for nb in atom.GetNeighbors())
+            w = improper_weight * (50.0 if bound_to_sp2_o else 6.0) / 3.0
             center = atom.GetIdx()
-            n0, n1, n2 = neighbors[0], neighbors[1], neighbors[2]
-            for (a, b, c) in ((n0, n1, n2), (n1, n2, n0), (n2, n0, n1)):
-                improper_idx_list.append([center, a, b, c])
+            n0, n1, n2 = neighbors
+            for (i, k, l) in ((n0, n1, n2), (n0, n2, n1), (n1, n2, n0)):
+                improper_idx_list.append([i, center, k, l])
                 improper_w_list.append(w)
 
     n_improper = len(improper_idx_list)
@@ -322,7 +313,7 @@ def extract_etk_params(
     d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
     # Fixed-window terms (the dist14 family): long-range pairs, and the 1-3 pairs below.
     unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
-    improper_centres = {q[0] for q in improper_idx_list}
+    improper_centres = {q[1] for q in improper_idx_list}
     if run_field:
         for bond in mol.GetBonds():
             a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
