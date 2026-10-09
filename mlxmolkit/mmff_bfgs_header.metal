@@ -403,25 +403,72 @@ inline void ele_g(
 
 // ---- Threadgroup parallel helpers (used by TG kernel) ----
 
+// With MMFF_TG32 (the launcher's TG_SIZE == 32) the threadgroup is exactly
+// one SIMD-group: reductions run in registers with xor-shuffles, no
+// threadgroup memory or barriers. The shuffle distances (16, 8, 4, 2, 1) are
+// the tree's strides, so every partial sum pairs the same operands in the
+// same order and every lane ends with the tree's exact value.
+#ifndef MMFF_TG32
+#define MMFF_TG32 0
+#endif
+
+inline float lane_sum32(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+}
+
+// Reads s[tid], which the calling lane has just written.
 inline float tg_reduce_sum(threadgroup float* s, uint tid, uint n) {
+#if MMFF_TG32
+    return lane_sum32(s[tid]);
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = n / 2; stride > 0; stride >>= 1) {
         if (tid < stride) s[tid] += s[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     return s[0];
+#endif
 }
 
+inline float tg_reduce_max_v(float v, threadgroup float* s, uint tid, uint n) {
+#if MMFF_TG32
+    v = max(v, simd_shuffle_xor(v, 16));
+    v = max(v, simd_shuffle_xor(v, 8));
+    v = max(v, simd_shuffle_xor(v, 4));
+    v = max(v, simd_shuffle_xor(v, 2));
+    v = max(v, simd_shuffle_xor(v, 1));
+    return v;
+#else
+    s[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = n / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] = max(s[tid], s[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = s[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+#endif
+}
+
+// Element-wise helpers: lane tid only touches elements tid, tid+tg_size, ...,
+// as does every element-wise loop of the kernels, so they need no barrier.
+// Barriers remain where a lane reads what another lane wrote (positions
+// before an energy or gradient evaluation, the gradient after phase 2, the
+// BFGS Hessian and the vectors its products read).
 inline void parallel_copy(device float* dst, const device float* src,
                            int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 inline void parallel_neg_copy(device float* dst, const device float* src,
                                int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = -src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 inline float parallel_dot(const device float* a, const device float* b,
@@ -742,14 +789,7 @@ inline float scale_grad_parallel(device float* grad, int n_terms, float scale,
         grad[i] *= scale;
         lmax = max(lmax, abs(grad[i]));
     }
-    red[tid] = lmax;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float max_grad = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_grad = tg_reduce_max_v(lmax, red, tid, tg_size);
     while (max_grad > GRAD_CAP) {
         scale *= 0.5f;
         lmax = 0.0f;
@@ -757,15 +797,7 @@ inline float scale_grad_parallel(device float* grad, int n_terms, float scale,
             grad[i] *= 0.5f;
             lmax = max(lmax, abs(grad[i]));
         }
-        red[tid] = lmax;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] = max(red[tid], red[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        max_grad = red[0];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_grad = tg_reduce_max_v(lmax, red, tid, tg_size);
     }
-    threadgroup_barrier(mem_flags::mem_device);
     return scale;
 }

@@ -222,9 +222,15 @@ def _pack_mmff_for_nk(
     }
 
 
+def _kernel_defines(grad_mode: int) -> str:
+    # MMFF_TG32: the threadgroup is one 32-wide SIMD-group, so reductions use
+    # shuffles (see mmff_bfgs_header.metal).
+    return f"#define GRAD_MODE {int(grad_mode)}\n#define MMFF_TG32 {int(TG_SIZE == 32)}\n"
+
+
 def _get_mmff_kernel_tg(grad_mode: int = GRAD_GATHER):
     if grad_mode not in _mmff_kernel_tg:
-        tg_header = (f"#define GRAD_MODE {int(grad_mode)}\n" + _MSL_HEADER
+        tg_header = (_kernel_defines(grad_mode) + _MSL_HEADER
                      + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\n")
         _mmff_kernel_tg[grad_mode] = mx.fast.metal_kernel(
             name=f"mmff_bfgs_tg_g{int(grad_mode)}",
@@ -251,7 +257,7 @@ def _get_mmff_kernel_tg(grad_mode: int = GRAD_GATHER):
 
 def _get_mmff_kernel_lbfgs_tg(grad_mode: int = GRAD_GATHER):
     if grad_mode not in _mmff_kernel_lbfgs_tg:
-        tg_header = (f"#define GRAD_MODE {int(grad_mode)}\n" + _MSL_HEADER
+        tg_header = (_kernel_defines(grad_mode) + _MSL_HEADER
                      + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\nconstant int LBFGS_M_VAL = {LBFGS_M};\n")
         _mmff_kernel_lbfgs_tg[grad_mode] = mx.fast.metal_kernel(
             name=f"mmff_lbfgs_tg_g{int(grad_mode)}",
@@ -269,7 +275,7 @@ def _get_mmff_kernel_lbfgs_tg(grad_mode: int = GRAD_GATHER):
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch",
-                "work_lbfgs", "work_rho", "work_alpha",
+                "work_lbfgs",
             ],
             header=tg_header,
             source=_MSL_SOURCE_LBFGS_TG,
@@ -364,13 +370,11 @@ def mmff_minimize_nk(
                 (total_pos_size,), (total_pos_size,),
                 (max(1, scratch_size),),
                 (max(1, total_lbfgs),),
-                (max(1, C * LBFGS_M),),
-                (max(1, C * LBFGS_M),),
             ],
             output_dtypes=[
                 mx.float32, mx.float32, mx.int32,
                 mx.float32, mx.float32, mx.float32,
-                mx.float32, mx.float32, mx.float32,
+                mx.float32,
             ],
             grid=(C * TG_SIZE, 1, 1),
             threadgroup=(TG_SIZE, 1, 1),

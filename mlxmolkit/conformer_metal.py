@@ -161,54 +161,77 @@ inline void fourth_dim_g(const device float* pos, device float* grad, int idx, f
     grad[(atom_off + idx) * dim + 3] += 2.0f * wt * w;
 }
 
-// ---- Threadgroup parallel primitives ----
-inline float tg_reduce_sum(threadgroup float* s, uint tid, uint n) {
+// ---- Reductions over the TPM lanes ----
+// With TPM == 32 the threadgroup is exactly one SIMD-group, so the reduction
+// runs in registers with xor-shuffles and needs no threadgroup memory or
+// barriers. The shuffle distances (16, 8, 4, 2, 1) are the strides of the
+// tree below, so each partial sum pairs the same operands in the same order
+// and every lane ends with the tree's exact result (float + is commutative).
+inline float reduce_sum(float v, threadgroup float* s, uint tid, uint n) {
+#if TPM == 32
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+#else
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s[tid] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = n / 2; stride > 0; stride >>= 1) {
         if (tid < stride) s[tid] += s[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float result = s[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return result;
+    return s[0];
+#endif
 }
-inline float tg_reduce_max(threadgroup float* s, uint tid, uint n) {
+inline float reduce_max(float v, threadgroup float* s, uint tid, uint n) {
+#if TPM == 32
+    v = max(v, simd_shuffle_xor(v, 16));
+    v = max(v, simd_shuffle_xor(v, 8));
+    v = max(v, simd_shuffle_xor(v, 4));
+    v = max(v, simd_shuffle_xor(v, 2));
+    v = max(v, simd_shuffle_xor(v, 1));
+    return v;
+#else
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s[tid] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = n / 2; stride > 0; stride >>= 1) {
         if (tid < stride) s[tid] = max(s[tid], s[tid + stride]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float result = s[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return result;
+    return s[0];
+#endif
 }
+// Element-wise helpers: lane tid only touches elements tid, tid+tpm, ...,
+// the same elements every helper and every element-wise loop of the kernel
+// gives it, so no barrier is needed between them (a thread sees its own
+// writes). A barrier is needed only where a lane reads elements another lane
+// wrote: positions before an energy/gradient evaluation, and the gradient,
+// which phase 2 writes atom by atom.
 inline float parallel_dot(const device float* a, const device float* b,
     int n, uint tid, uint tpm, threadgroup float* s) {
     float sum = 0.0f;
     for (int i = (int)tid; i < n; i += (int)tpm) sum += a[i] * b[i];
-    s[tid] = sum;
-    return tg_reduce_sum(s, tid, tpm);
+    return reduce_sum(sum, s, tid, tpm);
 }
 inline void parallel_saxpy(device float* a, float alpha, const device float* b,
     int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) a[i] += alpha * b[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 inline void parallel_scale(device float* a, float alpha, int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) a[i] *= alpha;
-    threadgroup_barrier(mem_flags::mem_device);
 }
 inline void parallel_copy(device float* dst, const device float* src, int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 inline void parallel_set(device float* a, float val, int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) a[i] = val;
-    threadgroup_barrier(mem_flags::mem_device);
 }
 inline void parallel_neg_copy(device float* dst, const device float* src, int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = -src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 // ---- Gradient, all lanes, in two phases ----
@@ -395,6 +418,7 @@ _MSL_DG_BODY = r"""
 
     // Copy initial positions to output (parallel)
     parallel_copy(&out_pos[atom_off * dim], &pos[atom_off * dim], n_vars, tid, tpm);
+    threadgroup_barrier(mem_flags::mem_device);  // energy reads every lane's atoms
 
     // Working pointers (each conformer has its own slice)
     device float* my_pos = &out_pos[atom_off * dim];
@@ -406,7 +430,9 @@ _MSL_DG_BODY = r"""
 
     device float* my_S = &work_lbfgs[lbfgs_start];
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m * n_vars];
-    device float* my_rho = &work_rho[conf_idx * lbfgs_m];
+    // L-BFGS scalars: every lane computes identical values, so each keeps its own copy.
+    float my_rho[LBFGS_M];
+    float my_alpha[LBFGS_M];
 
     // ---- Gradient of the current positions into my_grad (all lanes return) ----
 #if GRAD_MODE == 1
@@ -422,6 +448,7 @@ _MSL_DG_BODY = r"""
 #elif GRAD_MODE == 2
     #define DG_GRADIENT() \
         parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        threadgroup_barrier(mem_flags::mem_device); \
         for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm) \
             dist_g_atomic(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1], \
                 dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off); \
@@ -437,6 +464,7 @@ _MSL_DG_BODY = r"""
     // Reference: thread 0 adds every term serially.
     #define DG_GRADIENT() \
         parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        threadgroup_barrier(mem_flags::mem_device); \
         if (tid == 0) { \
             for (int t = dist_start; t < dist_end; t++) \
                 dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1], \
@@ -462,8 +490,7 @@ _MSL_DG_BODY = r"""
             chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off);
     for (int t = fourth_start_t + (int)tid; t < fourth_end_t; t += (int)tpm)
         local_energy += fourth_dim_e(out_pos, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
-    shared[tid] = local_energy;
-    float energy = tg_reduce_sum(shared, tid, tpm);
+    float energy = reduce_sum(local_energy, shared, tid, tpm);
 
     DG_GRADIENT();
 
@@ -474,8 +501,7 @@ _MSL_DG_BODY = r"""
         for (int i = (int)tid; i < n_vars; i += (int)tpm) {
             float a = abs(my_grad[i]); if (a > lmx) lmx = a;
         }
-        shared[tid] = lmx;
-        if (tg_reduce_max(shared, tid, tpm) <= 10.0f) break;
+        if (reduce_max(lmx, shared, tid, tpm) <= 10.0f) break;
         parallel_scale(my_grad, 0.5f, n_vars, tid, tpm);
     }
 
@@ -483,8 +509,7 @@ _MSL_DG_BODY = r"""
 
     float local_sum_sq = 0.0f;
     for (int i = (int)tid; i < n_vars; i += (int)tpm) local_sum_sq += my_pos[i] * my_pos[i];
-    shared[tid] = local_sum_sq;
-    float sum_sq = tg_reduce_sum(shared, tid, tpm);
+    float sum_sq = reduce_sum(local_sum_sq, shared, tid, tpm);
     float max_step = MAX_STEP_FACTOR * max(sqrt(sum_sq), (float)n_vars);
 
     int status = 1;
@@ -497,8 +522,7 @@ _MSL_DG_BODY = r"""
 
         float local_dir_sq = 0.0f;
         for (int i = (int)tid; i < n_vars; i += (int)tpm) local_dir_sq += my_dir[i] * my_dir[i];
-        shared[tid] = local_dir_sq;
-        float dir_norm = sqrt(tg_reduce_sum(shared, tid, tpm));
+        float dir_norm = sqrt(reduce_sum(local_dir_sq, shared, tid, tpm));
         if (dir_norm > max_step) parallel_scale(my_dir, max_step / dir_norm, n_vars, tid, tpm);
 
         float slope = parallel_dot(my_dir, my_grad, n_vars, tid, tpm, shared);
@@ -510,8 +534,7 @@ _MSL_DG_BODY = r"""
             float t = ad / ap;
             if (t > local_test_max) local_test_max = t;
         }
-        shared[tid] = local_test_max;
-        float lambda_min = MOVETOL / max(tg_reduce_max(shared, tid, tpm), 1e-30f);
+        float lambda_min = MOVETOL / max(reduce_max(local_test_max, shared, tid, tpm), 1e-30f);
 
         float lam = 1.0f, prev_lam = 1.0f, prev_e = old_energy;
         bool ls_done = false;
@@ -533,8 +556,7 @@ _MSL_DG_BODY = r"""
                     chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off);
             for (int t = fourth_start_t + (int)tid; t < fourth_end_t; t += (int)tpm)
                 local_trial_e += fourth_dim_e(out_pos, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
-            shared[tid] = local_trial_e;
-            float trial_e = tg_reduce_sum(shared, tid, tpm);
+            float trial_e = reduce_sum(local_trial_e, shared, tid, tpm);
 
             if (trial_e - old_energy <= FUNCTOL * lam * slope) {
                 energy = trial_e; ls_done = true;
@@ -576,23 +598,12 @@ _MSL_DG_BODY = r"""
             float t = abs(my_old_pos[i]) / max(abs(my_pos[i]), 1.0f);
             if (t > local_tolx) local_tolx = t;
         }
-        shared[tid] = local_tolx;
-        if (tg_reduce_max(shared, tid, tpm) < TOLX) { status = 0; break; }
+        if (reduce_max(local_tolx, shared, tid, tpm) < TOLX) { status = 0; break; }
 
         parallel_copy(my_old_grad, my_grad, n_vars, tid, tpm);
 
-        float local_new_e = 0.0f;
-        for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm)
-            local_new_e += dist_violation_e(out_pos, dist_pairs[t*2], dist_pairs[t*2+1],
-                dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off);
-        for (int t = chiral_start_t + (int)tid; t < chiral_end_t; t += (int)tpm)
-            local_new_e += chiral_violation_e(out_pos,
-                chiral_quads[t*4], chiral_quads[t*4+1], chiral_quads[t*4+2], chiral_quads[t*4+3],
-                chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off);
-        for (int t = fourth_start_t + (int)tid; t < fourth_end_t; t += (int)tpm)
-            local_new_e += fourth_dim_e(out_pos, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
-        shared[tid] = local_new_e;
-        energy = tg_reduce_sum(shared, tid, tpm);
+        // `energy` already holds trial_e of the accepted step, computed at these
+        // exact positions by the same code: re-evaluating it gave the same bits.
 
         DG_GRADIENT();
 
@@ -601,8 +612,7 @@ _MSL_DG_BODY = r"""
             float t = abs(my_grad[i]) * max(abs(my_pos[i]), 1.0f);
             if (t > local_grad_test) local_grad_test = t;
         }
-        shared[tid] = local_grad_test;
-        if (tg_reduce_max(shared, tid, tpm) / max(energy, 1.0f) < grad_tol) { status = 0; break; }
+        if (reduce_max(local_grad_test, shared, tid, tpm) / max(energy, 1.0f) < grad_tol) { status = 0; break; }
 
         // L-BFGS update
         for (int i = (int)tid; i < n_vars; i += (int)tpm)
@@ -615,22 +625,19 @@ _MSL_DG_BODY = r"""
             int slot = hist_idx % lbfgs_m;
             parallel_copy(&my_S[slot * n_vars], my_old_pos, n_vars, tid, tpm);
             parallel_copy(&my_Y[slot * n_vars], my_q, n_vars, tid, tpm);
-            if (tid == 0) my_rho[slot] = 1.0f / ys_dot;
-            threadgroup_barrier(mem_flags::mem_device);
+            my_rho[slot] = 1.0f / ys_dot;
             hist_idx++;
             if (hist_count < lbfgs_m) hist_count++;
         }
 
         // Two-loop recursion
         parallel_copy(my_q, my_grad, n_vars, tid, tpm);
-        device float* my_alpha = &work_alpha[conf_idx * lbfgs_m];
 
         for (int j = hist_count - 1; j >= 0; j--) {
             int slot = (hist_idx - 1 - (hist_count - 1 - j)) % lbfgs_m;
             if (slot < 0) slot += lbfgs_m;
             float alpha_j = my_rho[slot] * parallel_dot(&my_S[slot*n_vars], my_q, n_vars, tid, tpm, shared);
-            if (tid == 0) my_alpha[j] = alpha_j;
-            threadgroup_barrier(mem_flags::mem_device);
+            my_alpha[j] = alpha_j;
             parallel_saxpy(my_q, -alpha_j, &my_Y[slot*n_vars], n_vars, tid, tpm);
         }
         if (hist_count > 0) {
@@ -797,7 +804,7 @@ def _build_dg_kernel(
         output_names=[
             "out_pos", "out_energies", "out_statuses",
             "work_grad", "work_dir", "work_scratch",
-            "work_lbfgs", "work_rho", "work_alpha", "work_pf",
+            "work_lbfgs", "work_pf",
         ],
         header=header,
         source=source,
@@ -940,14 +947,12 @@ def dg_minimize_shared(
             (total_pos_size,),    # work_dir
             (3 * total_pos_size,),  # work_scratch (old_pos, old_grad, q)
             (max(1, total_lbfgs),),  # work_lbfgs (S + Y history)
-            (max(1, C * lbfgs_m),),  # work_rho
-            (max(1, C * lbfgs_m),),  # work_alpha
             (max(1, total_pf),),     # work_pf (distance-term prefactors)
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.int32,
             mx.float32, mx.float32, mx.float32,
-            mx.float32, mx.float32, mx.float32, mx.float32,
+            mx.float32, mx.float32,
         ],
     )
     mx.eval(results[0], results[1], results[2])

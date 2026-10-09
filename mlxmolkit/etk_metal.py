@@ -240,34 +240,77 @@ inline void etk_add_pair_terms(thread float* acc, const thread float* own,
     }
 }
 
-// ---- Threadgroup primitives (same as DG kernel) ----
-inline float tg_reduce_sum(threadgroup float* s, uint tid, uint n) {
+// ---- Reductions over the TPM lanes ----
+// With TPM == 32 the threadgroup is exactly one SIMD-group, so the reduction
+// runs in registers with xor-shuffles and needs no threadgroup memory or
+// barriers. The shuffle distances (16, 8, 4, 2, 1) are the strides of the
+// tree below, so each partial sum pairs the same operands in the same order
+// and every lane ends with the tree's exact result (float + is commutative).
+inline float reduce_sum(float v, threadgroup float* s, uint tid, uint n) {
+#if TPM == 32
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride=n/2;stride>0;stride>>=1){if(tid<stride)s[tid]+=s[tid+stride];threadgroup_barrier(mem_flags::mem_threadgroup);}
-    float r=s[0]; threadgroup_barrier(mem_flags::mem_threadgroup); return r;
-}
-inline float tg_reduce_max(threadgroup float* s, uint tid, uint n) {
+    s[tid] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride=n/2;stride>0;stride>>=1){if(tid<stride)s[tid]=max(s[tid],s[tid+stride]);threadgroup_barrier(mem_flags::mem_threadgroup);}
-    float r=s[0]; threadgroup_barrier(mem_flags::mem_threadgroup); return r;
+    for (uint stride = n / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] += s[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return s[0];
+#endif
 }
-inline float parallel_dot(const device float* a, const device float* b, int n, uint tid, uint tpm, threadgroup float* s) {
-    float sum=0.0f; for (int i=(int)tid;i<n;i+=(int)tpm) sum+=a[i]*b[i]; s[tid]=sum; return tg_reduce_sum(s,tid,tpm);
+inline float reduce_max(float v, threadgroup float* s, uint tid, uint n) {
+#if TPM == 32
+    v = max(v, simd_shuffle_xor(v, 16));
+    v = max(v, simd_shuffle_xor(v, 8));
+    v = max(v, simd_shuffle_xor(v, 4));
+    v = max(v, simd_shuffle_xor(v, 2));
+    v = max(v, simd_shuffle_xor(v, 1));
+    return v;
+#else
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = n / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] = max(s[tid], s[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return s[0];
+#endif
 }
-inline void parallel_saxpy(device float* a, float alpha, const device float* b, int n, uint tid, uint tpm) {
-    for (int i=(int)tid;i<n;i+=(int)tpm) a[i]+=alpha*b[i]; threadgroup_barrier(mem_flags::mem_device);
+// Element-wise helpers: lane tid only touches elements tid, tid+tpm, ...,
+// the same elements every helper and every element-wise loop of the kernel
+// gives it, so no barrier is needed between them (a thread sees its own
+// writes). A barrier is needed only where a lane reads elements another lane
+// wrote: positions before an energy/gradient evaluation, and the gradient,
+// which phase 2 writes atom by atom.
+inline float parallel_dot(const device float* a, const device float* b,
+    int n, uint tid, uint tpm, threadgroup float* s) {
+    float sum = 0.0f;
+    for (int i = (int)tid; i < n; i += (int)tpm) sum += a[i] * b[i];
+    return reduce_sum(sum, s, tid, tpm);
+}
+inline void parallel_saxpy(device float* a, float alpha, const device float* b,
+    int n, uint tid, uint tpm) {
+    for (int i = (int)tid; i < n; i += (int)tpm) a[i] += alpha * b[i];
 }
 inline void parallel_scale(device float* a, float alpha, int n, uint tid, uint tpm) {
-    for (int i=(int)tid;i<n;i+=(int)tpm) a[i]*=alpha; threadgroup_barrier(mem_flags::mem_device);
+    for (int i = (int)tid; i < n; i += (int)tpm) a[i] *= alpha;
 }
-inline void parallel_copy(device float* d, const device float* s, int n, uint tid, uint tpm) {
-    for (int i=(int)tid;i<n;i+=(int)tpm) d[i]=s[i]; threadgroup_barrier(mem_flags::mem_device);
+inline void parallel_copy(device float* dst, const device float* src, int n, uint tid, uint tpm) {
+    for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = src[i];
 }
-inline void parallel_set(device float* a, float v, int n, uint tid, uint tpm) {
-    for (int i=(int)tid;i<n;i+=(int)tpm) a[i]=v; threadgroup_barrier(mem_flags::mem_device);
+inline void parallel_set(device float* a, float val, int n, uint tid, uint tpm) {
+    for (int i = (int)tid; i < n; i += (int)tpm) a[i] = val;
 }
-inline void parallel_neg_copy(device float* d, const device float* s, int n, uint tid, uint tpm) {
-    for (int i=(int)tid;i<n;i+=(int)tpm) d[i]=-s[i]; threadgroup_barrier(mem_flags::mem_device);
+inline void parallel_neg_copy(device float* dst, const device float* src, int n, uint tid, uint tpm) {
+    for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = -src[i];
 }
 """
 
@@ -309,6 +352,7 @@ _ETK_BODY = r"""
     int lbfgs_start = lbfgs_history_starts[conf_idx];
 
     parallel_copy(&out_pos[atom_off*dim], &pos[atom_off*dim], n_vars, tid, tpm);
+    threadgroup_barrier(mem_flags::mem_device);  // energy reads every lane's atoms
 
     device float* my_pos = &out_pos[atom_off*dim];
     device float* my_grad = &work_grad[atom_off*dim];
@@ -318,7 +362,9 @@ _ETK_BODY = r"""
     device float* my_q = &work_scratch[2*total_pos_size + atom_off*dim];
     device float* my_S = &work_lbfgs[lbfgs_start];
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m*n_vars];
-    device float* my_rho = &work_rho[conf_idx * lbfgs_m];
+    // L-BFGS scalars: every lane computes identical values, so each keeps its own copy.
+    float my_rho[LBFGS_M];
+    float my_alpha[LBFGS_M];
 
     // ---- Gradient of the current positions into my_grad (all lanes return) ----
 #if GRAD_MODE == 1
@@ -380,6 +426,7 @@ _ETK_BODY = r"""
     // Reference: thread 0 adds every term serially.
     #define ETK_GRADIENT() \
         parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        threadgroup_barrier(mem_flags::mem_device); \
         if (tid == 0) { \
             for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off; \
                 torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5], \
@@ -430,15 +477,14 @@ _ETK_BODY = r"""
         int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
         local_e += dist14_e(out_pos, a,b, d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2], dim);
     }
-    shared[tid] = local_e;
-    float energy = tg_reduce_sum(shared, tid, tpm);
+    float energy = reduce_sum(local_e, shared, tid, tpm);
 
     ETK_GRADIENT();
 
     // ---- L-BFGS loop (identical to DG kernel) ----
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
     float lss=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm) lss+=my_pos[i]*my_pos[i];
-    shared[tid]=lss; float max_step=MAX_STEP_FACTOR*max(sqrt(tg_reduce_sum(shared,tid,tpm)),(float)n_vars);
+    float max_step=MAX_STEP_FACTOR*max(sqrt(reduce_sum(lss, shared, tid, tpm)),(float)n_vars);
     int status=1, hist_count=0, hist_idx=0;
 
     for (int iter=0; iter<max_iters && status==1; iter++) {
@@ -446,11 +492,11 @@ _ETK_BODY = r"""
         float old_energy = energy;
 
         float ld2=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm) ld2+=my_dir[i]*my_dir[i];
-        shared[tid]=ld2; float dn=sqrt(tg_reduce_sum(shared,tid,tpm));
+        float dn=sqrt(reduce_sum(ld2, shared, tid, tpm));
         if (dn>max_step) parallel_scale(my_dir,max_step/dn,n_vars,tid,tpm);
         float slope=parallel_dot(my_dir,my_grad,n_vars,tid,tpm,shared);
         float ltm=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_dir[i])/max(abs(my_pos[i]),1.0f);if(t>ltm)ltm=t;}
-        shared[tid]=ltm; float lmin=MOVETOL/max(tg_reduce_max(shared,tid,tpm),1e-30f);
+        float lmin=MOVETOL/max(reduce_max(ltm, shared, tid, tpm),1e-30f);
 
         float lam=1.0f,prev_lam=1.0f,prev_e=old_energy; bool ls_done=false;
         for (int ls=0; ls<MAX_LS_ITERS && !ls_done; ls++) {
@@ -477,7 +523,7 @@ _ETK_BODY = r"""
             for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm){
                 int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
                 lte+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
-            shared[tid]=lte; float trial_e=tg_reduce_sum(shared,tid,tpm);
+            float trial_e=reduce_sum(lte, shared, tid, tpm);
 
             if (trial_e-old_energy<=FUNCTOL*lam*slope){energy=trial_e;ls_done=true;}
             else {
@@ -497,44 +543,29 @@ _ETK_BODY = r"""
         for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_old_pos[i]=my_pos[i]-my_old_pos[i];
         threadgroup_barrier(mem_flags::mem_device);
         float ltx=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_old_pos[i])/max(abs(my_pos[i]),1.0f);if(t>ltx)ltx=t;}
-        shared[tid]=ltx; if(tg_reduce_max(shared,tid,tpm)<TOLX){status=0;break;}
+        if(reduce_max(ltx, shared, tid, tpm)<TOLX){status=0;break;}
 
         parallel_copy(my_old_grad,my_grad,n_vars,tid,tpm);
 
-        // New energy (parallel) + gradient
-        float lne=0.0f;
-        for (int t=tor_s+(int)tid;t<tor_e;t+=(int)tpm){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
-            float cp=calc_cos_phi(out_pos,a1,a2,a3,a4,dim);
-            lne+=torsion_e(cp,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
-                torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5]);}
-        for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-            lne+=improper_e(out_pos,ic,i0,i1,i2,improper_w[t],dim);}
-        for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
-            lne+=dist14_e(out_pos,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
-        for (int t=d13_s+(int)tid;t<d13_e;t+=(int)tpm){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
-            lne+=dist14_e(out_pos,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
-        for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
-            lne+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
-        shared[tid]=lne; energy=tg_reduce_sum(shared,tid,tpm);
+        // `energy` already holds trial_e of the accepted step, computed at these
+        // exact positions by the same code: re-evaluating it gave the same bits.
 
         ETK_GRADIENT();
 
         float lgt=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_grad[i])*max(abs(my_pos[i]),1.0f);if(t>lgt)lgt=t;}
-        shared[tid]=lgt; if(tg_reduce_max(shared,tid,tpm)/max(energy,1.0f)<grad_tol_v){status=0;break;}
+        if(reduce_max(lgt, shared, tid, tpm)/max(energy,1.0f)<grad_tol_v){status=0;break;}
 
         // L-BFGS update
         for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_q[i]=my_grad[i]-my_old_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
         float ys=parallel_dot(my_q,my_old_pos,n_vars,tid,tpm,shared);
         if (ys>1e-10f){int sl=hist_idx%lbfgs_m;parallel_copy(&my_S[sl*n_vars],my_old_pos,n_vars,tid,tpm);
-            parallel_copy(&my_Y[sl*n_vars],my_q,n_vars,tid,tpm);if(tid==0)my_rho[sl]=1.0f/ys;
-            threadgroup_barrier(mem_flags::mem_device);hist_idx++;if(hist_count<lbfgs_m)hist_count++;}
+            parallel_copy(&my_Y[sl*n_vars],my_q,n_vars,tid,tpm);my_rho[sl]=1.0f/ys;hist_idx++;if(hist_count<lbfgs_m)hist_count++;}
 
         parallel_copy(my_q,my_grad,n_vars,tid,tpm);
-        device float* my_alpha=&work_rho[(n_confs_cfg + (int)conf_idx)*lbfgs_m];
         for (int j=hist_count-1;j>=0;j--){int sl=(hist_idx-1-(hist_count-1-j))%lbfgs_m;if(sl<0)sl+=lbfgs_m;
             float aj=my_rho[sl]*parallel_dot(&my_S[sl*n_vars],my_q,n_vars,tid,tpm,shared);
-            if(tid==0)my_alpha[j]=aj;threadgroup_barrier(mem_flags::mem_device);
+            my_alpha[j]=aj;
             parallel_saxpy(my_q,-aj,&my_Y[sl*n_vars],n_vars,tid,tpm);}
         if (hist_count>0){int nw=(hist_idx-1)%lbfgs_m;if(nw<0)nw+=lbfgs_m;
             float sy=parallel_dot(&my_S[nw*n_vars],&my_Y[nw*n_vars],n_vars,tid,tpm,shared);
@@ -575,12 +606,12 @@ def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad
                 "lbfgs_history_starts",
                 "csr_slot_base", "csr_off", "csr_ent2", "conf_scr_base",
             ],
-            # Metal allows 31 buffers per kernel: alpha shares work_rho's
-            # buffer and the gradient scratch follows work_scratch.
+            # Metal allows 31 buffers per kernel: the gradient scratch
+            # follows work_scratch in the same buffer.
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch",
-                "work_lbfgs", "work_rho",
+                "work_lbfgs",
             ],
             header=header,
             source=source,
@@ -758,12 +789,12 @@ def etk_minimize_shared(
         output_shapes=[
             (total_pos_size,), (C,), (C,),
             (total_pos_size,), (total_pos_size,), (3 * total_pos_size + total_scr,),
-            (max(1, total_lbfgs),), (max(1, 2 * C * lbfgs_m),),
+            (max(1, total_lbfgs),),
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.int32,
             mx.float32, mx.float32, mx.float32,
-            mx.float32, mx.float32,
+            mx.float32,
         ],
     )
     mx.eval(results[0], results[1], results[2])

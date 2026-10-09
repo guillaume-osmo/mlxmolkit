@@ -47,12 +47,13 @@
     // L-BFGS history: S and Y vectors (m pairs), rho scalars
     device float* my_S = &work_lbfgs[lbfgs_start];
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m * n_terms];
-    device float* my_rho = &work_rho[mol_idx * lbfgs_m];
-    device float* my_alpha = &work_alpha[mol_idx * lbfgs_m];
+    // L-BFGS scalars: every lane computes identical values, so each keeps its own copy.
+    float my_rho[LBFGS_M_VAL];
+    float my_alpha[LBFGS_M_VAL];
 
     threadgroup float tg_reduce[TG_SIZE_VAL];
-    threadgroup float tg_grad_scale_shared;
-    threadgroup int tg_status_shared;
+    threadgroup float tg_grad_scale_shared;  // serial reference (GRAD_MODE 0) only
+    float grad_scale_l = 1.0f;  // gradient scale, identical in every lane
 
     // Serial energy+gradient macro (same as BFGS variant)
     #define SEQ_COMPUTE_EG(OUT_E) \
@@ -119,8 +120,7 @@
 #if GRAD_MODE == 1
     MMFF_PAR_GRADIENT();
     {
-        float sc = scale_grad_parallel(my_grad, n_terms, GRAD_SCALE_INIT, tid, tg_size, tg_reduce);
-        if (tid == 0) tg_grad_scale_shared = sc;
+        grad_scale_l = scale_grad_parallel(my_grad, n_terms, GRAD_SCALE_INIT, tid, tg_size, tg_reduce);
     }
 #else
     float seq_e_init = 0.0f;
@@ -131,9 +131,11 @@
         tg_grad_scale_shared = grad_scale;
     }
 #endif
-    // Fences both spaces: the scaling writes my_grad (device) and
-    // tg_grad_scale_shared (threadgroup), and all threads read both below.
+#if GRAD_MODE != 1
+    // Lane 0 scaled my_grad and set tg_grad_scale_shared; everyone reads both.
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    grad_scale_l = tg_grad_scale_shared;
+#endif
     float energy = 0.0f;
     // Re-sum with the tree reduction the line search uses, discarding the serial
     // sum above. The Armijo test differences this value against trial_e, so both
@@ -152,13 +154,12 @@
     tg_reduce[tid] = local_sum_sq;
     float max_step = MAX_STEP_FACTOR * max(sqrt(tg_reduce_sum(tg_reduce, tid, tg_size)), (float)n_terms);
 
-    if (tid == 0) tg_status_shared = 1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int status = 1;  // per lane: every lane takes the same decisions
 
     int hist_count = 0, hist_idx = 0;
 
     // ---- Main L-BFGS loop ----
-    for (int iter = 0; iter < max_iters && tg_status_shared == 1; iter++) {
+    for (int iter = 0; iter < max_iters && status == 1; iter++) {
 
         // === LINE SEARCH (same as BFGS variant) ===
         parallel_copy(my_old_pos, my_pos, n_terms, tid, tg_size);
@@ -171,14 +172,11 @@
         if (dir_norm > max_step) {
             float sc = max_step / dir_norm;
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dir[i] *= sc;
-            threadgroup_barrier(mem_flags::mem_device);
         }
 
         float slope = parallel_dot(my_dir, my_grad, n_terms, tid, tg_size, tg_reduce);
         if (slope >= 0.0f) {
-            if (tid == 0) tg_status_shared = 0;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            break;
+            status = 0; break;
         }
 
         float local_test_max = 0.0f;
@@ -186,10 +184,8 @@
             float tv = abs(my_dir[i]) / max(abs(my_pos[i]), 1.0f);
             if (tv > local_test_max) local_test_max = tv;
         }
-        tg_reduce[tid] = local_test_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size/2; s>0; s>>=1) { if(tid<s) tg_reduce[tid]=max(tg_reduce[tid],tg_reduce[tid+s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
-        float lambda_min = MOVETOL / max(tg_reduce[0], 1e-30f);
+        float red_max0 = tg_reduce_max_v(local_test_max, tg_reduce, tid, tg_size);
+        float lambda_min = MOVETOL / max(red_max0, 1e-30f);
 
         float lam = 1.0f, prev_lam = 1.0f, prev_e = old_energy;
         bool ls_done = false;
@@ -214,7 +210,6 @@
 
         // s_k = pos - old_pos
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_old_pos[i] = my_pos[i] - my_old_pos[i];
-        threadgroup_barrier(mem_flags::mem_device);
 
         // TOLX check
         float local_tolx = 0.0f;
@@ -222,10 +217,8 @@
             float tv = abs(my_old_pos[i]) / max(abs(my_pos[i]), 1.0f);
             if (tv > local_tolx) local_tolx = tv;
         }
-        tg_reduce[tid] = local_tolx;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s=tg_size/2;s>0;s>>=1){if(tid<s)tg_reduce[tid]=max(tg_reduce[tid],tg_reduce[tid+s]);threadgroup_barrier(mem_flags::mem_threadgroup);}
-        if (tg_reduce[0] < TOLX) { if(tid==0)tg_status_shared=0; threadgroup_barrier(mem_flags::mem_threadgroup); break; }
+        float red_max1 = tg_reduce_max_v(local_tolx, tg_reduce, tid, tg_size);
+        if (red_max1 < TOLX) { status = 0; break; }
 
         // Save old grad, recompute energy+gradient
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_old_grad[i] = my_grad[i];
@@ -238,9 +231,7 @@
 #if GRAD_MODE == 1
         MMFF_PAR_GRADIENT();
         {
-            float sc = scale_grad_parallel(my_grad, n_terms, tg_grad_scale_shared, tid, tg_size, tg_reduce);
-            threadgroup_barrier(mem_flags::mem_threadgroup);  // every lane has read the old scale
-            if (tid == 0) tg_grad_scale_shared = sc;
+            grad_scale_l = scale_grad_parallel(my_grad, n_terms, grad_scale_l, tid, tg_size, tg_reduce);
         }
 #else
         float seq_e = 0.0f;
@@ -250,10 +241,10 @@
             scale_grad_serial(my_grad, n_terms, grad_scale, false);
             tg_grad_scale_shared = grad_scale;
         }
-#endif
-        // Fences both spaces: scale_grad_serial writes my_grad (device) and
-        // tg_grad_scale_shared (threadgroup), and all threads read both below.
+        // Lane 0 scaled my_grad and set tg_grad_scale_shared; everyone reads both.
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        grad_scale_l = tg_grad_scale_shared;
+#endif
 
         // Grad convergence check
         float local_grad_test = 0.0f;
@@ -261,26 +252,22 @@
             float tv = abs(my_grad[i]) * max(abs(my_pos[i]), 1.0f);
             if (tv > local_grad_test) local_grad_test = tv;
         }
-        tg_reduce[tid] = local_grad_test;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s=tg_size/2;s>0;s>>=1){if(tid<s)tg_reduce[tid]=max(tg_reduce[tid],tg_reduce[tid+s]);threadgroup_barrier(mem_flags::mem_threadgroup);}
-        if (tg_reduce[0] / max(energy * tg_grad_scale_shared, 1.0f) < grad_tol) {
-            if(tid==0)tg_status_shared=0; threadgroup_barrier(mem_flags::mem_threadgroup); break;
+        float red_max2 = tg_reduce_max_v(local_grad_test, tg_reduce, tid, tg_size);
+        if (red_max2 / max(energy * grad_scale_l, 1.0f) < grad_tol) {
+            status = 0; break;
         }
 
         // ==== L-BFGS UPDATE (replaces dense Hessian) ====
         // y_k = grad_new - grad_old
         for (int i = (int)tid; i < n_terms; i += (int)tg_size)
             my_q[i] = my_grad[i] - my_old_grad[i];
-        threadgroup_barrier(mem_flags::mem_device);
 
         float ys = parallel_dot(my_q, my_old_pos, n_terms, tid, tg_size, tg_reduce);
         if (ys > 1e-10f) {
             int slot = hist_idx % lbfgs_m;
             parallel_copy(&my_S[slot * n_terms], my_old_pos, n_terms, tid, tg_size);
             parallel_copy(&my_Y[slot * n_terms], my_q, n_terms, tid, tg_size);
-            if (tid == 0) my_rho[slot] = 1.0f / ys;
-            threadgroup_barrier(mem_flags::mem_device);
+            my_rho[slot] = 1.0f / ys;
             hist_idx++;
             if (hist_count < lbfgs_m) hist_count++;
         }
@@ -292,10 +279,8 @@
             int slot = (hist_idx - 1 - (hist_count - 1 - j)) % lbfgs_m;
             if (slot < 0) slot += lbfgs_m;
             float aj = my_rho[slot] * parallel_dot(&my_S[slot*n_terms], my_q, n_terms, tid, tg_size, tg_reduce);
-            if (tid == 0) my_alpha[j] = aj;
-            threadgroup_barrier(mem_flags::mem_device);
+            my_alpha[j] = aj;
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_q[i] -= aj * my_Y[slot*n_terms+i];
-            threadgroup_barrier(mem_flags::mem_device);
         }
         if (hist_count > 0) {
             int nw = (hist_idx - 1) % lbfgs_m; if (nw < 0) nw += lbfgs_m;
@@ -303,7 +288,6 @@
             float yy = parallel_dot(&my_Y[nw*n_terms], &my_Y[nw*n_terms], n_terms, tid, tg_size, tg_reduce);
             float gamma = sy / max(yy, 1e-30f);
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_q[i] *= gamma;
-            threadgroup_barrier(mem_flags::mem_device);
         }
         for (int j = 0; j < hist_count; j++) {
             int slot = (hist_idx - 1 - (hist_count - 1 - j)) % lbfgs_m;
@@ -311,12 +295,11 @@
             float bj = my_rho[slot] * parallel_dot(&my_Y[slot*n_terms], my_q, n_terms, tid, tg_size, tg_reduce);
             float aj = my_alpha[j];
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_q[i] += (aj - bj) * my_S[slot*n_terms+i];
-            threadgroup_barrier(mem_flags::mem_device);
         }
         parallel_neg_copy(my_dir, my_q, n_terms, tid, tg_size);
     }
 
     if (tid == 0) {
         out_energies[mol_idx] = energy;
-        out_statuses[mol_idx] = tg_status_shared;
+        out_statuses[mol_idx] = status;
     }
