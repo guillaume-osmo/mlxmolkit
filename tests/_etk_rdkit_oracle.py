@@ -5,8 +5,11 @@ or ``constructPlain3DForceField`` (``Code/DistGeom/DistGeomUtils.cpp``) from the
 ``CrystalFFDetails`` that ``getExperimentalTorsions`` fills
 (``Code/GraphMol/ForceFieldHelpers/CrystalFF/TorsionPreferences.cpp``), and does
 not expose it to Python. This module rebuilds it from the source of the
-2025.09 release series (tag ``Release_2025_09_1b1``; the installed RDKit is
-2025.09.4), as follows:
+2026.03 release series (tag ``Release_2026_03_3``; the reference RDKit is
+2026.03.6). Its ETK code is the same as 2025.09's apart from the sign of
+UFF inversion's C2 gradient term, which is zero for C/N/O; the CSD torsion
+patterns did change (macrocycles), and they are read from the installed
+RDKit. It is built as follows:
 
 * distance and angle constraints are RDKit's own contribs, evaluated by an
   ``rdForceField.ForceField`` (``AddDistanceConstraint`` is
