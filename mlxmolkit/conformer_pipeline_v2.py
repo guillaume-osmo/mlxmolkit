@@ -46,6 +46,11 @@ class ConformerResult:
     positions_3d: List[np.ndarray]   # list of (n_atoms, 3) arrays
     energies: List[float]
     converged: List[bool]
+    # True when MMFF94 optimised this molecule's conformers (their energies are
+    # then MMFF energies); False when MMFF was not requested or could not type
+    # the molecule, in which case mmff_error says why.
+    mmff_applied: bool = False
+    mmff_error: Optional[str] = None
 
 
 @dataclass
@@ -127,6 +132,23 @@ def _auto_iters(max_atoms: int, base: int, scale: float) -> int:
     return max(base, int(base + scale * max_atoms))
 
 
+def _mmff_params_or_error(mol, mmff_variant: str):
+    """MMFF parameters of one molecule, or ``(None, reason)`` if it cannot be typed.
+
+    The parameters do not depend on the coordinates except through the 100 A
+    non-bonded cutoff, which an all-zero conformer satisfies for every pair, so
+    each molecule is typed once instead of once per chunk.
+    """
+    from rdkit import Chem
+    m = Chem.Mol(mol)
+    m.RemoveAllConformers()
+    m.AddConformer(Chem.Conformer(m.GetNumAtoms()), assignId=True)
+    try:
+        return extract_mmff_params(m, mmff_variant=mmff_variant), None
+    except Exception as exc:  # untypable atom, missing parameters, ...
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 def _process_chunk(
     chunk: List[tuple],
     dg_params_list: List[DGParams],
@@ -141,8 +163,11 @@ def _process_chunk(
     mmff_variant: str,
     fourth_dim_weight: float,
     chiral_weight: float,
+    mmff_cache: Optional[dict] = None,
 ) -> List[tuple]:
     """Run DG → 3D → ETK → MMFF on one chunk. Returns per-conformer results."""
+    if mmff_cache is None:
+        mmff_cache = {}
 
     # Identify molecules in this chunk
     mol_k: dict[int, int] = {}
@@ -254,40 +279,42 @@ def _process_chunk(
             pos3 = etk_out
 
     # ---- Stage 4: MMFF94 optimization (3D) ----
+    # Each molecule is typed once (mmff_cache); a molecule MMFF cannot type is
+    # skipped on its own and keeps its ETK geometry and energy, while the rest
+    # of the chunk is still optimised.
     mmff_e = np.zeros(C, dtype=np.float32)
-    mmff_converged = np.ones(C, dtype=bool)
-    mmff_ran = False
+    mmff_converged = np.zeros(C, dtype=bool)
+    mmff_applied = np.zeros(C, dtype=bool)
     if run_mmff and mols_list is not None:
-        from rdkit import Chem
-        chunk_mmff = []
-        mmff_converged[:] = False
-        # Use first conformer of each molecule for MMFF param extraction
-        conf_cursor = 0
-        for chunk_mol_ord, mol_idx in enumerate(mol_order):
-            mol = mols_list[mol_idx]
-            n_a = dg_params_list[mol_idx].n_atoms
-            s3 = int(batch3.conf_atom_starts[conf_cursor]) * 3
-            conf_pos = pos3[s3:s3 + n_a * 3].reshape(n_a, 3)
-            if mol.GetNumConformers() == 0:
-                mol.AddConformer(Chem.Conformer(int(n_a)), assignId=True)
-            conf = mol.GetConformer(0)
-            for a_idx in range(n_a):
-                conf.SetAtomPosition(a_idx, conf_pos[a_idx].astype(float).tolist())
-            try:
-                chunk_mmff.append(extract_mmff_params(mol, mmff_variant=mmff_variant))
-            except Exception:
-                chunk_mmff = None
-                break
-            conf_cursor += mol_k[mol_idx]
-
-        if chunk_mmff is not None:
-            chunk_mmff_k = [mol_k[m] for m in mol_order]
-            pos3, mmff_e, mmff_converged = mmff_minimize_nk(
-                chunk_mmff, chunk_mmff_k, pos3,
+        ok_mols, ok_k = [], []
+        seg = []  # (start, end) flat coordinate ranges of the optimised conformers
+        c0 = 0
+        for mol_idx in mol_order:
+            k = mol_k[mol_idx]
+            if mol_idx not in mmff_cache:
+                mmff_cache[mol_idx] = _mmff_params_or_error(mols_list[mol_idx], mmff_variant)
+            params, _ = mmff_cache[mol_idx]
+            if params is not None:
+                ok_mols.append(params)
+                ok_k.append(k)
+                mmff_applied[c0:c0 + k] = True
+                seg.append((int(batch3.conf_atom_starts[c0]) * 3,
+                            int(batch3.conf_atom_starts[c0 + k]) * 3))
+            c0 += k
+        if ok_mols:
+            sub_pos = np.concatenate([pos3[a:b] for a, b in seg])
+            sub_out, sub_e, sub_conv = mmff_minimize_nk(
+                ok_mols, ok_k, sub_pos,
                 max_iters=mmff_max_iters,
                 use_lbfgs=mmff_use_lbfgs,
             )
-            mmff_ran = True
+            pos3 = pos3.copy()
+            cur = 0
+            for a, b in seg:
+                pos3[a:b] = sub_out[cur:cur + (b - a)]
+                cur += b - a
+            mmff_e[mmff_applied] = sub_e
+            mmff_converged[mmff_applied] = sub_conv
 
     # ---- Collect results per conformer ----
     results = []
@@ -298,16 +325,18 @@ def _process_chunk(
             n_a = dg_params_list[mol_idx].n_atoms
             s3 = int(batch3.conf_atom_starts[c]) * 3
             p3 = pos3[s3:s3 + n_a * 3].reshape(n_a, 3).copy()
-            energy = float(mmff_e[c]) if mmff_ran else float(dg_e[c]) + float(etk_e[c])
+            applied = bool(mmff_applied[c])
+            energy = float(mmff_e[c]) if applied else float(dg_e[c]) + float(etk_e[c])
             converged = (
                 bool(dg_s[c] == 0)
                 and (not has_etk or bool(etk_s[c] == 0))
-                and (not run_mmff or (mmff_ran and bool(mmff_converged[c])))
+                and (not applied or bool(mmff_converged[c]))
             )
             results.append((
                 mol_idx, p3,
                 energy,
                 converged,
+                applied,
             ))
             c += 1
 
@@ -416,6 +445,7 @@ def generate_conformers_nk(
         mmff_use_lbfgs = max_atoms_all >= _LBFGS_ATOM_THRESHOLD
 
     total_confs = 0
+    mmff_cache: dict = {}
     for chunk_idx, chunk in enumerate(chunks):
         chunk_results = _process_chunk(
             chunk, dg_params_list,
@@ -430,12 +460,17 @@ def generate_conformers_nk(
             mmff_variant=mmff_variant,
             fourth_dim_weight=fourth_dim_weight,
             chiral_weight=chiral_weight,
+            mmff_cache=mmff_cache,
         )
-        for mol_idx, pos_3d, energy, converged in chunk_results:
+        for mol_idx, pos_3d, energy, converged, applied in chunk_results:
             mol_results[mol_idx].positions_3d.append(pos_3d)
             mol_results[mol_idx].energies.append(energy)
             mol_results[mol_idx].converged.append(converged)
+            mol_results[mol_idx].mmff_applied = applied
         total_confs += sum(c_end - c_start for _, c_start, c_end in chunk)
+
+    for mol_idx, (_, err) in mmff_cache.items():
+        mol_results[mol_idx].mmff_error = err
 
     return PipelineResult(
         molecules=mol_results,
