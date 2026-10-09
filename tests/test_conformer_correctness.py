@@ -176,3 +176,12 @@ def test_return_failed_adds_rejected_attempts_without_changing_accepted_ones():
     failed = [(c, s) for c, s in zip(m1.fail_cause, m1.fail_stage) if c is not None]
     assert len(failed) == sum(m1.n_failed_by_cause.values())
     assert all(isinstance(c, EmbedFailureCause) and s in ("dg", "etk", "mmff") for c, s in failed)
+
+
+def test_three_atom_molecules_do_not_crash_the_batch():
+    """Fewer atoms than the 4D embedding has coordinates: used to raise IndexError
+    in the metric-matrix start and take every molecule in the call down with it."""
+    smis = ["S=C=S", "O=[Si]=O", "[N-]=[N+]=O", "CC(=O)Oc1ccccc1C(=O)O"]
+    res = generate_conformers_nk(smis, n_confs_per_mol=2, variant="srETKDGv3", seed=7)
+    assert len(res.molecules) == len(smis)
+    assert all(len(m.positions_3d) > 0 for m in res.molecules)

@@ -74,8 +74,10 @@ def _embed_one_metric(bmat: np.ndarray, rng, dim: int = 4) -> np.ndarray:
     # RDKit (randNegEig=True) fills a random [-1,1] coordinate when a top-`dim` eigenvalue is
     # non-positive, instead of collapsing that DoF to exactly 0 (which biases small/linear molecules).
     cols = []
+    # A molecule with fewer atoms than `dim` (S=C=S, N2O in 4D) has fewer
+    # eigenvalues than coordinates; the missing ones count as non-positive.
     for k in range(dim):
-        if lam[k] > 0.0:
+        if k < len(lam) and lam[k] > 0.0:
             cols.append(V[:, idx[k]] * np.sqrt(lam[k]))
         else:
             cols.append(1.0 - 2.0 * rng.random(N))
