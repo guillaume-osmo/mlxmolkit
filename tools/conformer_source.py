@@ -39,7 +39,12 @@ from rdkit.Chem import AllChem
 ETKDG_VARIANT = "ETKDGv3"
 
 # Shared defaults so callers agree without repeating magic numbers.
-DEFAULT_MAX_EMBED_ATTEMPTS = 1000
+# ``None`` = RDKit's own default (``maxIterations = 0``, i.e. 10 x the atom count
+# per conformer). Until 2026-10 this constant was 1000, but it never reached
+# RDKit: it was written to ``params.maxAttempts``, which does not exist, behind a
+# ``hasattr`` guard that skipped it silently. Every cache built so far therefore
+# used RDKit's default, and keeping ``None`` here keeps them reproducible.
+DEFAULT_MAX_EMBED_ATTEMPTS: int | None = None
 DEFAULT_RANDOM_COORDS_SEED_OFFSET = 7919
 DEFAULT_MMFF_VARIANT = "MMFF94"
 DEFAULT_MAX_OPT_ITERS = 200
@@ -63,8 +68,11 @@ def make_etkdg_params(
     params.randomSeed = int(seed)
     if prune_rms_thresh is not None:
         params.pruneRmsThresh = float(prune_rms_thresh)
-    if max_attempts is not None and hasattr(params, "maxAttempts"):
-        params.maxAttempts = int(max_attempts)
+    if max_attempts is not None:
+        # RDKit's name for "embedding attempts per conformer" is maxIterations.
+        # Set it unconditionally: a silently skipped limit is how this went
+        # unapplied before (see DEFAULT_MAX_EMBED_ATTEMPTS).
+        params.maxIterations = int(max_attempts)
     params.useRandomCoords = bool(use_random_coords)
     return params
 

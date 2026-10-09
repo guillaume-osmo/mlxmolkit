@@ -40,7 +40,7 @@ def mol_from_smiles_with_conformers(
     min_conformers: int = 1,
     seed: int,
     prune_rms_thresh: float,
-    max_embed_attempts: int,
+    max_embed_attempts: int | None,
     optimize: bool,
     mmff_variant: str,
     max_opt_iters: int,
@@ -85,7 +85,7 @@ def mol_from_graph_with_conformers(
     min_conformers: int = 1,
     seed: int,
     prune_rms_thresh: float,
-    max_embed_attempts: int,
+    max_embed_attempts: int | None,
     optimize: bool,
     mmff_variant: str,
     max_opt_iters: int,
@@ -428,7 +428,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260613)
     parser.add_argument("--prune-rms-thresh", type=float, default=0.5)
-    parser.add_argument("--max-embed-attempts", type=int, default=1000)
+    parser.add_argument(
+        "--max-embed-attempts",
+        type=int,
+        default=None,
+        help="RDKit maxIterations per conformer; default = RDKit's (10 x atoms). "
+        "Before 2026-10 the old default of 1000 was never applied.",
+    )
     parser.add_argument("--no-optimize", action="store_true")
     parser.add_argument("--mmff-variant", default="MMFF94")
     parser.add_argument("--max-opt-iters", type=int, default=300)
