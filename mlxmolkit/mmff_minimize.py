@@ -2,9 +2,12 @@
 MMFF94 optimization using Shivam's in-kernel BFGS Metal kernel.
 
 Entire BFGS loop runs on GPU — zero CPU round-trips.
-Two variants:
-  - Single-thread per conformer (for large molecules)
-  - Threadgroup-parallel TG=32 (for typical molecules, faster Hessian)
+Two variants, both one 32-lane threadgroup per conformer:
+  - dense BFGS (default for < 150 atoms)
+  - L-BFGS (no dense Hessian)
+The gradient uses all 32 lanes (see ``parallel_grad``), and the kernels take
+the batch size from ``atom_starts`` rather than a template argument, so one
+compiled kernel serves every batch shape.
 
 MMFF params are small (O(atoms), not O(atoms²)), so replicating them
 per conformer has negligible memory overhead.
@@ -17,6 +20,7 @@ from typing import List, Optional
 import numpy as np
 import mlx.core as mx
 
+from .conformer_metal import GRAD_GATHER, GRAD_SERIAL, build_atom_term_csr
 from .mmff_params import MMFFParams, extract_mmff_params
 
 _KERNEL_DIR = Path(__file__).parent
@@ -31,10 +35,55 @@ TG_SIZE = 32
 LBFGS_M = 8
 MAX_ATOMS_METAL = 64
 
-# Kernel caches
+# Kernel caches, keyed by gradient mode (GRAD_SERIAL / GRAD_GATHER)
 _mmff_kernel = None
-_mmff_kernel_tg = None
-_mmff_kernel_lbfgs_tg = None
+_mmff_kernel_tg: dict[int, object] = {}
+_mmff_kernel_lbfgs_tg: dict[int, object] = {}
+
+_CSR_INPUTS = ["csr_meta", "csr_off", "csr_ent2"]
+
+
+def _mmff_grad_csr(mmff_params_list: List[MMFFParams], conf_counts: List[int]):
+    """Per-molecule CSR of the MMFF terms touching each atom.
+
+    Types in the serial gradient's order: bond, angle, stretch-bend, oop,
+    torsion, vdW, electrostatic. Terms are indexed within their molecule, so
+    the k replicas of a molecule share one index; the kernel adds the
+    conformer's own term offset.
+
+    Returns ``csr_meta`` = [conf_to_mol (C) | slot_base (N+1)], ``csr_off``
+    and ``csr_ent2`` = interleaved (term * 4 + role, partner atom).
+    """
+    n_atoms = np.array([p.n_atoms for p in mmff_params_list], dtype=np.int64)
+
+    def starts(counts):
+        out = np.zeros(len(counts) + 1, dtype=np.int64)
+        np.cumsum(counts, out=out[1:])
+        return out
+
+    def cols(*names):
+        counts = [len(getattr(p, names[0])) for p in mmff_params_list]
+        if sum(counts) == 0:
+            return starts(counts), np.zeros((0, len(names)), dtype=np.int64)
+        arr = np.concatenate([
+            np.stack([np.asarray(getattr(p, n), dtype=np.int64) for n in names], axis=1)
+            for p in mmff_params_list if len(getattr(p, names[0])) > 0
+        ])
+        return starts(counts), arr
+
+    types = [
+        cols("bond_idx1", "bond_idx2"),
+        cols("angle_idx1", "angle_idx2", "angle_idx3"),
+        cols("strbend_idx1", "strbend_idx2", "strbend_idx3"),
+        cols("oop_idx1", "oop_idx2", "oop_idx3", "oop_idx4"),
+        cols("torsion_idx1", "torsion_idx2", "torsion_idx3", "torsion_idx4"),
+        cols("vdw_idx1", "vdw_idx2"),
+        cols("ele_idx1", "ele_idx2"),
+    ]
+    slot_base, off, ent, partner = build_atom_term_csr(n_atoms, types, local_terms=True)
+    conf_to_mol = np.repeat(np.arange(len(conf_counts), dtype=np.int32), conf_counts)
+    meta = np.concatenate([conf_to_mol, slot_base]).astype(np.int32)
+    return meta, off, np.stack([ent, partner], axis=1).ravel().astype(np.int32)
 
 
 def _pack_mmff_for_nk(
@@ -173,12 +222,12 @@ def _pack_mmff_for_nk(
     }
 
 
-def _get_mmff_kernel_tg():
-    global _mmff_kernel_tg
-    if _mmff_kernel_tg is None:
-        tg_header = _MSL_HEADER + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\n"
-        _mmff_kernel_tg = mx.fast.metal_kernel(
-            name="mmff_bfgs_tg",
+def _get_mmff_kernel_tg(grad_mode: int = GRAD_GATHER):
+    if grad_mode not in _mmff_kernel_tg:
+        tg_header = (f"#define GRAD_MODE {int(grad_mode)}\n" + _MSL_HEADER
+                     + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\n")
+        _mmff_kernel_tg[grad_mode] = mx.fast.metal_kernel(
+            name=f"mmff_bfgs_tg_g{int(grad_mode)}",
             input_names=[
                 "pos", "atom_starts", "hessian_starts", "config",
                 "all_term_starts",
@@ -189,7 +238,7 @@ def _get_mmff_kernel_tg():
                 "tor_quads", "tor_params",
                 "vdw_pairs", "vdw_params",
                 "ele_pairs", "ele_params",
-            ],
+            ] + _CSR_INPUTS,
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch", "work_hessian",
@@ -197,15 +246,15 @@ def _get_mmff_kernel_tg():
             header=tg_header,
             source=_MSL_SOURCE_TG,
         )
-    return _mmff_kernel_tg
+    return _mmff_kernel_tg[grad_mode]
 
 
-def _get_mmff_kernel_lbfgs_tg():
-    global _mmff_kernel_lbfgs_tg
-    if _mmff_kernel_lbfgs_tg is None:
-        tg_header = _MSL_HEADER + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\nconstant int LBFGS_M_VAL = {LBFGS_M};\n"
-        _mmff_kernel_lbfgs_tg = mx.fast.metal_kernel(
-            name="mmff_lbfgs_tg",
+def _get_mmff_kernel_lbfgs_tg(grad_mode: int = GRAD_GATHER):
+    if grad_mode not in _mmff_kernel_lbfgs_tg:
+        tg_header = (f"#define GRAD_MODE {int(grad_mode)}\n" + _MSL_HEADER
+                     + f"\nconstant int TG_SIZE_VAL = {TG_SIZE};\nconstant int LBFGS_M_VAL = {LBFGS_M};\n")
+        _mmff_kernel_lbfgs_tg[grad_mode] = mx.fast.metal_kernel(
+            name=f"mmff_lbfgs_tg_g{int(grad_mode)}",
             input_names=[
                 "pos", "atom_starts", "lbfgs_starts", "config",
                 "all_term_starts",
@@ -216,7 +265,7 @@ def _get_mmff_kernel_lbfgs_tg():
                 "tor_quads", "tor_params",
                 "vdw_pairs", "vdw_params",
                 "ele_pairs", "ele_params",
-            ],
+            ] + _CSR_INPUTS,
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch",
@@ -225,7 +274,7 @@ def _get_mmff_kernel_lbfgs_tg():
             header=tg_header,
             source=_MSL_SOURCE_LBFGS_TG,
         )
-    return _mmff_kernel_lbfgs_tg
+    return _mmff_kernel_lbfgs_tg[grad_mode]
 
 
 def mmff_minimize_nk(
@@ -236,6 +285,7 @@ def mmff_minimize_nk(
     max_iters: int = 500,
     grad_tol: float = 1e-4,
     use_lbfgs: bool = False,
+    parallel_grad: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run MMFF94 optimization entirely on GPU — zero CPU round-trips.
 
@@ -259,6 +309,11 @@ def mmff_minimize_nk(
         If True, use L-BFGS (O(mn) memory, no dense Hessian).
         If False (default), use full BFGS (O(n²) Hessian, faster for
         small molecules but more memory).
+    parallel_grad : bool
+        True (default): all 32 lanes compute the gradient (pair-term force
+        factors strided over lanes, then one lane per atom summing its terms
+        through a CSR index in the serial order) -- deterministic and
+        bit-identical to False, where thread 0 computes it serially.
 
     Returns
     -------
@@ -266,21 +321,31 @@ def mmff_minimize_nk(
     """
     packed = _pack_mmff_for_nk(mmff_params_list, conf_counts)
     packed['config'] = mx.array(np.array([packed['C'], max_iters, grad_tol], dtype=np.float32))
+    grad_mode = GRAD_GATHER if parallel_grad else GRAD_SERIAL
 
     C = packed['C']
     total_pos_size = packed['total_pos_size']
     total_hessian_size = packed['total_hessian_size']
 
+    if grad_mode == GRAD_GATHER:
+        csr_meta, csr_off, csr_ent2 = _mmff_grad_csr(mmff_params_list, conf_counts)
+    else:
+        csr_meta, csr_off, csr_ent2 = (np.zeros(1, dtype=np.int32),) * 3
+    csr = [mx.array(csr_meta), mx.array(csr_off), mx.array(csr_ent2)]
+    # work_scratch: 3 position-sized vectors, then the parallel gradient's
+    # per-term force factors of the bond, vdW and electrostatic terms.
+    n_pair_terms = sum(len(p.bond_idx1) + len(p.vdw_idx1) + len(p.ele_idx1)
+                       for p, k in zip(mmff_params_list, conf_counts) for _ in range(k))
+    scratch_size = total_pos_size * 3 + (n_pair_terms if grad_mode == GRAD_GATHER else 0)
+
     if use_lbfgs:
         # L-BFGS: replace dense Hessian with history vectors
+        n_terms_c = np.diff(np.array(packed['atom_starts'])).astype(np.int64) * 3
         lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
-        for c in range(C):
-            n_a = int(packed['atom_starts'][c + 1].item()) - int(packed['atom_starts'][c].item())
-            n_terms = n_a * 3
-            lbfgs_starts[c + 1] = lbfgs_starts[c] + 2 * LBFGS_M * n_terms
+        np.cumsum(2 * LBFGS_M * n_terms_c, out=lbfgs_starts[1:])
         total_lbfgs = int(lbfgs_starts[-1])
 
-        kernel = _get_mmff_kernel_lbfgs_tg()
+        kernel = _get_mmff_kernel_lbfgs_tg(grad_mode)
         outputs = kernel(
             inputs=[
                 mx.array(positions_3d),
@@ -293,11 +358,11 @@ def mmff_minimize_nk(
                 packed['tor_quads'], packed['tor_params'],
                 packed['vdw_pairs'], packed['vdw_params'],
                 packed['ele_pairs'], packed['ele_params'],
-            ],
+            ] + csr,
             output_shapes=[
                 (total_pos_size,), (C,), (C,),
                 (total_pos_size,), (total_pos_size,),
-                (total_pos_size * 3,),
+                (max(1, scratch_size),),
                 (max(1, total_lbfgs),),
                 (max(1, C * LBFGS_M),),
                 (max(1, C * LBFGS_M),),
@@ -309,11 +374,10 @@ def mmff_minimize_nk(
             ],
             grid=(C * TG_SIZE, 1, 1),
             threadgroup=(TG_SIZE, 1, 1),
-            template=[("total_pos_size", total_pos_size)],
         )
     else:
         # Full BFGS with dense Hessian
-        kernel = _get_mmff_kernel_tg()
+        kernel = _get_mmff_kernel_tg(grad_mode)
         outputs = kernel(
             inputs=[
                 mx.array(positions_3d),
@@ -326,11 +390,11 @@ def mmff_minimize_nk(
                 packed['tor_quads'], packed['tor_params'],
                 packed['vdw_pairs'], packed['vdw_params'],
                 packed['ele_pairs'], packed['ele_params'],
-            ],
+            ] + csr,
             output_shapes=[
                 (total_pos_size,), (C,), (C,),
                 (total_pos_size,), (total_pos_size,),
-                (total_pos_size * 3,),
+                (max(1, scratch_size),),
                 (max(total_hessian_size, 1),),
             ],
             output_dtypes=[
@@ -339,7 +403,6 @@ def mmff_minimize_nk(
             ],
             grid=(C * TG_SIZE, 1, 1),
             threadgroup=(TG_SIZE, 1, 1),
-            template=[("total_pos_size", total_pos_size)],
         )
 
     mx.eval(outputs[0], outputs[1], outputs[2])

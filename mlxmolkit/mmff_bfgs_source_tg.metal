@@ -8,6 +8,9 @@
     float grad_tol = config[2];
 
     if ((int)mol_idx >= n_mols_cfg) return;
+    // Total coordinates of the batch, read here rather than templated so the
+    // kernel compiles once instead of once per batch shape.
+    const int total_pos_size = atom_starts[n_mols_cfg] * 3;
 
     int atom_start = atom_starts[mol_idx];
     int atom_end = atom_starts[mol_idx + 1];
@@ -30,6 +33,10 @@
     threadgroup_barrier(mem_flags::mem_device);
 
     device float* my_pos = &out_pos[atom_start * 3];
+    // Parallel gradient: per-term force factors of the pair terms, by global term.
+    device float* pf_bond = &work_scratch[3 * total_pos_size];
+    device float* pf_vdw = pf_bond + all_term_starts[0*ts_stride + n_mols_cfg];
+    device float* pf_ele = pf_vdw + all_term_starts[5*ts_stride + n_mols_cfg];
     device float* my_grad = &work_grad[atom_start * 3];
     device float* my_dir = &work_dir[atom_start * 3];
     device float* my_old_pos = &work_scratch[atom_start * 3];
@@ -113,6 +120,13 @@
         }
 
     // ---- Initial energy + gradient (thread 0 computes the gradient) ----
+#if GRAD_MODE == 1
+    MMFF_PAR_GRADIENT();
+    {
+        float sc = scale_grad_parallel(my_grad, n_terms, GRAD_SCALE_INIT, tid, tg_size, tg_reduce);
+        if (tid == 0) tg_grad_scale_shared = sc;
+    }
+#else
     float seq_e_init = 0.0f;
     SEQ_COMPUTE_EG(seq_e_init);
     if (tid == 0) {
@@ -120,7 +134,8 @@
         scale_grad_serial(my_grad, n_terms, grad_scale, true);
         tg_grad_scale_shared = grad_scale;
     }
-    // Fences both spaces: scale_grad_serial writes my_grad (device) and
+#endif
+    // Fences both spaces: the scaling writes my_grad (device) and
     // tg_grad_scale_shared (threadgroup), and all threads read both below.
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     float energy = 0.0f;
@@ -284,6 +299,14 @@
         // the next Armijo test compare like with like.
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
+#if GRAD_MODE == 1
+        MMFF_PAR_GRADIENT();
+        {
+            float sc = scale_grad_parallel(my_grad, n_terms, tg_grad_scale_shared, tid, tg_size, tg_reduce);
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // every lane has read the old scale
+            if (tid == 0) tg_grad_scale_shared = sc;
+        }
+#else
         float seq_e = 0.0f;
         SEQ_COMPUTE_EG(seq_e);
         if (tid == 0) {
@@ -291,6 +314,7 @@
             scale_grad_serial(my_grad, n_terms, grad_scale, false);
             tg_grad_scale_shared = grad_scale;
         }
+#endif
         // Fences both spaces: scale_grad_serial writes my_grad (device) and
         // tg_grad_scale_shared (threadgroup), and all threads read both below.
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);

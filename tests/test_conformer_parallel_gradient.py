@@ -1,4 +1,4 @@
-"""The 32-lane gradients of the DG and ETK kernels against the serial ones.
+"""The 32-lane gradients of the DG / ETK / MMFF kernels against the serial ones.
 
 Each parallel gradient sums every component in the serial loop's term order,
 so the optimisers must take bit-identical trajectories, not merely close ones:
@@ -12,6 +12,8 @@ from mlxmolkit.conformer_metal import build_atom_term_csr, dg_minimize_shared
 from mlxmolkit.dg_extract import extract_dg_params, get_bounds_matrix, metric_matrix_positions
 from mlxmolkit.etk_extract import extract_etk_params
 from mlxmolkit.etk_metal import etk_minimize_shared
+from mlxmolkit.mmff_minimize import mmff_minimize_nk
+from mlxmolkit.mmff_params import extract_mmff_params
 from mlxmolkit.shared_batch import add_etk_to_batch, init_random_positions, pack_shared_dg_batch
 
 Chem = pytest.importorskip("rdkit.Chem")
@@ -99,3 +101,48 @@ def test_etk_parallel_gradient_is_bit_identical_to_serial():
     np.testing.assert_array_equal(par[2], ser[2])
     np.testing.assert_array_equal(par[1], ser[1])
     np.testing.assert_array_equal(par[0], ser[0])
+
+
+@pytest.mark.parametrize("use_lbfgs", [False, True])
+def test_mmff_parallel_gradient_is_bit_identical_to_serial(use_lbfgs):
+    from rdkit.Chem import AllChem
+
+    params, pos, counts = [], [], []
+    for i, smi in enumerate(SMILES):
+        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+        cids = AllChem.EmbedMultipleConfs(mol, numConfs=3, randomSeed=5 + i)
+        params.append(extract_mmff_params(mol))
+        counts.append(len(cids))
+        for cid in cids:
+            pos.append(mol.GetConformer(cid).GetPositions().astype(np.float32).ravel())
+    pos = np.concatenate(pos)
+    ser = mmff_minimize_nk(params, counts, pos, max_iters=400, use_lbfgs=use_lbfgs, parallel_grad=False)
+    par = mmff_minimize_nk(params, counts, pos, max_iters=400, use_lbfgs=use_lbfgs, parallel_grad=True)
+    np.testing.assert_array_equal(par[2], ser[2])
+    np.testing.assert_array_equal(par[1], ser[1])
+    np.testing.assert_array_equal(par[0], ser[0])
+
+
+def test_mmff_kernel_compiles_once_for_every_batch_shape(monkeypatch):
+    from rdkit.Chem import AllChem
+    from mlxmolkit import mmff_minimize
+    from mlxmolkit.conformer_metal import GRAD_GATHER
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=3, randomSeed=1)
+    p = extract_mmff_params(mol)
+    real = mmff_minimize._get_mmff_kernel_tg(GRAD_GATHER)
+    calls = []
+
+    def spy(**kw):
+        calls.append(kw)
+        return real(**kw)
+
+    monkeypatch.setitem(mmff_minimize._mmff_kernel_tg, GRAD_GATHER, spy)
+    for k in (1, 2, 3):
+        pos = np.concatenate([mol.GetConformer(c).GetPositions().astype(np.float32).ravel() for c in range(k)])
+        mmff_minimize_nk([p], [k], pos, max_iters=5)
+    # A template argument is part of the compiled library's key: total_pos_size
+    # used to be one, so every new batch shape paid a fresh Metal compile.
+    assert len(calls) == 3
+    assert all(not kw.get("template") for kw in calls)
