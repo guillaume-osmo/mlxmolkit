@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import subprocess
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
@@ -231,6 +232,43 @@ def _mmff_params_or_error(mol, mmff_variant: str):
 
 _STAGE_NONE, _STAGE_DG, _STAGE_ETK, _STAGE_MMFF = 0, 1, 2, 3
 _STAGE_NAMES = {_STAGE_DG: "dg", _STAGE_ETK: "etk", _STAGE_MMFF: "mmff"}
+
+
+# RDKit before 2026.03 gives both 1-4 pairs across a stereo double bond in a
+# ring the trans window (BoundsMatrixBuilder's _getAtomStereo ignores the
+# direction a 1-4 path is walked): on humulene-type terpenes the cis pairs get
+# [3.76, 3.88] A instead of [2.76, 2.88]. ETK then twists the bond to the wrong
+# isomer and the E/Z check rejects most attempts -- RDKit 2025.09.4's own
+# srETKDGv3 rejects 40-1048 per 8 conformers of them, 2026.03.6 none.
+_RING_DB_BOUNDS_FIXED = (2026, 3)
+
+
+def _rdkit_version() -> tuple:
+    from rdkit import __version__
+    parts = []
+    for p in __version__.split(".")[:2]:
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _warn_ring_stereo_double_bonds(mols) -> None:
+    """Warn once if this RDKit has the ring double-bond 1-4 bounds bug and it applies."""
+    if _rdkit_version() >= _RING_DB_BOUNDS_FIXED:
+        return
+    from rdkit import Chem
+    for mol in mols:
+        for bond in mol.GetBonds():
+            if (bond.GetBondType() == Chem.BondType.DOUBLE and bond.IsInRing()
+                    and bond.GetStereo() > Chem.BondStereo.STEREOANY):
+                from rdkit import __version__
+                warnings.warn(
+                    f"RDKit {__version__} gives the cis 1-4 pairs across a stereo double bond "
+                    f"in a ring a trans bounds window (fixed in RDKit 2026.03): such "
+                    f"molecules (e.g. {Chem.MolToSmiles(Chem.RemoveHs(mol))}) will mostly embed "
+                    f"with the wrong E/Z and be rejected and resampled. Use RDKit >= 2026.03.",
+                    RuntimeWarning, stacklevel=3)
+                return
 
 
 # Floats of BFGS inverse Hessian one ETK call may hold (512 MB).
@@ -560,6 +598,8 @@ def generate_conformers_nk(
         # After extract_dg_params: same stereo perception as the DG constraints.
         gate_params.append(cg.build_gate_params(mol, bmat))
         mol_n_atoms.append(dg_params_list[-1].n_atoms)
+
+    _warn_ring_stereo_double_bonds(mols)
 
     result = PipelineResult(molecules=[
         ConformerResult(n_atoms=dg_params_list[i].n_atoms, positions_3d=[], energies=[],
