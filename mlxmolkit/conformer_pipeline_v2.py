@@ -26,7 +26,6 @@ from .shared_batch import (
     concat_etk_params,
     pack_per_conformer_etk_batch,
     pack_shared_dg_batch,
-    init_random_positions,
 )
 from .conformer_metal import dg_minimize_shared
 from .etk_metal import etk_minimize_shared
@@ -132,6 +131,75 @@ def _auto_iters(max_atoms: int, base: int, scale: float) -> int:
     return max(base, int(base + scale * max_atoms))
 
 
+def _resolve_iteration_caps(
+    dg_params_list: List[DGParams], dg_max_iters: int, etk_max_iters: int,
+    mmff_max_iters: int,
+) -> tuple[int, int, int]:
+    """Iteration caps for the whole call, from the most complex molecule.
+
+    The caps are fixed once per call, not per chunk: a cap that followed the
+    largest molecule of each chunk made a conformer's result depend on which
+    other molecules happened to share its chunk. A cap is a ceiling, not a
+    cost -- every conformer leaves its loop on its own convergence test.
+    """
+    if not dg_params_list:
+        return max(dg_max_iters, 1), max(etk_max_iters, 1), max(mmff_max_iters, 1)
+    max_atoms = max(p.n_atoms for p in dg_params_list)
+    max_constraints = max(len(p.dist_idx1) for p in dg_params_list)
+    complexity = max(max_atoms, int(max_constraints ** 0.5))
+    if dg_max_iters <= 0:
+        dg_max_iters = _auto_iters(complexity, base=300, scale=20.0)
+    if etk_max_iters <= 0:
+        etk_max_iters = _auto_iters(complexity, base=150, scale=10.0)
+    if mmff_max_iters <= 0:
+        mmff_max_iters = _auto_iters(complexity, base=200, scale=15.0)
+    return dg_max_iters, etk_max_iters, mmff_max_iters
+
+
+def _conformer_seed(base_entropy: int, mol_idx: int, conf_idx: int, attempt: int) -> tuple:
+    """Seed of one embedding attempt: (seed, molecule, conformer slot, attempt).
+
+    Every attempt draws its random start from its own stream, so the output
+    does not depend on chunking, batch size or the free memory that sets it.
+    """
+    return (int(base_entropy), int(mol_idx), int(conf_idx), int(attempt))
+
+
+def _dg_continue_unconverged(
+    batch4: SharedConstraintBatch, chunk_dg: List[DGParams], dg_out: np.ndarray,
+    dg_e: np.ndarray, dg_s: np.ndarray, max_iters: int,
+    fourth_dim_weight: float, chiral_weight: float,
+) -> None:
+    """Continue the DG minimisation of the conformers that hit the iteration cap.
+
+    RDKit's firstMinimization keeps calling minimize() until it converges;
+    the kernel stops at max_iters, so the unconverged conformers -- and only
+    those, whatever their number -- are restarted from where they stopped
+    with twice the cap. The improved result is kept per conformer.
+    Updates dg_out / dg_e / dg_s in place.
+    """
+    todo = np.flatnonzero(dg_s != 0)
+    if len(todo) == 0:
+        return
+    sub_mol = batch4.conf_to_mol[todo]
+    uniq, counts = np.unique(sub_mol, return_counts=True)  # todo is mol-sorted
+    sub_batch = pack_shared_dg_batch([chunk_dg[m] for m in uniq], counts.tolist(), dim=4)
+    spans = [(int(batch4.conf_atom_starts[c]) * 4, int(batch4.conf_atom_starts[c + 1]) * 4)
+             for c in todo]
+    sub_pos = np.concatenate([dg_out[a:b] for a, b in spans])
+    out2, e2, s2 = dg_minimize_shared(
+        sub_batch, sub_pos, max_iters=max_iters,
+        fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
+    )
+    for j, c in enumerate(todo):
+        if s2[j] == 0 or e2[j] < dg_e[c]:
+            a, b = spans[j]
+            sa = int(sub_batch.conf_atom_starts[j]) * 4
+            dg_out[a:b] = out2[sa:sa + (b - a)]
+            dg_e[c] = e2[j]
+            dg_s[c] = s2[j]
+
+
 def _mmff_params_or_error(mol, mmff_variant: str):
     """MMFF parameters of one molecule, or ``(None, reason)`` if it cannot be typed.
 
@@ -155,7 +223,7 @@ def _process_chunk(
     etk_params_list: Optional[List[ETKParams]],
     mols_list: Optional[list],
     run_mmff: bool,
-    seed_offset: int,
+    conf_seeds: List[tuple],
     dg_max_iters: int,
     etk_max_iters: int,
     mmff_max_iters: int,
@@ -165,7 +233,12 @@ def _process_chunk(
     chiral_weight: float,
     mmff_cache: Optional[dict] = None,
 ) -> List[tuple]:
-    """Run DG → 3D → ETK → MMFF on one chunk. Returns per-conformer results."""
+    """Run DG → 3D → ETK → MMFF on one chunk. Returns per-conformer results.
+
+    ``conf_seeds`` holds one seed per conformer of the chunk, in chunk order.
+    The iteration caps must already be resolved (> 0), see
+    :func:`_resolve_iteration_caps`.
+    """
     if mmff_cache is None:
         mmff_cache = {}
 
@@ -182,49 +255,24 @@ def _process_chunk(
     chunk_k = [mol_k[m] for m in mol_order]
     C = sum(chunk_k)
 
-    # Auto-scale iterations by largest molecule in this chunk.
-    # Larger molecules have more constraints → harder energy landscape.
-    # Small molecules converge early via in-kernel TOLX/grad checks.
-    max_atoms = max(dg_params_list[m].n_atoms for m in mol_order)
-    max_constraints = max(len(dg_params_list[m].dist_idx1) for m in mol_order)
-    complexity = max(max_atoms, int(max_constraints ** 0.5))
-    if dg_max_iters <= 0:
-        dg_max_iters = _auto_iters(complexity, base=300, scale=20.0)
-    if etk_max_iters <= 0:
-        etk_max_iters = _auto_iters(complexity, base=150, scale=10.0)
-    if mmff_max_iters <= 0:
-        mmff_max_iters = _auto_iters(complexity, base=200, scale=15.0)
-
     # ---- Stage 1: DG minimize (4D) ----
     # Initial coords via RDKit's metric-matrix distance-geometry embedding (random distance
     # matrix within bounds -> double-centred Gram -> top-4 eigenvectors), NOT Gaussian noise:
     # the Gaussian start lands in a different DG basin and does not reproduce RDKit's conformers.
+    # A molecule without a bounds matrix falls back to a Gaussian start, drawn
+    # from the same per-conformer stream.
     batch4 = pack_shared_dg_batch(chunk_dg, chunk_k, dim=4)
-    _bounds_mats = [dg.bounds_mat for dg in chunk_dg]
-    if all(b is not None for b in _bounds_mats):
-        pos4 = metric_matrix_positions(batch4, _bounds_mats, seed=42 + seed_offset, dim=4)
-    else:
-        pos4 = init_random_positions(batch4, seed=42 + seed_offset)
+    pos4 = metric_matrix_positions(
+        batch4, [dg.bounds_mat for dg in chunk_dg], dim=4, conf_seeds=conf_seeds)
     dg_out, dg_e, dg_s = dg_minimize_shared(
         batch4, pos4, max_iters=dg_max_iters,
         fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
     )
 
-    # ---- Stage 1b: Retry non-converged with 2x iterations (warm start) ----
-    n_failed = int(np.sum(dg_s != 0))
-    if n_failed > 0 and n_failed < C:
-        dg_out2, dg_e2, dg_s2 = dg_minimize_shared(
-            batch4, dg_out, max_iters=dg_max_iters * 2,
-            fourth_dim_weight=fourth_dim_weight, chiral_weight=chiral_weight,
-        )
-        # Keep improved results for conformers that were not converged
-        for c in range(C):
-            if dg_s[c] != 0 and (dg_s2[c] == 0 or dg_e2[c] < dg_e[c]):
-                s = int(batch4.conf_atom_starts[c]) * 4
-                e = int(batch4.conf_atom_starts[c + 1]) * 4
-                dg_out[s:e] = dg_out2[s:e]
-                dg_e[c] = dg_e2[c]
-                dg_s[c] = dg_s2[c]
+    # ---- Stage 1b: continue the conformers that hit the cap (warm start) ----
+    _dg_continue_unconverged(
+        batch4, chunk_dg, dg_out, dg_e, dg_s, dg_max_iters * 2,
+        fourth_dim_weight, chiral_weight)
 
     # ---- Stage 1c: Stereo checks (reject bad chirality) ----
     if mols_list is not None:
@@ -362,6 +410,7 @@ def generate_conformers_nk(
     mmff_max_iters: int = 0,
     mmff_use_lbfgs: bool | None = None,
     mmff_variant: str = "MMFF94",
+    seed: int = 42,
 ) -> PipelineResult:
     """Generate 3D conformers for N molecules x k conformers each.
 
@@ -390,6 +439,11 @@ def generate_conformers_nk(
         Whether to run MMFF94 force field optimization (default False).
     mmff_max_iters : int
         L-BFGS iterations for MMFF stage.
+    seed : int
+        Random seed. Conformer j of molecule i starts from its own random
+        stream seeded by (seed, i, j, attempt), so the output is identical
+        whatever the chunking, ``max_confs_per_batch`` or free memory. A
+        negative seed draws fresh entropy (non-reproducible), like RDKit's -1.
     """
     from rdkit import Chem
 
@@ -424,6 +478,10 @@ def generate_conformers_nk(
     # MMFF extraction deferred — needs a conformer, we'll embed after DG+ETK
     # to avoid wasting time on a separate RDKit EmbedMolecule call
 
+    dg_max_iters, etk_max_iters, mmff_max_iters = _resolve_iteration_caps(
+        dg_params_list, dg_max_iters, etk_max_iters, mmff_max_iters)
+    base_entropy = seed if seed >= 0 else int(np.random.SeedSequence().entropy)
+
     # ---- Compute batch size ----
     if max_confs_per_batch is None:
         max_confs_per_batch = _compute_max_confs_per_batch(
@@ -452,7 +510,8 @@ def generate_conformers_nk(
             etk_params_list if run_etk else None,
             mols,  # needed for stereo checks + MMFF
             run_mmff,
-            seed_offset=chunk_idx * 10000,
+            conf_seeds=[_conformer_seed(base_entropy, m, j, 0)
+                        for m, c_start, c_end in chunk for j in range(c_start, c_end)],
             dg_max_iters=dg_max_iters,
             etk_max_iters=etk_max_iters,
             mmff_max_iters=mmff_max_iters,

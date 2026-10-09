@@ -83,15 +83,30 @@ def _embed_one_metric(bmat: np.ndarray, rng, dim: int = 4) -> np.ndarray:
     return X.astype(np.float32)
 
 
-def metric_matrix_positions(batch, bounds_mats, seed: int = 42, dim: int = 4) -> np.ndarray:
+def metric_matrix_positions(batch, bounds_mats, seed: int = 42, dim: int = 4,
+                            conf_seeds=None) -> np.ndarray:
     """RDKit-style DG initial coords for every conformer in `batch`, atom-major flat array.
-    `bounds_mats[m]` is molecule m's bounds matrix (m indexes batch.conf_to_mol)."""
+
+    `bounds_mats[m]` is molecule m's bounds matrix (m indexes batch.conf_to_mol).
+
+    Without `conf_seeds`, one random stream seeded by `seed` is drawn through
+    the conformers in batch order, so a conformer's start depends on every
+    conformer packed before it. With `conf_seeds` (one entry per conformer,
+    anything `np.random.default_rng` accepts, e.g. a tuple of non-negative
+    ints), conformer c draws from its own stream, so its start depends only on
+    its own seed and molecule -- not on batch composition or chunking.
+    """
     import os as _os
     _force_gauss = bool(_os.environ.get("MLXMOLKIT_GAUSSIAN_INIT"))   # A/B toggle for validation
+    if conf_seeds is not None and len(conf_seeds) != int(batch.n_confs_total):
+        raise ValueError(f"conf_seeds has {len(conf_seeds)} entries for "
+                         f"{int(batch.n_confs_total)} conformers")
     rng = np.random.default_rng(seed)
     n_total = int(batch.conf_atom_starts[-1])
     out = np.zeros(n_total * dim, np.float32)
     for c in range(int(batch.n_confs_total)):
+        if conf_seeds is not None:
+            rng = np.random.default_rng(conf_seeds[c])
         m = int(batch.conf_to_mol[c])
         a0 = int(batch.conf_atom_starts[c]); a1 = int(batch.conf_atom_starts[c + 1])
         bmat = None if _force_gauss else bounds_mats[m]
