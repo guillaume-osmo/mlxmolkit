@@ -23,8 +23,9 @@ from .dg_extract import DGParams, extract_dg_params, get_bounds_matrix, metric_m
 from .etk_extract import ETKDG_VARIANTS, ETKParams, extract_etk_params
 from .shared_batch import (
     SharedConstraintBatch,
+    concat_etk_params,
+    pack_per_conformer_etk_batch,
     pack_shared_dg_batch,
-    add_etk_to_batch,
     init_random_positions,
 )
 from .conformer_metal import dg_minimize_shared
@@ -228,64 +229,27 @@ def _process_chunk(
         s3 = int(batch3.conf_atom_starts[c]) * 3
         pos3[s3:s3 + n_a * 3] = p4[:, :3].flatten()
 
-    # ---- Stage 2c: Update reference positions (setReferenceValues) ----
-    # Re-center dist12/dist13 bounds around measured 3D distances from DG.
-    # This is critical for angle quality — ETK then refines torsions around
-    # the true geometry instead of fighting against initial bounds estimates.
-    if etk_params_list is not None:
-        chunk_etk = [etk_params_list[m] for m in mol_order]
-        add_etk_to_batch(batch3, chunk_etk)
-
-        for c in range(C):
-            mol_idx_c = batch3.conf_to_mol[c]
-            n_a = batch3.mol_n_atoms[mol_idx_c]
-            s3 = int(batch3.conf_atom_starts[c]) * 3
-            pos_c = pos3[s3:s3 + n_a * 3].reshape(n_a, 3)
-
-            # Update dist12 bounds (bonds)
-            if batch3.etk_dist12_idx1 is not None:
-                d12_s = batch3.etk_dist12_term_starts[mol_idx_c]
-                d12_e = batch3.etk_dist12_term_starts[mol_idx_c + 1]
-                for t in range(d12_s, d12_e):
-                    a = batch3.etk_dist12_idx1[t]
-                    b = batch3.etk_dist12_idx2[t]
-                    measured = np.linalg.norm(pos_c[a] - pos_c[b])
-                    hw = (batch3.etk_dist12_ub[t] - batch3.etk_dist12_lb[t]) / 2.0
-                    batch3.etk_dist12_lb[t] = measured - hw
-                    batch3.etk_dist12_ub[t] = measured + hw
-
-            # Update dist13 bounds (angles)
-            if batch3.etk_dist13_idx1 is not None:
-                d13_s = batch3.etk_dist13_term_starts[mol_idx_c]
-                d13_e = batch3.etk_dist13_term_starts[mol_idx_c + 1]
-                for t in range(d13_s, d13_e):
-                    a = batch3.etk_dist13_idx1[t]
-                    b = batch3.etk_dist13_idx2[t]
-                    measured = np.linalg.norm(pos_c[a] - pos_c[b])
-                    hw = (batch3.etk_dist13_ub[t] - batch3.etk_dist13_lb[t]) / 2.0
-                    batch3.etk_dist13_lb[t] = measured - hw
-                    batch3.etk_dist13_ub[t] = measured + hw
-
+    # ---- Stage 2c: per-conformer reference values (RDKit setReferenceValues) ----
+    # RDKit's ETK force field restrains every 1-2 and 1-3 distance to the value
+    # it has in THAT conformer's DG output (+/- 0.01 A). The reference therefore
+    # differs per conformer, so the ETK batch carries one constraint set per
+    # conformer instead of one per molecule.
     # ---- Stage 3: ETK minimize (3D) ----
-    # ETK params already added to batch3 in stage 2c (with updated reference positions)
     etk_e = np.zeros(C, dtype=np.float32)
     etk_s = np.zeros(C, dtype=np.int32)
     has_etk = False
     if etk_params_list is not None:
-        if batch3.etk_torsion_term_starts is None:
-            # Params not added yet (no reference update path)
-            chunk_etk = [etk_params_list[m] for m in mol_order]
-            add_etk_to_batch(batch3, chunk_etk)
-        has_etk = (
-            (batch3.etk_torsion_term_starts is not None and batch3.etk_torsion_term_starts[-1] > 0)
-            or (batch3.etk_improper_term_starts is not None and batch3.etk_improper_term_starts[-1] > 0)
-            or (batch3.etk_dist12_term_starts is not None and batch3.etk_dist12_term_starts[-1] > 0)
-            or (batch3.etk_dist13_term_starts is not None and batch3.etk_dist13_term_starts[-1] > 0)
-            or (batch3.etk_dist14_term_starts is not None and batch3.etk_dist14_term_starts[-1] > 0)
+        etk_batch = pack_per_conformer_etk_batch(
+            concat_etk_params([etk_params_list[m] for m in mol_order]),
+            batch3.mol_n_atoms, batch3.conf_to_mol, pos3,
+        )
+        has_etk = any(
+            int(getattr(etk_batch, f"etk_{t}_term_starts")[-1]) > 0
+            for t in ("torsion", "improper", "dist12", "dist13", "dist14")
         )
         if has_etk:
             etk_out, etk_e, etk_s = etk_minimize_shared(
-                batch3, pos3, max_iters=etk_max_iters,
+                etk_batch, pos3, max_iters=etk_max_iters,
             )
             pos3 = etk_out
 
