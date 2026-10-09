@@ -52,8 +52,10 @@ marked "ETK only" are skipped after MMFF, see below):
   conformer can arrive at it in ETK, and MMFF cannot leave an exact 180 deg
   angle (its bending gradient vanishes there).
 * ``BOND_LENGTH`` (mlxmolkit): any bonded distance more than
-  ``BOND_LENGTH_TOL`` (0.10 A after ETK, 0.25 A after MMFF) outside its
-  bounds-matrix window.
+  ``BOND_LENGTH_TOL`` (0.20 A after ETK, 0.25 A after MMFF) outside its
+  bounds-matrix window. A sanity check, not a quality filter: RDKit's own
+  ETKDGv3 conformers that pass every other check reach 0.144 A outside the
+  window (bicyclo[3.3.1]nonane C-C at 1.41 A against [1.504, 1.524]).
 
 After MMFF, ``FINAL_CHIRAL_BOUNDS`` is skipped and the bond tolerance widened:
 the bounds matrix encodes UFF-like lengths, and an MMFF minimum legitimately
@@ -111,7 +113,7 @@ CHIRAL_VOLUME_FRACTION = 0.8
 PERCEPTION_ZERO_VOLUME_TOL = 0.1   # RDKit assignChiralTypesFrom3D
 # mlxmolkit-only thresholds.
 LINEAR_ANGLE_DEG = 175.0
-BOND_LENGTH_TOL = 0.10        # A outside the bounds-matrix 1-2 window, after ETK
+BOND_LENGTH_TOL = 0.20        # A outside the bounds-matrix 1-2 window, after ETK
 BOND_LENGTH_TOL_MMFF = 0.25   # after MMFF (see the module docstring)
 
 _TET = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)

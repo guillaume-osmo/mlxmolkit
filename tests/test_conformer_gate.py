@@ -119,7 +119,7 @@ def test_short_bond_fails_and_mmff_tolerance_is_wider():
     c1, c2 = 1, 2
     d = x[c2] - x[c1]
     lb = params.bond_lb[[i for i, (a, b) in enumerate(params.bond_idx) if {a, b} == {c1, c2}][0]]
-    target = lb - 0.18  # 0.18 A short: beyond the ETK tolerance, within the MMFF one
+    target = lb - 0.23  # 0.23 A short: beyond the ETK tolerance, within the MMFF one
     moving = [c2, 3] + [n.GetIdx() for a in (c2, 3) for n in mol.GetAtomWithIdx(a).GetNeighbors()
                         if n.GetAtomicNum() == 1]
     delta = d / np.linalg.norm(d) * (target - np.linalg.norm(d))
