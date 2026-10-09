@@ -39,6 +39,7 @@ from mlxmolkit.cheese import (
     shape_carbo_matrix_mlx,
     shape_tanimoto_matrix_mlx,
 )
+from mlxmolkit.cheese_fused import cheese_max_similarity_metal, cheese_similarity_matrix_metal
 
 __all__ = [
     "CheeseAlignmentConfig",
@@ -50,6 +51,8 @@ __all__ = [
     "cheese_alignment_matrix",
     "cheese_batch",
     "cheese_batch_from_rdkit_mols",
+    "cheese_max_similarity_metal",
+    "cheese_similarity_matrix_metal",
     "cheese_similarity_matrix_mlx",
     "cheese_similarity_pairs_mlx",
     "electrostatic_carbo_matrix_mlx",
