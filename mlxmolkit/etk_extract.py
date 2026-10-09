@@ -4,7 +4,8 @@ Extract ETKDG torsion parameters from RDKit molecules.
 Extracts:
   - CSD experimental torsion preferences (6-term Fourier)
   - Improper torsion terms (planarity at sp2 centers)
-  - 1-2, 1-3, and 1-4 distance constraints (from bounds matrix)
+  - 1-2 and 1-3 distance constraints (per-conformer reference lengths) and
+    long-range distance constraints (bounds matrix)
 
 These parameters are used in stage 5 of the ETKDG pipeline, where 3D
 coordinates are refined after 4D→3D collapse to match torsional
@@ -75,7 +76,9 @@ class ETKParams:
     dist13_ub: np.ndarray        # (n_dist13,) float32
     dist13_weight: np.ndarray    # (n_dist13,) float32
 
-    # 1-4 and long-range distance constraints: E = 0.5 * w * (d - bound)² if violated
+    # Fixed-window distance restraints, E = 0.5 * w * (d - bound)² outside [lb, ub]: every pair
+    # that is not bonded, not a bond angle's ends and not a torsion's ends (RDKit's long-range
+    # terms). The field name is historical.
     dist14_idx1: np.ndarray      # (n_dist14,) int32
     dist14_idx2: np.ndarray      # (n_dist14,) int32
     dist14_lb: np.ndarray        # (n_dist14,) float32 — lower bound distance
@@ -118,7 +121,7 @@ class BatchedETKSystem:
     dist13_weight: np.ndarray
     dist13_term_starts: np.ndarray   # (n_mols+1,) int32
 
-    # 1-4 distance constraints (global atom indices)
+    # Fixed-window distance restraints (global atom indices)
     dist14_idx1: np.ndarray
     dist14_idx2: np.ndarray
     dist14_lb: np.ndarray
@@ -131,11 +134,9 @@ def extract_etk_params(
     mol: Chem.Mol,
     bounds_mat: np.ndarray,
     improper_weight: float = 10.0,
-    dist14_weight: float = 1.0,
     *,
     use_exp_torsion: bool = True,
     use_basic_knowledge: bool = True,
-    use_long_range: bool = True,
     long_range_weight: float = 10.0,
     ring_planarity_fc: float = 100.0,
     use_small_ring_torsions: bool = False,
@@ -302,109 +303,57 @@ def extract_etk_params(
         imp_idx = np.zeros((0, 4), dtype=np.int32)
         imp_w = np.zeros(0, dtype=np.float32)
 
-    # --- 1-2 distance constraints (bonds) ---
-    # Enforce correct bond lengths in 3D. Uses bounds matrix midpoint ± tolerance.
-    BOND_TOL = 0.01  # A
-    BOND_FC = 100.0
+    # --- Distance restraints, RDKit's construct3DForceField / constructPlain3DForceField ---
+    # RDKit tracks the pairs it restrains (atomPairs): the end atoms of every torsion term,
+    # every bond, every bond angle. Each of those has its own term (or, for a torsion's end
+    # atoms, none); every other pair is held to its bounds-matrix window. No ETK stage runs
+    # without experimental torsions or basic knowledge (plain DG).
+    run_field = use_exp_torsion or use_basic_knowledge
+    restrained = {(min(q[0], q[3]), max(q[0], q[3])) for q in torsion_idx_list}
+
+    # 1-2 (every bond) and 1-3 (every bond angle): RDKit restrains them to the length they
+    # have in the conformer entering ETK, +/- KNOWN_DIST_TOL, with KNOWN_DIST_FORCE_CONSTANT.
+    # The window stored here is centred on the bounds-matrix midpoint and re-centred on each
+    # conformer's own distance by pack_per_conformer_etk_batch.
+    KNOWN_DIST_TOL = 0.01  # A
+    KNOWN_DIST_FC = 100.0
     d12_i1, d12_i2, d12_lb, d12_ub, d12_w = [], [], [], [], []
-    if use_basic_knowledge:
+    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
+    if run_field:
         for bond in mol.GetBonds():
             a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
             lo, hi = min(a, b), max(a, b)
-            lb_val = bounds_mat[hi, lo]
-            ub_val = bounds_mat[lo, hi]
-            if lb_val > 0 and ub_val > 0:
-                mid = (lb_val + ub_val) / 2.0
-                d12_i1.append(a)
-                d12_i2.append(b)
-                d12_lb.append(mid - BOND_TOL)
-                d12_ub.append(mid + BOND_TOL)
-                d12_w.append(BOND_FC)
-
-    n_d12 = len(d12_i1)
-
-    # --- 1-3 distance constraints (angles) ---
-    # Enforce correct angles via 1-3 distance bounds. Critical for geometry quality.
-    ANGLE_FC = 100.0
-    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
-    if use_basic_knowledge:
+            mid = (bounds_mat[hi, lo] + bounds_mat[lo, hi]) / 2.0
+            d12_i1.append(a); d12_i2.append(b)
+            d12_lb.append(mid - KNOWN_DIST_TOL); d12_ub.append(mid + KNOWN_DIST_TOL)
+            d12_w.append(KNOWN_DIST_FC)
+            restrained.add((lo, hi))
         for atom in mol.GetAtoms():
-            center = atom.GetIdx()
             neighbors = sorted([n.GetIdx() for n in atom.GetNeighbors()])
             for i in range(len(neighbors)):
                 for j in range(i + 1, len(neighbors)):
                     a, b = neighbors[i], neighbors[j]
-                    lo, hi = min(a, b), max(a, b)
-                    lb_val = bounds_mat[hi, lo]
-                    ub_val = bounds_mat[lo, hi]
-                    if lb_val > 0 and ub_val > 0:
-                        mid = (lb_val + ub_val) / 2.0
-                        d13_i1.append(a)
-                        d13_i2.append(b)
-                        d13_lb.append(mid - BOND_TOL)
-                        d13_ub.append(mid + BOND_TOL)
-                        d13_w.append(ANGLE_FC)
-
+                    mid = (bounds_mat[b, a] + bounds_mat[a, b]) / 2.0
+                    d13_i1.append(a); d13_i2.append(b)
+                    d13_lb.append(mid - KNOWN_DIST_TOL); d13_ub.append(mid + KNOWN_DIST_TOL)
+                    d13_w.append(KNOWN_DIST_FC)
+                    restrained.add((a, b))
+    n_d12 = len(d12_i1)
     n_d13 = len(d13_i1)
 
-    # --- 1-4 distance constraints ---
-    d14_i1, d14_i2, d14_lb, d14_ub, d14_w = [], [], [], [], []
-
-    # Collect 1-4 pairs (atoms separated by exactly 3 bonds)
-    for bond in mol.GetBonds():
-        a = bond.GetBeginAtomIdx()
-        b = bond.GetEndAtomIdx()
-        # From atom a, find neighbors of b that aren't a (1-3 from a)
-        for n_b in mol.GetAtomWithIdx(b).GetNeighbors():
-            c = n_b.GetIdx()
-            if c == a:
-                continue
-            # From c, find neighbors that aren't b (1-4 from a)
-            for n_c in mol.GetAtomWithIdx(c).GetNeighbors():
-                d = n_c.GetIdx()
-                if d == b or d == a:
-                    continue
-                if a < d:
-                    ub = bounds_mat[a, d]
-                    lb = bounds_mat[d, a]
-                    if ub > 0 and lb > 0:
-                        d14_i1.append(a)
-                        d14_i2.append(d)
-                        d14_lb.append(lb)
-                        d14_ub.append(ub)
-                        d14_w.append(dist14_weight)
-
-    # Long-range distance constraints (RDKit's addLongRangeDistanceConstraints): EVERY pair beyond
-    # 1-3 held at its FIXED smoothed-bounds range during the ET stage, so torsion rotation cannot
-    # distort the overall shape. The port stops at 1-4, leaving the long-range structure unconstrained
-    # -> torsions inflate strain. This adds all topological-distance>=4 pairs at fixed bounds.
-    if use_basic_knowledge and use_long_range:
-        lr_w = long_range_weight
-        from rdkit.Chem import GetDistanceMatrix
-        topo = GetDistanceMatrix(mol)
+    # Every other pair -- 1-4 pairs that are not a torsion's end atoms included -- at its fixed
+    # bounds-matrix window, force constant 10 * boundsMatForceScaling
+    # (addLongRangeDistanceConstraints).
+    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
+    if run_field:
         na = mol.GetNumAtoms()
         for a in range(na):
             for d in range(a + 1, na):
-                if topo[a, d] < 4:  # 1-2/1-3/1-4 already handled above
+                if (a, d) in restrained:
                     continue
-                ub = bounds_mat[a, d]; lb = bounds_mat[d, a]
-                if ub > 0 and lb > 0:
-                    d14_i1.append(a); d14_i2.append(d)
-                    d14_lb.append(lb); d14_ub.append(ub); d14_w.append(lr_w)
-
-    # Deduplicate
-    seen = set()
-    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
-    for i in range(len(d14_i1)):
-        key = (d14_i1[i], d14_i2[i])
-        if key not in seen:
-            seen.add(key)
-            unique_i1.append(d14_i1[i])
-            unique_i2.append(d14_i2[i])
-            unique_lb.append(d14_lb[i])
-            unique_ub.append(d14_ub[i])
-            unique_w.append(d14_w[i])
-
+                unique_i1.append(a); unique_i2.append(d)
+                unique_lb.append(bounds_mat[d, a]); unique_ub.append(bounds_mat[a, d])
+                unique_w.append(long_range_weight)
     n_d14 = len(unique_i1)
 
     def _a(lst, dt=np.int32):

@@ -174,15 +174,20 @@ def test_etk_variant_term_families_are_not_mixed():
     kdg = extract_etk_params(mol, bounds, variant="KDG")
     etkdg = extract_etk_params(mol, bounds, variant="ETKDGv3")
 
+    # Plain DG runs no ETK stage at all.
     assert len(dg.torsion_idx) == 0
     assert len(dg.improper_idx) == 0
     assert len(dg.dist12_idx1) == 0
     assert len(dg.dist13_idx1) == 0
+    assert len(dg.dist14_idx1) == 0
 
+    # ETDG is RDKit's constructPlain3DForceField: torsions and the 1-2, 1-3 and
+    # long-range distance terms, but no basic-knowledge impropers.
     assert len(etdg.torsion_idx) > 0
     assert len(etdg.improper_idx) == 0
-    assert len(etdg.dist12_idx1) == 0
-    assert len(etdg.dist13_idx1) == 0
+    assert len(etdg.dist12_idx1) > 0
+    assert len(etdg.dist13_idx1) > 0
+    assert len(etdg.dist14_idx1) > 0
 
     assert len(kdg.dist12_idx1) > 0
     assert len(kdg.dist13_idx1) > 0
