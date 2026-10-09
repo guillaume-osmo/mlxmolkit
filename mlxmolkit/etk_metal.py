@@ -498,6 +498,11 @@ _ETK_BODY = r"""
     }
 
     ETK_GRADIENT();
+    if (config[6] != 0.0f) {
+        // Evaluation only: the energy and raw gradient of the input positions.
+        if (tid==0){out_energies[conf_idx]=energy;out_statuses[conf_idx]=0;}
+        return;
+    }
     ETK_SCALE_GRADIENT();
 
     // ---- L-BFGS loop (identical to DG kernel) ----
@@ -682,6 +687,7 @@ def etk_minimize_shared(
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
     parallel_grad: bool = True,
+    _evaluate_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run ETK L-BFGS on all C conformers in parallel with shared constraints.
 
@@ -711,7 +717,8 @@ def etk_minimize_shared(
     dim = 3  # ETK is always 3D
     total_pos_size = int(batch.conf_atom_starts[-1]) * dim
 
-    config = np.array([C, max_iters, grad_tol, dim, total_pos_size, batch.n_mols + 1], dtype=np.float32)
+    config = np.array([C, max_iters, grad_tol, dim, total_pos_size, batch.n_mols + 1,
+                       1.0 if _evaluate_only else 0.0], dtype=np.float32)
 
     # Pack torsion terms
     nt = len(batch.etk_torsion_idx) if batch.etk_torsion_idx is not None else 0
@@ -817,5 +824,27 @@ def etk_minimize_shared(
             mx.float32,
         ],
     )
+    if _evaluate_only:
+        mx.eval(results[1], results[3])
+        return np.array(results[1]), np.array(results[3])
     mx.eval(results[0], results[1], results[2])
     return np.array(results[0]), np.array(results[1]), np.array(results[2])
+
+
+def etk_energy_and_gradient(
+    batch: SharedConstraintBatch,
+    positions: np.ndarray,
+    *,
+    tpm: int = DEFAULT_TPM,
+    parallel_grad: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """ETK energy per conformer and the raw (unscaled) gradient at *positions*.
+
+    Runs the minimisation kernel's own energy and gradient code once, without
+    taking a step, so tests can hold the kernel against a reference field.
+
+    Returns:
+        energies: (C,) float32; gradient: (n_atoms_total * 3,) float32.
+    """
+    return etk_minimize_shared(batch, positions, max_iters=0, tpm=tpm,
+                               parallel_grad=parallel_grad, _evaluate_only=True)
