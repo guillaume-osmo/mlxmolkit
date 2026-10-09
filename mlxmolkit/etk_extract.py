@@ -220,17 +220,19 @@ def extract_etk_params(
         except Exception:
             pass
 
-    # Flat-ring planarity torsions. RDKit adds these inside construct3DForceField (NOT via
-    # GetExperimentalTorsions, so the port misses them): for 4 consecutive sp2/aromatic ring atoms
-    # a-b-c-d, a cos2φ term V*(1 - cos2φ) drives the endocyclic dihedral to planar (φ=0). Reuses the
-    # verified torsion energy/gradient (V at index 1, sign -1). Dedup by central bond (b,c).
+    # Flat-ring planarity torsions. RDKit adds these in getExperimentalTorsions (to the
+    # CrystalFFDetails, but not to the list Python's GetExperimentalTorsions returns): for 4
+    # consecutive SP2 atoms a-b-c-d of a 4- to 6-membered ring, V*(1 - cos2φ) drives the
+    # endocyclic dihedral to planar (φ=0), once per central bond (b,c), and not on a bond a CSD
+    # torsion already uses (RDKit's doneBonds). Reuses the torsion energy/gradient (V at index 1,
+    # sign -1).
     if use_basic_knowledge:
         ring_fc = ring_planarity_fc
         ri = mol.GetRingInfo()
-        seen_ring_bonds = set()
+        seen_ring_bonds = {(min(q[1], q[2]), max(q[1], q[2])) for q in torsion_idx_list}
         for ring in ri.AtomRings():
             nring = len(ring)
-            if nring < 4:
+            if nring < 4 or nring > 6:
                 continue
             for k in range(nring):
                 a, b, c, d = ring[k], ring[(k + 1) % nring], ring[(k + 2) % nring], ring[(k + 3) % nring]

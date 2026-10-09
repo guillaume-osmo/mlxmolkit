@@ -31,9 +31,14 @@ with exactly three neighbours, as three inversion terms of force constant
 10 * (50 if C bound to an SP2 O else 6) / 3. Flat-ring torsions (V2 = 100) are
 added for 4- to 6-membered rings whose four consecutive atoms are SP2, on
 bonds no CSD torsion uses. One approximation: RDKit also skips flat-ring
-torsions on bonds of bridged ring systems that some CSD pattern matched;
-which bonds a pattern matched is not visible from Python, so every bond of a
-bridged system is treated as matched.
+torsions on a bond of a bridged ring system (or in more than three rings)
+when a CSD pattern matched it, although it then adds no CSD torsion there.
+Which bonds a pattern matched is not visible from Python, and the ETKDG
+patterns are for acyclic bonds apart from the macrocycle ones, so such bonds
+are taken as unmatched: matching RDKit's own pattern files
+(torsionPreferences_v2.in + _macrocycles.in) selects the same flat-ring
+torsions on all 677 probe isomers, while taking them as matched would
+differ on 2.
 """
 from __future__ import annotations
 
@@ -46,7 +51,6 @@ from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from mlxmolkit.etk_extract import ETKDG_VARIANTS
 
 SP2 = Chem.HybridizationType.SP2
-MIN_MACROCYCLE_SIZE = 9
 KNOWN_DIST_TOL = 0.01
 KNOWN_DIST_FORCE_CONSTANT = 100.0
 
@@ -58,22 +62,6 @@ class RDKitETKTerms:
     bonds: list      # (i, j)
     angles: list     # (i, j(centre), k, is_linear)
     improper_centres: set
-
-
-def _excluded_bonds(mol):
-    """RDKit's bonds of bridged ring systems (rings sharing > 1 bond)."""
-    rings = [list(r) for r in mol.GetRingInfo().BondRings()]
-    out = set()
-    for a in range(len(rings)):
-        for b in range(a + 1, len(rings)):
-            if len(rings[a]) >= MIN_MACROCYCLE_SIZE and len(rings[b]) >= MIN_MACROCYCLE_SIZE:
-                continue
-            if len(set(rings[a]) & set(rings[b])) > 1:
-                if len(rings[a]) < MIN_MACROCYCLE_SIZE:
-                    out.update(rings[a])
-                if len(rings[b]) < MIN_MACROCYCLE_SIZE:
-                    out.update(rings[b])
-    return out
 
 
 def rdkit_etk_terms(mol: Chem.Mol, variant: str = "ETKDGv3") -> RDKitETKTerms:
@@ -94,10 +82,6 @@ def rdkit_etk_terms(mol: Chem.Mol, variant: str = "ETKDGv3") -> RDKitETKTerms:
             q = list(t["atomIndices"])
             torsions.append((*q, np.array(t["V"], float), np.array(t["signs"], float)))
             done.add(mol.GetBondBetweenAtoms(q[1], q[2]).GetIdx())
-        if use_exp:
-            ri = mol.GetRingInfo()
-            done |= _excluded_bonds(mol)
-            done |= {b.GetIdx() for b in mol.GetBonds() if ri.NumBondRings(b.GetIdx()) > 3}
     inversions, centres = [], set()
     if use_basic:
         for a in mol.GetAtoms():
