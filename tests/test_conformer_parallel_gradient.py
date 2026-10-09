@@ -79,7 +79,8 @@ def test_dg_parallel_gradient_is_bit_identical_to_serial(dim):
     np.testing.assert_array_equal(dg_minimize_shared(batch, pos, max_iters=400)[0], par[0])
 
 
-def test_etk_parallel_gradient_is_bit_identical_to_serial():
+@pytest.mark.parametrize("optimizer", ["bfgs", "lbfgs"])
+def test_etk_parallel_gradient_is_bit_identical_to_serial(optimizer):
     mols, bmats = _mols()
     dgs = [extract_dg_params(m, b, dim=4) for m, b in zip(mols, bmats)]
     etks = [extract_etk_params(m, b, variant="ETKDGv3") for m, b in zip(mols, bmats)]
@@ -96,8 +97,8 @@ def test_etk_parallel_gradient_is_bit_identical_to_serial():
         .reshape(-1, 4)[:, :3].ravel()
         for c in range(batch3.n_confs_total)
     ]).astype(np.float32)
-    ser = etk_minimize_shared(batch3, pos3, max_iters=300, parallel_grad=False)
-    par = etk_minimize_shared(batch3, pos3, max_iters=300, parallel_grad=True)
+    ser = etk_minimize_shared(batch3, pos3, max_iters=300, parallel_grad=False, optimizer=optimizer)
+    par = etk_minimize_shared(batch3, pos3, max_iters=300, parallel_grad=True, optimizer=optimizer)
     np.testing.assert_array_equal(par[2], ser[2])
     np.testing.assert_array_equal(par[1], ser[1])
     np.testing.assert_array_equal(par[0], ser[0])

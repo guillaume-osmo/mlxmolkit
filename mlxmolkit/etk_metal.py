@@ -38,6 +38,7 @@ constant float FUNCTOL = 1e-4f;
 constant float MOVETOL = 1e-6f;
 constant float MAX_STEP_FACTOR = 100.0f;
 constant int MAX_LS_ITERS = 1000;
+constant float BFGS_EPS = 3e-8f;  // RDKit BFGSOpt EPS: curvature guard of the update
 
 // ---- Torsion cos(phi) ----
 inline float calc_cos_phi(const device float* pos, int i1, int i2, int i3, int i4, int dim) {
@@ -444,7 +445,7 @@ _ETK_BODY = r"""
     int d14_s = term_starts[4*ts+mol_idx], d14_e = term_starts[4*ts+mol_idx+1];
     int ang_s = term_starts[5*ts+mol_idx], ang_e = term_starts[5*ts+mol_idx+1];
 
-    int lbfgs_start = lbfgs_history_starts[conf_idx];
+    int opt_start = opt_starts[conf_idx];
 
     parallel_copy(&out_pos[atom_off*dim], &pos[atom_off*dim], n_vars, tid, tpm);
     threadgroup_barrier(mem_flags::mem_device);  // energy reads every lane's atoms
@@ -455,15 +456,30 @@ _ETK_BODY = r"""
     device float* my_old_pos = &work_scratch[atom_off*dim];
     device float* my_old_grad = &work_scratch[total_pos_size + atom_off*dim];
     device float* my_q = &work_scratch[2*total_pos_size + atom_off*dim];
-    device float* my_S = &work_lbfgs[lbfgs_start];
-    device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m*n_vars];
+#if OPT_BFGS
+    // Dense inverse Hessian, row-major; lane tid owns rows tid, tid+tpm, ...
+    device float* my_H = &work_opt[opt_start];
+    for (int i=(int)tid;i<n_vars;i+=(int)tpm)
+        for (int j=0;j<n_vars;j++) my_H[i*n_vars+j] = (i==j) ? 1.0f : 0.0f;
+    device float* my_hd = &work_scratch[3*total_pos_size + atom_off*dim];
+    device float* my_hg = &work_scratch[4*total_pos_size + atom_off*dim];
+    // The update pending from the previous iteration: its vectors and scalars.
+    device float* my_pxi = &work_scratch[5*total_pos_size + atom_off*dim];
+    device float* my_phd = &work_scratch[6*total_pos_size + atom_off*dim];
+    device float* my_pu = &work_scratch[7*total_pos_size + atom_off*dim];
+    bool pend = false;
+    float p_fac = 0.0f, p_fad = 0.0f, p_fae = 0.0f;
+#else
+    device float* my_S = &work_opt[opt_start];
+    device float* my_Y = &work_opt[opt_start + lbfgs_m*n_vars];
     // L-BFGS scalars: every lane computes identical values, so each keeps its own copy.
     float my_rho[LBFGS_M];
     float my_alpha[LBFGS_M];
+#endif
 
     // ---- Gradient of the current positions into my_grad (all lanes return) ----
 #if GRAD_MODE == 1
-    device float* my_scr = &work_scratch[3*total_pos_size + conf_scr_base[conf_idx]];
+    device float* my_scr = &work_scratch[N_SCR_VEC*total_pos_size + conf_scr_base[conf_idx]];
     const int n_tor = tor_e - tor_s, n_imp = imp_e - imp_s;
     const int n12 = d12_e - d12_s, n13 = d13_e - d13_s, n14 = d14_e - d14_s;
     device float* scr_tor = my_scr;
@@ -616,11 +632,14 @@ _ETK_BODY = r"""
     }
     ETK_SCALE_GRADIENT();
 
-    // ---- L-BFGS loop (identical to DG kernel) ----
+    // ---- BFGS (RDKit's BFGSOpt::minimize) or L-BFGS loop ----
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
     float lss=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm) lss+=my_pos[i]*my_pos[i];
     float max_step=MAX_STEP_FACTOR*max(sqrt(reduce_sum(lss, shared, tid, tpm)),(float)n_vars);
-    int status=1, hist_count=0, hist_idx=0;
+    int status=1;
+#if !OPT_BFGS
+    int hist_count=0, hist_idx=0;
+#endif
 
     for (int iter=0; iter<max_iters && status==1; iter++) {
         parallel_copy(my_old_pos, my_pos, n_vars, tid, tpm);
@@ -694,6 +713,54 @@ _ETK_BODY = r"""
         float lgt=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_grad[i])*max(abs(my_pos[i]),1.0f);if(t>lgt)lgt=t;}
         if(reduce_max(lgt, shared, tid, tpm)/max(abs(energy)*gscale,1.0f)<grad_tol_v){status=0;break;}
 
+#if OPT_BFGS
+        // BFGS inverse-Hessian update of RDKit's BFGSOpt::minimize, with xi =
+        // my_old_pos (the step), dGrad = my_q and hessDGrad = my_hd:
+        //   H += fac xi xi' - fad hd hd' + fae u u',  u = fac xi - fad hd,
+        //   fac = 1/(dGrad.xi), fad = 1/(dGrad.hd), fae = dGrad.hd,
+        // skipped unless dGrad.xi > sqrt(EPS |dGrad|^2 |xi|^2); direction -H grad.
+        // H is read once per iteration: the rank-3 update of the previous
+        // iteration is applied to each row as it is read for H dGrad and
+        // H grad, and the direction adds the new update's terms to H grad.
+        for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_q[i]=my_grad[i]-my_old_grad[i];
+        threadgroup_barrier(mem_flags::mem_device);  // rows read all of dGrad, grad, pending
+        float lfac=0.0f,lfae=0.0f,lsdg=0.0f,lsxi=0.0f;
+        for (int i=(int)tid;i<n_vars;i+=(int)tpm) {
+            device float* Hi = &my_H[i*n_vars];
+            float h=0.0f, hg=0.0f;
+            if (pend) {
+                float a=p_fac*my_pxi[i], b=p_fad*my_phd[i], c=p_fae*my_pu[i];
+                for (int j=0;j<n_vars;j++) {
+                    float v = Hi[j] + (a*my_pxi[j] - b*my_phd[j] + c*my_pu[j]);
+                    Hi[j]=v; h+=v*my_q[j]; hg+=v*my_grad[j];
+                }
+            } else {
+                for (int j=0;j<n_vars;j++) { float v=Hi[j]; h+=v*my_q[j]; hg+=v*my_grad[j]; }
+            }
+            my_hd[i]=h; my_hg[i]=hg;
+            lfac+=my_q[i]*my_old_pos[i]; lfae+=my_q[i]*h;
+            lsdg+=my_q[i]*my_q[i]; lsxi+=my_old_pos[i]*my_old_pos[i];
+        }
+        float fac=reduce_sum(lfac,shared,tid,tpm), fae=reduce_sum(lfae,shared,tid,tpm);
+        float sdg=reduce_sum(lsdg,shared,tid,tpm), sxi=reduce_sum(lsxi,shared,tid,tpm);
+        // Every lane holds the same reductions, so the branch is uniform.
+        pend = fac > sqrt(BFGS_EPS*sdg*sxi);
+        if (pend) {
+            p_fac=1.0f/fac; p_fad=1.0f/fae; p_fae=fae;
+            float lxg=0.0f,lhg=0.0f,lug=0.0f;
+            for (int i=(int)tid;i<n_vars;i+=(int)tpm) {
+                float u=p_fac*my_old_pos[i]-p_fad*my_hd[i];
+                my_pxi[i]=my_old_pos[i]; my_phd[i]=my_hd[i]; my_pu[i]=u;
+                lxg+=my_old_pos[i]*my_grad[i]; lhg+=my_hd[i]*my_grad[i]; lug+=u*my_grad[i];
+            }
+            float xg=reduce_sum(lxg,shared,tid,tpm), hdg=reduce_sum(lhg,shared,tid,tpm);
+            float ug=reduce_sum(lug,shared,tid,tpm);
+            for (int i=(int)tid;i<n_vars;i+=(int)tpm)
+                my_dir[i]=-(my_hg[i]+(p_fac*xg*my_pxi[i]-p_fad*hdg*my_phd[i]+p_fae*ug*my_pu[i]));
+        } else {
+            for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_dir[i]=-my_hg[i];
+        }
+#else
         // L-BFGS update
         for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_q[i]=my_grad[i]-my_old_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
@@ -714,6 +781,7 @@ _ETK_BODY = r"""
             float bj=my_rho[sl]*parallel_dot(&my_Y[sl*n_vars],my_q,n_vars,tid,tpm,shared);
             parallel_saxpy(my_q,my_alpha[j]-bj,&my_S[sl*n_vars],n_vars,tid,tpm);}
         parallel_neg_copy(my_dir,my_q,n_vars,tid,tpm);
+#endif
     }
     if (tid==0){out_energies[conf_idx]=energy;out_statuses[conf_idx]=status;}
 """
@@ -725,14 +793,21 @@ _ETK_BODY = r"""
 _etk_kernel_cache: dict[tuple, object] = {}
 
 
-def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad_mode: int = GRAD_GATHER):
-    key = (tpm, lbfgs_m, int(grad_mode))
+def _n_scr_vec(bfgs: bool) -> int:
+    """Per-atom-coordinate vectors in work_scratch before the gradient scratch."""
+    return 8 if bfgs else 3
+
+
+def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad_mode: int = GRAD_GATHER,
+                    bfgs: bool = True):
+    key = (tpm, lbfgs_m, int(grad_mode), bool(bfgs))
     if key not in _etk_kernel_cache:
-        header = (f"#define GRAD_MODE {int(grad_mode)}\n#define DIM 3\n"
+        header = (f"#define GRAD_MODE {int(grad_mode)}\n#define DIM 3\n#define OPT_BFGS {int(bool(bfgs))}\n"
+                  f"#define N_SCR_VEC {_n_scr_vec(bfgs)}\n"
                   + _ETK_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m)))
         source = _ETK_BODY.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
         _etk_kernel_cache[key] = mx.fast.metal_kernel(
-            name=f"etk_lbfgs_shared_g{int(grad_mode)}",
+            name=f"etk_{'bfgs' if bfgs else 'lbfgs'}_shared_g{int(grad_mode)}",
             input_names=[
                 "pos", "config",
                 "conf_to_mol", "conf_atom_starts", "mol_n_atoms",
@@ -743,7 +818,7 @@ def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad
                 "d13_pairs", "d13_bounds",
                 "d14_pairs", "d14_bounds",
                 "angle_triples", "angle_params",
-                "lbfgs_history_starts",
+                "opt_starts",
                 "csr_slot_base", "csr_off", "csr_ent2", "conf_scr_base",
             ],
             # Metal allows 31 buffers per kernel: the gradient scratch
@@ -751,7 +826,7 @@ def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch",
-                "work_lbfgs",
+                "work_opt",
             ],
             header=header,
             source=source,
@@ -808,9 +883,10 @@ def etk_minimize_shared(
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
     parallel_grad: bool = True,
+    optimizer: str = "bfgs",
     _evaluate_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run ETK L-BFGS on all C conformers in parallel with shared constraints.
+    """Run the ETK minimisation on all C conformers in parallel with shared constraints.
 
     Requires ETK fields in *batch* (call ``add_etk_to_batch`` first).
 
@@ -828,11 +904,27 @@ def etk_minimize_shared(
         CSR index, in the serial loop's order: no atomics, deterministic, and
         bit-identical to ``parallel_grad=False``.
         False: thread 0 computes the gradient serially (reference).
+    optimizer : str
+        "bfgs" (default): RDKit's BFGSOpt::minimize, with a dense inverse
+        Hessian per conformer (n_vars**2 floats). "lbfgs": limited-memory
+        BFGS with ``lbfgs_m`` pairs and the gamma-scaled initial Hessian.
+        Both see the gradient scaled as RDKit's ForceField does.
+
+        L-BFGS is not a faithful substitute here. Its gamma scaling and
+        short memory take long steps along the CSD torsion gradients, which
+        for a strong term (V1 = 100 on aryl ethers) cut across the torsion
+        circle through a linear bond angle. There the 1-3 restraint has no
+        bending gradient and the torsions through the atom are undefined,
+        so the minimiser stops on that saddle. From RDKit's own DG starts
+        its BFGS leaves 2/40 aryl-ether conformers linear, L-BFGS 21/40.
 
     Returns
     -------
     out_positions, energies, statuses
     """
+    if optimizer not in ("bfgs", "lbfgs"):
+        raise ValueError(f"optimizer must be 'bfgs' or 'lbfgs', not {optimizer!r}")
+    bfgs = optimizer == "bfgs"
     grad_mode = GRAD_GATHER if parallel_grad else GRAD_SERIAL
     C = batch.n_confs_total
     dim = 3  # ETK is always 3D
@@ -889,11 +981,15 @@ def etk_minimize_shared(
         ang_triples = np.zeros(3, dtype=np.int32)
         ang_params = np.zeros(3, dtype=np.float32)
 
-    # L-BFGS history
+    # Optimiser state per conformer: the dense inverse Hessian (BFGS) or the
+    # 2*m history vectors (L-BFGS).
     n_vars_c = batch.mol_n_atoms[batch.conf_to_mol].astype(np.int64) * dim
-    lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
-    np.cumsum(2 * lbfgs_m * n_vars_c, out=lbfgs_starts[1:])
-    total_lbfgs = int(lbfgs_starts[-1])
+    per_conf = n_vars_c * n_vars_c if bfgs else 2 * lbfgs_m * n_vars_c
+    opt_starts64 = np.concatenate([[0], np.cumsum(per_conf)])
+    if opt_starts64[-1] >= 2 ** 31:
+        raise ValueError("ETK optimiser state exceeds 2**31 floats; use a smaller batch")
+    opt_starts = opt_starts64.astype(np.int32)
+    total_opt = int(opt_starts[-1])
 
     # Gradient scratch per conformer: 12 floats per torsion/improper (the
     # four role vectors) + 1 prefactor per 1-2/1-3/1-4 term.
@@ -914,7 +1010,7 @@ def etk_minimize_shared(
     np.cumsum(per_mol[batch.conf_to_mol], out=conf_scr_base[1:])
     total_scr = int(conf_scr_base[-1])
 
-    kernel = _get_etk_kernel(tpm, lbfgs_m, grad_mode)
+    kernel = _get_etk_kernel(tpm, lbfgs_m, grad_mode, bfgs)
     results = kernel(
         inputs=[
             mx.array(positions),
@@ -940,7 +1036,7 @@ def etk_minimize_shared(
             mx.array(d14_bounds),
             mx.array(ang_triples),
             mx.array(ang_params),
-            mx.array(lbfgs_starts[:-1]),
+            mx.array(opt_starts[:-1]),
             mx.array(csr_slot_base),
             mx.array(csr_off),
             mx.array(csr_ent2),
@@ -950,8 +1046,8 @@ def etk_minimize_shared(
         threadgroup=(tpm, 1, 1),
         output_shapes=[
             (total_pos_size,), (C,), (C,),
-            (total_pos_size,), (total_pos_size,), (3 * total_pos_size + total_scr,),
-            (max(1, total_lbfgs),),
+            (total_pos_size,), (total_pos_size,), (_n_scr_vec(bfgs) * total_pos_size + total_scr,),
+            (max(1, total_opt),),
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.int32,
@@ -982,4 +1078,5 @@ def etk_energy_and_gradient(
         energies: (C,) float32; gradient: (n_atoms_total * 3,) float32.
     """
     return etk_minimize_shared(batch, positions, max_iters=0, tpm=tpm,
-                               parallel_grad=parallel_grad, _evaluate_only=True)
+                               parallel_grad=parallel_grad, optimizer="lbfgs",
+                               _evaluate_only=True)
