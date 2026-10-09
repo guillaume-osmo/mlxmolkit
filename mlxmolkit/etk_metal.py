@@ -16,6 +16,12 @@ from typing import Optional
 import numpy as np
 import mlx.core as mx
 
+from .conformer_metal import (
+    GRAD_GATHER,
+    GRAD_SERIAL,
+    _cached_on_batch,
+    build_atom_term_csr,
+)
 from .shared_batch import SharedConstraintBatch
 
 DEFAULT_TPM = 32
@@ -149,6 +155,91 @@ inline void dist14_g(const device float* pos, device float* grad,
     }
 }
 
+// ---- Torsion gradient as four role vectors (phase 1 of the parallel gradient) ----
+// Same expressions as torsion_g, but the vectors it would add to atoms
+// i1..i4 are stored to out[0..11] instead. A degenerate torsion, which
+// torsion_g skips, stores -0.0f: x + (-0.0f) == x for every x, so adding it
+// leaves the sum bit-identical to not adding anything.
+inline void torsion_g_roles(const device float* pos, device float* out,
+    int i1,int i2,int i3,int i4,
+    float V0,float V1,float V2,float V3,float V4,float V5,
+    float s0,float s1,float s2,float s3,float s4,float s5, int dim
+) {
+    float r1[3],r2[3],r3[3],r4[3];
+    for (int d=0;d<3;d++) {
+        r1[d]=pos[i1*dim+d]-pos[i2*dim+d]; r2[d]=pos[i3*dim+d]-pos[i2*dim+d];
+        r3[d]=-r2[d]; r4[d]=pos[i4*dim+d]-pos[i3*dim+d];
+    }
+    float t0x=r1[1]*r2[2]-r1[2]*r2[1],t0y=r1[2]*r2[0]-r1[0]*r2[2],t0z=r1[0]*r2[1]-r1[1]*r2[0];
+    float t1x=r3[1]*r4[2]-r3[2]*r4[1],t1y=r3[2]*r4[0]-r3[0]*r4[2],t1z=r3[0]*r4[1]-r3[1]*r4[0];
+    float d02=t0x*t0x+t0y*t0y+t0z*t0z, d12=t1x*t1x+t1y*t1y+t1z*t1z;
+    if (d02<1e-16f||d12<1e-16f) { for (int k=0;k<12;k++) out[k]=-0.0f; return; }
+    float inv0=rsqrt(max(d02,1e-16f)),inv1=rsqrt(max(d12,1e-16f));
+    float tnx0=t0x*inv0,tny0=t0y*inv0,tnz0=t0z*inv0;
+    float tnx1=t1x*inv1,tny1=t1y*inv1,tnz1=t1z*inv1;
+    float cp=clamp(tnx0*tnx1+tny0*tny1+tnz0*tnz1,-1.0f,1.0f);
+    float sp2=1.0f-cp*cp, sp=sqrt(max(sp2,0.0f));
+    float c=cp,c2=c*c,c3=c*c2,c4=c*c3;
+    float dE=-s0*V0*sp-2.0f*s1*V1*(2.0f*c*sp)-3.0f*s2*V2*(4.0f*c2*sp-sp)
+        -4.0f*s3*V3*(8.0f*c3*sp-4.0f*c*sp)-5.0f*s4*V4*(16.0f*c4*sp-12.0f*c2*sp+sp)
+        -6.0f*s5*V5*(32.0f*c4*c*sp-32.0f*c3*sp+6.0f*c*sp);
+    float st;
+    if (abs(sp)>1e-8f) st=-dE/sp; else st=-dE/max(abs(cp),1e-16f)*sign(cp+1e-30f);
+    float dcx0=inv0*(tnx1-cp*tnx0),dcy0=inv0*(tny1-cp*tny0),dcz0=inv0*(tnz1-cp*tnz0);
+    float dcx1=inv1*(tnx0-cp*tnx1),dcy1=inv1*(tny0-cp*tny1),dcz1=inv1*(tnz0-cp*tnz1);
+    float g1x=st*(dcz0*r2[1]-dcy0*r2[2]),g1y=st*(dcx0*r2[2]-dcz0*r2[0]),g1z=st*(dcy0*r2[0]-dcx0*r2[1]);
+    float g4x=st*(dcy1*r3[2]-dcz1*r3[1]),g4y=st*(dcz1*r3[0]-dcx1*r3[2]),g4z=st*(dcx1*r3[1]-dcy1*r3[0]);
+    float g2x=st*(dcy0*(r2[2]-r1[2])+dcz0*(r1[1]-r2[1])+dcy1*(-r4[2])+dcz1*r4[1]);
+    float g2y=st*(dcx0*(r1[2]-r2[2])+dcz0*(r2[0]-r1[0])+dcx1*r4[2]+dcz1*(-r4[0]));
+    float g2z=st*(dcx0*(r2[1]-r1[1])+dcy0*(r1[0]-r2[0])+dcx1*(-r4[1])+dcy1*r4[0]);
+    float g3x=st*(dcy0*r1[2]+dcz0*(-r1[1])+dcy1*(r4[2]-r3[2])+dcz1*(r3[1]-r4[1]));
+    float g3y=st*(dcx0*(-r1[2])+dcz0*r1[0]+dcx1*(r3[2]-r4[2])+dcz1*(r4[0]-r3[0]));
+    float g3z=st*(dcx0*r1[1]+dcy0*(-r1[0])+dcx1*(r4[1]-r3[1])+dcy1*(r3[0]-r4[0]));
+    out[0]=g1x; out[1]=g1y; out[2]=g1z;
+    out[3]=g2x; out[4]=g2y; out[5]=g2z;
+    out[6]=g3x; out[7]=g3y; out[8]=g3z;
+    out[9]=g4x; out[10]=g4y; out[11]=g4z;
+}
+
+// ---- Flat-bottom distance prefactor (phase 1): dist14_g's pf ----
+inline float dist14_pf(const device float* pos, int a, int b, float lb, float ub, float wt, int dim) {
+    float df[3]; float d2=0.0f;
+    for (int d=0;d<3;d++){df[d]=pos[a*dim+d]-pos[b*dim+d]; d2+=df[d]*df[d];}
+    float dist=sqrt(d2+1e-12f);
+    float pf=0.0f;
+    if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
+    else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+    return pf;
+}
+
+// ---- Phase 2: one lane per atom, terms gathered through the CSR index ----
+// csr_off/csr_ent list, per (molecule, term type, atom), the terms touching
+// the atom as ``term * 4 + role`` in increasing term order, then role: the
+// order in which the serial loop adds into it, so the sum is bit-identical.
+// Type order: torsion, improper, 1-2, 1-3, 1-4 (the serial loop's order).
+// Input pointers are template parameters: MLX hands small inputs to the
+// kernel in the constant address space and large ones in device.
+template <typename OffT, typename EntT>
+inline void etk_add_pair_terms(thread float* acc, const thread float* own,
+    const device float* pos, const device float* pf_arr, int t_start,
+    OffT csr_off, EntT csr_ent2,
+    int slot, int atom_off, int dim
+) {
+    for (int e = csr_off[slot]; e < csr_off[slot + 1]; e++) {
+        int en = csr_ent2[2*e]; int other = csr_ent2[2*e+1];
+        int role = en & 3;
+        float pf = pf_arr[(en >> 2) - t_start];
+        if (pf == 0.0f) continue;
+        // df = pos[a] - pos[b], formed exactly as dist14_g does.
+        for (int d = 0; d < 3; d++) {
+            float po = pos[(atom_off + other) * dim + d];
+            float df = (role == 0) ? (own[d] - po) : (po - own[d]);
+            float g = pf * df;
+            if (role == 0) acc[d] += g; else acc[d] -= g;
+        }
+    }
+}
+
 // ---- Threadgroup primitives (same as DG kernel) ----
 inline float tg_reduce_sum(threadgroup float* s, uint tid, uint n) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -185,7 +276,7 @@ inline void parallel_neg_copy(device float* d, const device float* s, int n, uin
 # Pre-adds atom_off to LOCAL constraint indices before calling helpers
 # ---------------------------------------------------------------------------
 
-_ETK_BODY = """
+_ETK_BODY = r"""
     uint tid = thread_position_in_threadgroup.x;
     uint conf_idx = threadgroup_position_in_grid.x;
     const uint tpm = TPM;
@@ -195,7 +286,7 @@ _ETK_BODY = """
     int n_confs_cfg = (int)config[0];
     int max_iters = (int)config[1];
     float grad_tol_v = config[2];
-    int dim = (int)config[3];
+    const int dim = DIM;  // compiled for 3D (config[3] is the same value)
     int total_pos_size = (int)config[4];
 
     if ((int)conf_idx >= n_confs_cfg) return;
@@ -207,11 +298,13 @@ _ETK_BODY = """
     int n_vars = n_atoms * dim;
 
     // Constraint ranges (per molecule — SHARED)
-    int tor_s = torsion_starts[mol_idx], tor_e = torsion_starts[mol_idx+1];
-    int imp_s = improper_starts[mol_idx], imp_e = improper_starts[mol_idx+1];
-    int d12_s = dist12_starts[mol_idx], d12_e = dist12_starts[mol_idx+1];
-    int d13_s = dist13_starts[mol_idx], d13_e = dist13_starts[mol_idx+1];
-    int d14_s = dist14_starts[mol_idx], d14_e = dist14_starts[mol_idx+1];
+    // term_starts = [torsion | improper | 1-2 | 1-3 | 1-4] ranges, (N+1) each
+    const int ts = (int)config[5];
+    int tor_s = term_starts[mol_idx], tor_e = term_starts[mol_idx+1];
+    int imp_s = term_starts[ts+mol_idx], imp_e = term_starts[ts+mol_idx+1];
+    int d12_s = term_starts[2*ts+mol_idx], d12_e = term_starts[2*ts+mol_idx+1];
+    int d13_s = term_starts[3*ts+mol_idx], d13_e = term_starts[3*ts+mol_idx+1];
+    int d14_s = term_starts[4*ts+mol_idx], d14_e = term_starts[4*ts+mol_idx+1];
 
     int lbfgs_start = lbfgs_history_starts[conf_idx];
 
@@ -227,8 +320,83 @@ _ETK_BODY = """
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m*n_vars];
     device float* my_rho = &work_rho[conf_idx * lbfgs_m];
 
-    // ---- Energy (parallel) + gradient (thread 0) ----
-    parallel_set(my_grad, 0.0f, n_vars, tid, tpm);
+    // ---- Gradient of the current positions into my_grad (all lanes return) ----
+#if GRAD_MODE == 1
+    device float* my_scr = &work_scratch[3*total_pos_size + conf_scr_base[conf_idx]];
+    const int n_tor = tor_e - tor_s, n_imp = imp_e - imp_s;
+    const int n12 = d12_e - d12_s, n13 = d13_e - d13_s;
+    device float* scr_tor = my_scr;
+    device float* scr_imp = my_scr + 12 * n_tor;
+    device float* scr_d12 = scr_imp + 12 * n_imp;
+    device float* scr_d13 = scr_d12 + n12;
+    device float* scr_d14 = scr_d13 + n13;
+    const int slot0 = csr_slot_base[mol_idx];
+    #define ETK_GRADIENT() \
+        for (int t=tor_s+(int)tid;t<tor_e;t+=(int)tpm) { \
+            int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off; \
+            int a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off; \
+            torsion_g_roles(out_pos,&scr_tor[12*(t-tor_s)],a1,a2,a3,a4, \
+                torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2], \
+                torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5], \
+                torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2], \
+                torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim); \
+        } \
+        for (int t=imp_s+(int)tid;t<imp_e;t+=(int)tpm) { \
+            int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off; \
+            int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off; \
+            torsion_g_roles(out_pos,&scr_imp[12*(t-imp_s)],ic,i0,i1,i2, \
+                0.0f,improper_w[t],0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f, dim); \
+        } \
+        for (int t=d12_s+(int)tid;t<d12_e;t+=(int)tpm) \
+            scr_d12[t-d12_s]=dist14_pf(out_pos,d12_pairs[t*2]+atom_off,d12_pairs[t*2+1]+atom_off, \
+                d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim); \
+        for (int t=d13_s+(int)tid;t<d13_e;t+=(int)tpm) \
+            scr_d13[t-d13_s]=dist14_pf(out_pos,d13_pairs[t*2]+atom_off,d13_pairs[t*2+1]+atom_off, \
+                d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim); \
+        for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm) \
+            scr_d14[t-d14_s]=dist14_pf(out_pos,d14_pairs[t*2]+atom_off,d14_pairs[t*2+1]+atom_off, \
+                d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim); \
+        threadgroup_barrier(mem_flags::mem_device); \
+        for (int a=(int)tid;a<n_atoms;a+=(int)tpm) { \
+            float acc[3]={0.0f,0.0f,0.0f}; \
+            float own[3]; for (int d=0;d<3;d++) own[d]=out_pos[(atom_off+a)*dim+d]; \
+            int sl=slot0+a; \
+            for (int e=csr_off[sl];e<csr_off[sl+1];e++) { \
+                int en=csr_ent2[2*e]; const device float* v=&scr_tor[12*((en>>2)-tor_s)+3*(en&3)]; \
+                acc[0]+=v[0]; acc[1]+=v[1]; acc[2]+=v[2]; \
+            } \
+            sl+=n_atoms; \
+            for (int e=csr_off[sl];e<csr_off[sl+1];e++) { \
+                int en=csr_ent2[2*e]; const device float* v=&scr_imp[12*((en>>2)-imp_s)+3*(en&3)]; \
+                acc[0]+=v[0]; acc[1]+=v[1]; acc[2]+=v[2]; \
+            } \
+            etk_add_pair_terms(acc,own,out_pos,scr_d12,d12_s,csr_off,csr_ent2,slot0+2*n_atoms+a,atom_off,dim); \
+            etk_add_pair_terms(acc,own,out_pos,scr_d13,d13_s,csr_off,csr_ent2,slot0+3*n_atoms+a,atom_off,dim); \
+            etk_add_pair_terms(acc,own,out_pos,scr_d14,d14_s,csr_off,csr_ent2,slot0+4*n_atoms+a,atom_off,dim); \
+            for (int d=0;d<3;d++) my_grad[a*dim+d]=acc[d]; \
+        } \
+        threadgroup_barrier(mem_flags::mem_device);
+#else
+    // Reference: thread 0 adds every term serially.
+    #define ETK_GRADIENT() \
+        parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        if (tid == 0) { \
+            for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off; \
+                torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5], \
+                    torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);} \
+            for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off; \
+                improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);} \
+            for (int t=d12_s;t<d12_e;t++){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off; \
+                dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);} \
+            for (int t=d13_s;t<d13_e;t++){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off; \
+                dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);} \
+            for (int t=d14_s;t<d14_e;t++){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off; \
+                dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);} \
+        } \
+        threadgroup_barrier(mem_flags::mem_device);
+#endif
+
+    // ---- Energy (parallel) + gradient ----
     float local_e = 0.0f;
 
     // Torsion energy (pre-add atom_off to LOCAL indices)
@@ -265,90 +433,7 @@ _ETK_BODY = """
     shared[tid] = local_e;
     float energy = tg_reduce_sum(shared, tid, tpm);
 
-#if PARALLEL_GRAD
-    // Parallel gradient: each thread handles a stripe of vars, reads all distance constraints
-    for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
-        int my_a=v/dim, my_c=v%dim; float g=0.0f;
-        for (int t=d12_s;t<d12_e;t++) {
-            int a=d12_pairs[t*2]+atom_off, b=d12_pairs[t*2+1]+atom_off;
-            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
-            float df[3]; float d2=0.0f;
-            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-            float dist=sqrt(d2+1e-12f), lb=d12_bounds[t*3], ub=d12_bounds[t*3+1], wt=d12_bounds[t*3+2];
-            float pf=0.0f;
-            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
-        }
-        for (int t=d13_s;t<d13_e;t++) {
-            int a=d13_pairs[t*2]+atom_off, b=d13_pairs[t*2+1]+atom_off;
-            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
-            float df[3]; float d2=0.0f;
-            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-            float dist=sqrt(d2+1e-12f), lb=d13_bounds[t*3], ub=d13_bounds[t*3+1], wt=d13_bounds[t*3+2];
-            float pf=0.0f;
-            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
-        }
-        for (int t=d14_s;t<d14_e;t++) {
-            int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
-            if ((my_a+atom_off)!=a && (my_a+atom_off)!=b) continue;
-            float df[3]; float d2=0.0f;
-            for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-            float dist=sqrt(d2+1e-12f), lb=d14_bounds[t*3], ub=d14_bounds[t*3+1], wt=d14_bounds[t*3+2];
-            float pf=0.0f;
-            if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-            else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-            if (pf!=0.0f) g+=(((my_a+atom_off)==a)?1.0f:-1.0f)*pf*df[my_c];
-        }
-        my_grad[v] = g;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-    // Torsion + improper gradients still serial (complex cross-product chain rule)
-    if (tid == 0) {
-        for (int t=tor_s;t<tor_e;t++) {
-            int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off;
-            int a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
-            torsion_g(out_pos,work_grad,a1,a2,a3,a4,
-                torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],
-                torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
-                torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],
-                torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);
-        }
-        for (int t=imp_s;t<imp_e;t++) {
-            int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off;
-            int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-            improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-#else
-    // Serial gradient (thread 0 only — default, no overhead)
-    if (tid == 0) {
-        for (int t=tor_s;t<tor_e;t++) {
-            int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off;
-            int a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
-            torsion_g(out_pos,work_grad,a1,a2,a3,a4,
-                torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],
-                torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
-                torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],
-                torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);
-        }
-        for (int t=imp_s;t<imp_e;t++) {
-            int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off;
-            int i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-            improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);
-        }
-        for (int t=d12_s;t<d12_e;t++) {int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
-            dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
-        for (int t=d13_s;t<d13_e;t++) {int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
-            dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
-        for (int t=d14_s;t<d14_e;t++) {int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
-            dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-#endif
+    ETK_GRADIENT();
 
     // ---- L-BFGS loop (identical to DG kernel) ----
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
@@ -415,9 +500,8 @@ _ETK_BODY = """
         shared[tid]=ltx; if(tg_reduce_max(shared,tid,tpm)<TOLX){status=0;break;}
 
         parallel_copy(my_old_grad,my_grad,n_vars,tid,tpm);
-        parallel_set(my_grad,0.0f,n_vars,tid,tpm);
 
-        // New energy (parallel) + gradient (thread 0)
+        // New energy (parallel) + gradient
         float lne=0.0f;
         for (int t=tor_s+(int)tid;t<tor_e;t+=(int)tpm){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
             float cp=calc_cos_phi(out_pos,a1,a2,a3,a4,dim);
@@ -433,70 +517,7 @@ _ETK_BODY = """
             lne+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
         shared[tid]=lne; energy=tg_reduce_sum(shared,tid,tpm);
 
-#if PARALLEL_GRAD
-        // Parallel distance gradient + serial torsion/improper
-        for (int v=(int)tid; v<n_vars; v+=(int)tpm) {
-            int ma=v/dim, mc=v%dim; float g=0.0f;
-            for (int t=d12_s;t<d12_e;t++) {
-                int a=d12_pairs[t*2]+atom_off, b=d12_pairs[t*2+1]+atom_off;
-                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
-                float df[3]; float d2=0.0f;
-                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-                float dist=sqrt(d2+1e-12f), lb=d12_bounds[t*3], ub=d12_bounds[t*3+1], wt=d12_bounds[t*3+2];
-                float pf=0.0f;
-                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
-            }
-            for (int t=d13_s;t<d13_e;t++) {
-                int a=d13_pairs[t*2]+atom_off, b=d13_pairs[t*2+1]+atom_off;
-                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
-                float df[3]; float d2=0.0f;
-                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-                float dist=sqrt(d2+1e-12f), lb=d13_bounds[t*3], ub=d13_bounds[t*3+1], wt=d13_bounds[t*3+2];
-                float pf=0.0f;
-                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
-            }
-            for (int t=d14_s;t<d14_e;t++) {
-                int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
-                if ((ma+atom_off)!=a && (ma+atom_off)!=b) continue;
-                float df[3]; float d2=0.0f;
-                for (int d=0;d<3;d++){df[d]=out_pos[a*dim+d]-out_pos[b*dim+d]; d2+=df[d]*df[d];}
-                float dist=sqrt(d2+1e-12f), lb=d14_bounds[t*3], ub=d14_bounds[t*3+1], wt=d14_bounds[t*3+2];
-                float pf=0.0f;
-                if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-                else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
-                if (pf!=0.0f) g+=(((ma+atom_off)==a)?1.0f:-1.0f)*pf*df[mc];
-            }
-            my_grad[v] = g;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-        if (tid==0) {
-            for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
-                torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
-                    torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);}
-            for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-                improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);}
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-#else
-        if (tid==0) {
-            for (int t=tor_s;t<tor_e;t++){int a1=torsion_quads[t*4]+atom_off,a2=torsion_quads[t*4+1]+atom_off,a3=torsion_quads[t*4+2]+atom_off,a4=torsion_quads[t*4+3]+atom_off;
-                torsion_g(out_pos,work_grad,a1,a2,a3,a4,torsion_V[t*6],torsion_V[t*6+1],torsion_V[t*6+2],torsion_V[t*6+3],torsion_V[t*6+4],torsion_V[t*6+5],
-                    torsion_signs_arr[t*6],torsion_signs_arr[t*6+1],torsion_signs_arr[t*6+2],torsion_signs_arr[t*6+3],torsion_signs_arr[t*6+4],torsion_signs_arr[t*6+5],dim);}
-            for (int t=imp_s;t<imp_e;t++){int ic=improper_quads[t*4]+atom_off,i0=improper_quads[t*4+1]+atom_off,i1=improper_quads[t*4+2]+atom_off,i2=improper_quads[t*4+3]+atom_off;
-                improper_g(out_pos,work_grad,ic,i0,i1,i2,improper_w[t],dim);}
-            for (int t=d12_s;t<d12_e;t++){int a=d12_pairs[t*2]+atom_off,b=d12_pairs[t*2+1]+atom_off;
-                dist14_g(out_pos,work_grad,a,b,d12_bounds[t*3],d12_bounds[t*3+1],d12_bounds[t*3+2],dim);}
-            for (int t=d13_s;t<d13_e;t++){int a=d13_pairs[t*2]+atom_off,b=d13_pairs[t*2+1]+atom_off;
-                dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);}
-            for (int t=d14_s;t<d14_e;t++){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
-                dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-#endif
+        ETK_GRADIENT();
 
         float lgt=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_grad[i])*max(abs(my_pos[i]),1.0f);if(t>lgt)lgt=t;}
         shared[tid]=lgt; if(tg_reduce_max(shared,tid,tpm)/max(energy,1.0f)<grad_tol_v){status=0;break;}
@@ -510,7 +531,7 @@ _ETK_BODY = """
             threadgroup_barrier(mem_flags::mem_device);hist_idx++;if(hist_count<lbfgs_m)hist_count++;}
 
         parallel_copy(my_q,my_grad,n_vars,tid,tpm);
-        device float* my_alpha=&work_alpha[conf_idx*lbfgs_m];
+        device float* my_alpha=&work_rho[(n_confs_cfg + (int)conf_idx)*lbfgs_m];
         for (int j=hist_count-1;j>=0;j--){int sl=(hist_idx-1-(hist_count-1-j))%lbfgs_m;if(sl<0)sl+=lbfgs_m;
             float aj=my_rho[sl]*parallel_dot(&my_S[sl*n_vars],my_q,n_vars,tid,tpm,shared);
             if(tid==0)my_alpha[j]=aj;threadgroup_barrier(mem_flags::mem_device);
@@ -534,34 +555,71 @@ _ETK_BODY = """
 _etk_kernel_cache: dict[tuple, object] = {}
 
 
-def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, parallel_grad: bool = False):
-    key = (tpm, lbfgs_m, parallel_grad)
+def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad_mode: int = GRAD_GATHER):
+    key = (tpm, lbfgs_m, int(grad_mode))
     if key not in _etk_kernel_cache:
-        pg_flag = "1" if parallel_grad else "0"
-        header = f"#define PARALLEL_GRAD {pg_flag}\n" + _ETK_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
+        header = (f"#define GRAD_MODE {int(grad_mode)}\n#define DIM 3\n"
+                  + _ETK_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m)))
         source = _ETK_BODY.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
         _etk_kernel_cache[key] = mx.fast.metal_kernel(
-            name="etk_lbfgs_shared",
+            name=f"etk_lbfgs_shared_g{int(grad_mode)}",
             input_names=[
                 "pos", "config",
                 "conf_to_mol", "conf_atom_starts", "mol_n_atoms",
-                "torsion_starts", "torsion_quads", "torsion_V", "torsion_signs_arr",
-                "improper_starts", "improper_quads", "improper_w",
-                "dist12_starts", "d12_pairs", "d12_bounds",
-                "dist13_starts", "d13_pairs", "d13_bounds",
-                "dist14_starts", "d14_pairs", "d14_bounds",
+                "term_starts",
+                "torsion_quads", "torsion_V", "torsion_signs_arr",
+                "improper_quads", "improper_w",
+                "d12_pairs", "d12_bounds",
+                "d13_pairs", "d13_bounds",
+                "d14_pairs", "d14_bounds",
                 "lbfgs_history_starts",
+                "csr_slot_base", "csr_off", "csr_ent2", "conf_scr_base",
             ],
+            # Metal allows 31 buffers per kernel: alpha shares work_rho's
+            # buffer and the gradient scratch follows work_scratch.
             output_names=[
                 "out_pos", "out_energies", "out_statuses",
                 "work_grad", "work_dir", "work_scratch",
-                "work_lbfgs", "work_rho", "work_alpha",
+                "work_lbfgs", "work_rho",
             ],
             header=header,
             source=source,
             ensure_row_contiguous=True,
         )
     return _etk_kernel_cache[key]
+
+
+def _starts(batch, name):
+    v = getattr(batch, name)
+    return v if v is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)
+
+
+def _pairs(i1, i2):
+    if i1 is None or len(i1) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.stack([i1, i2], axis=1)
+
+
+def _quads(q):
+    return np.zeros((0, 4), dtype=np.int32) if q is None or len(q) == 0 else np.asarray(q).reshape(-1, 4)
+
+
+def _etk_grad_csr(batch: SharedConstraintBatch):
+    """CSR of ETK terms per atom, types in the serial gradient's order:
+    torsion, improper, 1-2, 1-3, 1-4."""
+    arrays = (batch.mol_n_atoms, batch.etk_torsion_term_starts, batch.etk_torsion_idx,
+              batch.etk_improper_term_starts, batch.etk_improper_idx,
+              batch.etk_dist12_term_starts, batch.etk_dist12_idx1, batch.etk_dist12_idx2,
+              batch.etk_dist13_term_starts, batch.etk_dist13_idx1, batch.etk_dist13_idx2,
+              batch.etk_dist14_term_starts, batch.etk_dist14_idx1, batch.etk_dist14_idx2)
+    return _cached_on_batch(batch, "_etk_grad_csr_cache", arrays, lambda: build_atom_term_csr(
+        batch.mol_n_atoms, [
+            (_starts(batch, "etk_torsion_term_starts"), _quads(batch.etk_torsion_idx)),
+            (_starts(batch, "etk_improper_term_starts"), _quads(batch.etk_improper_idx)),
+            (_starts(batch, "etk_dist12_term_starts"), _pairs(batch.etk_dist12_idx1, batch.etk_dist12_idx2)),
+            (_starts(batch, "etk_dist13_term_starts"), _pairs(batch.etk_dist13_idx1, batch.etk_dist13_idx2)),
+            (_starts(batch, "etk_dist14_term_starts"), _pairs(batch.etk_dist14_idx1, batch.etk_dist14_idx2)),
+        ]))
 
 
 def etk_minimize_shared(
@@ -572,7 +630,7 @@ def etk_minimize_shared(
     grad_tol: float = 1e-4,
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
-    parallel_grad: bool = False,
+    parallel_grad: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run ETK L-BFGS on all C conformers in parallel with shared constraints.
 
@@ -583,16 +641,26 @@ def etk_minimize_shared(
     batch : SharedConstraintBatch
     positions : np.ndarray, shape (n_atoms_total * 3,)
         3D positions from DG stage (after 4D→3D extraction).
+    parallel_grad : bool
+        True (default): all TPM lanes compute the gradient, in two phases.
+        Phase 1 strides the terms over the lanes and stores, per term, the
+        vectors it adds to its atoms (torsion/improper) or its scalar
+        prefactor (1-2/1-3/1-4 distances). Phase 2 gives each lane whole atoms
+        and sums those contributions through a per-molecule "terms per atom"
+        CSR index, in the serial loop's order: no atomics, deterministic, and
+        bit-identical to ``parallel_grad=False``.
+        False: thread 0 computes the gradient serially (reference).
 
     Returns
     -------
     out_positions, energies, statuses
     """
+    grad_mode = GRAD_GATHER if parallel_grad else GRAD_SERIAL
     C = batch.n_confs_total
     dim = 3  # ETK is always 3D
     total_pos_size = int(batch.conf_atom_starts[-1]) * dim
 
-    config = np.array([C, max_iters, grad_tol, dim, total_pos_size], dtype=np.float32)
+    config = np.array([C, max_iters, grad_tol, dim, total_pos_size, batch.n_mols + 1], dtype=np.float32)
 
     # Pack torsion terms
     nt = len(batch.etk_torsion_idx) if batch.etk_torsion_idx is not None else 0
@@ -633,14 +701,30 @@ def etk_minimize_shared(
         batch.etk_dist14_lb, batch.etk_dist14_ub, batch.etk_dist14_weight)
 
     # L-BFGS history
+    n_vars_c = batch.mol_n_atoms[batch.conf_to_mol].astype(np.int64) * dim
     lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
-    for c in range(C):
-        n_atoms = batch.mol_n_atoms[batch.conf_to_mol[c]]
-        n_vars = n_atoms * dim
-        lbfgs_starts[c + 1] = lbfgs_starts[c] + 2 * lbfgs_m * n_vars
+    np.cumsum(2 * lbfgs_m * n_vars_c, out=lbfgs_starts[1:])
     total_lbfgs = int(lbfgs_starts[-1])
 
-    kernel = _get_etk_kernel(tpm, lbfgs_m, parallel_grad)
+    # Gradient scratch per conformer: 12 floats per torsion/improper (the
+    # four role vectors) + 1 prefactor per 1-2/1-3/1-4 term.
+    if grad_mode == GRAD_GATHER:
+        csr_slot_base, csr_off, csr_ent, csr_partner = _etk_grad_csr(batch)
+        csr_ent2 = np.stack([csr_ent, csr_partner], axis=1).ravel()
+        per_mol = (12 * np.diff(_starts(batch, "etk_torsion_term_starts").astype(np.int64))
+                   + 12 * np.diff(_starts(batch, "etk_improper_term_starts").astype(np.int64))
+                   + np.diff(_starts(batch, "etk_dist12_term_starts").astype(np.int64))
+                   + np.diff(_starts(batch, "etk_dist13_term_starts").astype(np.int64))
+                   + np.diff(_starts(batch, "etk_dist14_term_starts").astype(np.int64)))
+    else:
+        csr_slot_base = csr_off = np.zeros(1, dtype=np.int32)
+        csr_ent2 = np.zeros(2, dtype=np.int32)
+        per_mol = np.zeros(batch.n_mols, dtype=np.int64)
+    conf_scr_base = np.zeros(C + 1, dtype=np.int32)
+    np.cumsum(per_mol[batch.conf_to_mol], out=conf_scr_base[1:])
+    total_scr = int(conf_scr_base[-1])
+
+    kernel = _get_etk_kernel(tpm, lbfgs_m, grad_mode)
     results = kernel(
         inputs=[
             mx.array(positions),
@@ -648,35 +732,38 @@ def etk_minimize_shared(
             mx.array(batch.conf_to_mol),
             mx.array(batch.conf_atom_starts),
             mx.array(batch.mol_n_atoms),
-            mx.array(batch.etk_torsion_term_starts if batch.etk_torsion_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
+            mx.array(np.concatenate([
+                _starts(batch, "etk_torsion_term_starts"), _starts(batch, "etk_improper_term_starts"),
+                _starts(batch, "etk_dist12_term_starts"), _starts(batch, "etk_dist13_term_starts"),
+                _starts(batch, "etk_dist14_term_starts")]).astype(np.int32)),
             mx.array(tor_quads),
             mx.array(tor_V),
             mx.array(tor_signs),
-            mx.array(batch.etk_improper_term_starts if batch.etk_improper_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(imp_quads),
             mx.array(imp_w),
-            mx.array(batch.etk_dist12_term_starts if batch.etk_dist12_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(d12_pairs),
             mx.array(d12_bounds),
-            mx.array(batch.etk_dist13_term_starts if batch.etk_dist13_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(d13_pairs),
             mx.array(d13_bounds),
-            mx.array(batch.etk_dist14_term_starts if batch.etk_dist14_term_starts is not None else np.zeros(batch.n_mols + 1, dtype=np.int32)),
             mx.array(d14_pairs),
             mx.array(d14_bounds),
             mx.array(lbfgs_starts[:-1]),
+            mx.array(csr_slot_base),
+            mx.array(csr_off),
+            mx.array(csr_ent2),
+            mx.array(conf_scr_base),
         ],
         grid=(C * tpm, 1, 1),
         threadgroup=(tpm, 1, 1),
         output_shapes=[
             (total_pos_size,), (C,), (C,),
-            (total_pos_size,), (total_pos_size,), (3 * total_pos_size,),
-            (max(1, total_lbfgs),), (max(1, C * lbfgs_m),), (max(1, C * lbfgs_m),),
+            (total_pos_size,), (total_pos_size,), (3 * total_pos_size + total_scr,),
+            (max(1, total_lbfgs),), (max(1, 2 * C * lbfgs_m),),
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.int32,
             mx.float32, mx.float32, mx.float32,
-            mx.float32, mx.float32, mx.float32,
+            mx.float32, mx.float32,
         ],
     )
     mx.eval(results[0], results[1], results[2])

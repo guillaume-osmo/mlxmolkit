@@ -3,7 +3,15 @@ N×k parallel DG conformer generation with shared constraints.
 
 One Metal threadgroup per conformer (C threadgroups total, where C = Σ k_i).
 Each threadgroup has TPM=32 threads that parallelize energy computation,
-line search, and L-BFGS two-loop recursion.
+the gradient, line search, and L-BFGS two-loop recursion.
+
+The gradient is spread over all lanes without atomics: phase 1 strides the
+distance terms over the lanes and stores each term's prefactor; phase 2 gives
+each lane whole atoms and sums their terms through a "terms per atom" CSR
+index, in the serial loop's order. The result is deterministic and
+bit-identical to the original thread-0 gradient (``parallel_grad=False``).
+Float atomics were measured as well (``_grad_mode=GRAD_ATOMIC``): faster, but
+the reordered sums send a few conformers to different minima.
 
 Constraints are stored ONCE per molecule and shared across k conformers
 via ``conf_to_mol`` indirection.  Only positions differ between conformers
@@ -202,11 +210,154 @@ inline void parallel_neg_copy(device float* dst, const device float* src, int n,
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = -src[i];
     threadgroup_barrier(mem_flags::mem_device);
 }
+
+// ---- Gradient, all lanes, in two phases ----
+// Phase 1 (terms strided over lanes): the scalar prefactor pf of every
+// distance term, stored per conformer in my_pf.
+// Phase 2 (atoms strided over lanes): each lane sums the terms that touch the
+// atoms it owns, read from csr_off/csr_ent. The index lists, per (molecule,
+// term type, atom), the terms touching the atom as ``term * 4 + role`` in
+// increasing term order (then role): the order in which the serial loop adds
+// into that atom. Every contribution is formed with the serial helper's
+// expressions, so each gradient component is the same float sum taken in the
+// same order -- deterministic, and bit-identical to the thread-0 gradient.
+// Slot of (mol, type T, local atom a) = slot0 + T * n_atoms + a.
+// Input pointers are template parameters: MLX hands small inputs to the
+// kernel in the constant address space and large ones in device.
+template <typename PairsT, typename BoundsT>
+inline void dg_grad_phase1(
+    const device float* pos, device float* my_pf, uint tid, uint tpm,
+    int dist_start, int dist_end, int atom_off, int dim,
+    PairsT dist_pairs, BoundsT dist_bounds
+) {
+    for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm) {
+        int i1 = dist_pairs[t*2], i2 = dist_pairs[t*2+1];
+        float lb2 = dist_bounds[t*3], ub2 = dist_bounds[t*3+1], wt = dist_bounds[t*3+2];
+        float d2 = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            float diff = pos[(atom_off + i1) * dim + d] - pos[(atom_off + i2) * dim + d];
+            d2 += diff * diff;
+        }
+        float pf = 0.0f;
+        if (d2 > ub2) {
+            pf = wt * 4.0f * (d2 / ub2 - 1.0f) / ub2;
+        } else if (d2 < lb2) {
+            float l2d2 = d2 + lb2;
+            pf = wt * 8.0f * lb2 * (1.0f - 2.0f * lb2 / l2d2) / (l2d2 * l2d2);
+        }
+        my_pf[t - dist_start] = pf;
+    }
+}
+
+template <typename OffT, typename EntT, typename PartT, typename QuadT, typename CBoundT, typename FourT>
+inline void dg_grad_phase2(
+    const device float* pos, device float* grad, const device float* my_pf, uint tid, uint tpm,
+    int n_atoms, int atom_off, int dim, int slot0, int dist_start,
+    OffT csr_off, EntT csr_ent, PartT csr_partner,
+    QuadT chiral_quads, CBoundT chiral_bounds, float chiral_weight,
+    FourT fourth_idx_arr, float fourth_dim_weight
+) {
+    for (int a = (int)tid; a < n_atoms; a += (int)tpm) {
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float own[4];
+        for (int d = 0; d < dim; d++) own[d] = pos[(atom_off + a) * dim + d];
+        int s = slot0 + a;
+        for (int e = csr_off[s]; e < csr_off[s + 1]; e++) {
+            int en = csr_ent[e]; int other = csr_partner[e];
+            int t = en >> 2; int role = en & 3;
+            float pf = my_pf[t - dist_start];
+            if (pf == 0.0f) continue;
+            // diff = pos[i1] - pos[i2], formed exactly as the serial helper does.
+            for (int d = 0; d < dim; d++) {
+                float po = pos[(atom_off + other) * dim + d];
+                float diff = (role == 0) ? (own[d] - po) : (po - own[d]);
+                float g = pf * diff;
+                if (role == 0) acc[d] += g; else acc[d] -= g;
+            }
+        }
+        s = slot0 + n_atoms + a;
+        for (int e = csr_off[s]; e < csr_off[s + 1]; e++) {
+            int en = csr_ent[e]; int t = en >> 2; int role = en & 3;
+            int i1 = chiral_quads[t*4], i2 = chiral_quads[t*4+1];
+            int i3 = chiral_quads[t*4+2], i4 = chiral_quads[t*4+3];
+            float vol_lower = chiral_bounds[t*2], vol_upper = chiral_bounds[t*2+1];
+            int o = atom_off;
+            float v1[3], v2[3], v3[3];
+            for (int d = 0; d < 3; d++) {
+                v1[d] = pos[(o+i1)*dim+d] - pos[(o+i4)*dim+d];
+                v2[d] = pos[(o+i2)*dim+d] - pos[(o+i4)*dim+d];
+                v3[d] = pos[(o+i3)*dim+d] - pos[(o+i4)*dim+d];
+            }
+            float cx = v2[1]*v3[2] - v2[2]*v3[1];
+            float cy = v2[2]*v3[0] - v2[0]*v3[2];
+            float cz = v2[0]*v3[1] - v2[1]*v3[0];
+            float vol = v1[0]*cx + v1[1]*cy + v1[2]*cz;
+            float pf = 0.0f;
+            if (vol < vol_lower) pf = 2.0f * chiral_weight * (vol - vol_lower);
+            else if (vol > vol_upper) pf = 2.0f * chiral_weight * (vol - vol_upper);
+            if (pf == 0.0f) continue;
+            float g1x = pf * cx, g1y = pf * cy, g1z = pf * cz;
+            float g2x = pf * (v3[1]*v1[2] - v3[2]*v1[1]);
+            float g2y = pf * (v3[2]*v1[0] - v3[0]*v1[2]);
+            float g2z = pf * (v3[0]*v1[1] - v3[1]*v1[0]);
+            float g3x = pf * (v2[2]*v1[1] - v2[1]*v1[2]);
+            float g3y = pf * (v2[0]*v1[2] - v2[2]*v1[0]);
+            float g3z = pf * (v2[1]*v1[0] - v2[0]*v1[1]);
+            if (role == 0) { acc[0] += g1x; acc[1] += g1y; acc[2] += g1z; }
+            else if (role == 1) { acc[0] += g2x; acc[1] += g2y; acc[2] += g2z; }
+            else if (role == 2) { acc[0] += g3x; acc[1] += g3y; acc[2] += g3z; }
+            else {
+                acc[0] -= (g1x + g2x + g3x);
+                acc[1] -= (g1y + g2y + g3y);
+                acc[2] -= (g1z + g2z + g3z);
+            }
+        }
+        if (dim == 4) {
+            s = slot0 + 2 * n_atoms + a;
+            for (int e = csr_off[s]; e < csr_off[s + 1]; e++) {
+                int idx = fourth_idx_arr[csr_ent[e] >> 2];
+                float w = pos[(atom_off + idx) * dim + 3];
+                acc[3] += 2.0f * fourth_dim_weight * w;
+            }
+        }
+        for (int d = 0; d < dim; d++) grad[(atom_off + a) * dim + d] = acc[d];
+    }
+}
+
+#if GRAD_MODE == 2
+// ---- Gradient, all lanes, terms strided over lanes with float atomics ----
+// Measurement-only variant: the order of the atomic adds varies run to run.
+#define GADD(p, v) atomic_fetch_add_explicit((device atomic_float*)(p), (v), memory_order_relaxed)
+inline void dist_g_atomic(const device float* pos, device float* grad,
+    int i1, int i2, float lb2, float ub2, float wt, int dim, int atom_off) {
+    float d2 = 0.0f; float diff[4];
+    for (int d = 0; d < dim; d++) { diff[d] = pos[(atom_off+i1)*dim+d] - pos[(atom_off+i2)*dim+d]; d2 += diff[d]*diff[d]; }
+    float pf = 0.0f;
+    if (d2 > ub2) pf = wt * 4.0f * (d2 / ub2 - 1.0f) / ub2;
+    else if (d2 < lb2) { float l2d2 = d2 + lb2; pf = wt * 8.0f * lb2 * (1.0f - 2.0f * lb2 / l2d2) / (l2d2 * l2d2); }
+    if (pf != 0.0f) for (int d = 0; d < dim; d++) { float g = pf*diff[d];
+        GADD(&grad[(atom_off+i1)*dim+d], g); GADD(&grad[(atom_off+i2)*dim+d], -g); }
+}
+inline void chiral_g_atomic(const device float* pos, device float* grad,
+    int i1, int i2, int i3, int i4, float vl, float vu, float wt, int dim, int o) {
+    float v1[3], v2[3], v3[3];
+    for (int d = 0; d < 3; d++) { v1[d]=pos[(o+i1)*dim+d]-pos[(o+i4)*dim+d]; v2[d]=pos[(o+i2)*dim+d]-pos[(o+i4)*dim+d]; v3[d]=pos[(o+i3)*dim+d]-pos[(o+i4)*dim+d]; }
+    float cx=v2[1]*v3[2]-v2[2]*v3[1], cy=v2[2]*v3[0]-v2[0]*v3[2], cz=v2[0]*v3[1]-v2[1]*v3[0];
+    float vol=v1[0]*cx+v1[1]*cy+v1[2]*cz; float pf=0.0f;
+    if (vol<vl) pf=2.0f*wt*(vol-vl); else if (vol>vu) pf=2.0f*wt*(vol-vu);
+    if (pf==0.0f) return;
+    float g1[3]={pf*cx,pf*cy,pf*cz};
+    float g2[3]={pf*(v3[1]*v1[2]-v3[2]*v1[1]),pf*(v3[2]*v1[0]-v3[0]*v1[2]),pf*(v3[0]*v1[1]-v3[1]*v1[0])};
+    float g3[3]={pf*(v2[2]*v1[1]-v2[1]*v1[2]),pf*(v2[0]*v1[2]-v2[2]*v1[0]),pf*(v2[1]*v1[0]-v2[0]*v1[1])};
+    for (int d=0; d<3; d++) { GADD(&grad[(o+i1)*dim+d], g1[d]); GADD(&grad[(o+i2)*dim+d], g2[d]);
+        GADD(&grad[(o+i3)*dim+d], g3[d]); GADD(&grad[(o+i4)*dim+d], -(g1[d]+g2[d]+g3[d])); }
+}
+#endif
 """
 
 # Main kernel body — one threadgroup per CONFORMER, TPM threads per threadgroup
 # conf_to_mol indirection for shared constraints
-_MSL_DG_BODY = """
+_MSL_DG_BODY = r"""
     uint tid = thread_position_in_threadgroup.x;   // 0..TPM-1
     uint conf_idx = threadgroup_position_in_grid.x; // which conformer
     const uint tpm = TPM;
@@ -220,7 +371,7 @@ _MSL_DG_BODY = """
     float grad_tol = config[2];
     float chiral_weight = config[3];
     float fourth_dim_weight = config[4];
-    int dim = (int)config[5];
+    const int dim = DIM;  // compiled per dimension (config[5] is the same value)
     int total_pos_size = (int)config[6];
 
     if ((int)conf_idx >= n_confs_cfg) return;
@@ -257,9 +408,50 @@ _MSL_DG_BODY = """
     device float* my_Y = &work_lbfgs[lbfgs_start + lbfgs_m * n_vars];
     device float* my_rho = &work_rho[conf_idx * lbfgs_m];
 
-    // ---- Initial energy (parallel) + gradient ----
-    parallel_set(my_grad, 0.0f, n_vars, tid, tpm);
+    // ---- Gradient of the current positions into my_grad (all lanes return) ----
+#if GRAD_MODE == 1
+    device float* my_pf = &work_pf[conf_term_base[conf_idx]];
+    #define DG_GRADIENT() \
+        dg_grad_phase1(out_pos, my_pf, tid, tpm, dist_start, dist_end, atom_off, dim, \
+            dist_pairs, dist_bounds); \
+        threadgroup_barrier(mem_flags::mem_device); \
+        dg_grad_phase2(out_pos, work_grad, my_pf, tid, tpm, n_atoms, atom_off, dim, \
+            csr_slot_base[mol_idx], dist_start, csr_off, csr_ent, csr_partner, \
+            chiral_quads, chiral_bounds, chiral_weight, fourth_idx_arr, fourth_dim_weight); \
+        threadgroup_barrier(mem_flags::mem_device);
+#elif GRAD_MODE == 2
+    #define DG_GRADIENT() \
+        parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm) \
+            dist_g_atomic(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1], \
+                dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off); \
+        for (int t = chiral_start_t + (int)tid; t < chiral_end_t; t += (int)tpm) \
+            chiral_g_atomic(out_pos, work_grad, chiral_quads[t*4], chiral_quads[t*4+1], \
+                chiral_quads[t*4+2], chiral_quads[t*4+3], chiral_bounds[t*2], chiral_bounds[t*2+1], \
+                chiral_weight, dim, atom_off); \
+        if (dim == 4) for (int t = fourth_start_t + (int)tid; t < fourth_end_t; t += (int)tpm) { \
+            int a4 = fourth_idx_arr[t]; \
+            GADD(&work_grad[(atom_off+a4)*dim+3], 2.0f*fourth_dim_weight*out_pos[(atom_off+a4)*dim+3]); } \
+        threadgroup_barrier(mem_flags::mem_device);
+#else
+    // Reference: thread 0 adds every term serially.
+    #define DG_GRADIENT() \
+        parallel_set(my_grad, 0.0f, n_vars, tid, tpm); \
+        if (tid == 0) { \
+            for (int t = dist_start; t < dist_end; t++) \
+                dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1], \
+                    dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off); \
+            for (int t = chiral_start_t; t < chiral_end_t; t++) \
+                chiral_violation_g(out_pos, work_grad, \
+                    chiral_quads[t*4], chiral_quads[t*4+1], chiral_quads[t*4+2], chiral_quads[t*4+3], \
+                    chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off); \
+            for (int t = fourth_start_t; t < fourth_end_t; t++) \
+                fourth_dim_g(out_pos, work_grad, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off); \
+        } \
+        threadgroup_barrier(mem_flags::mem_device);
+#endif
 
+    // ---- Initial energy (parallel) + gradient ----
     float local_energy = 0.0f;
     for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm)
         local_energy += dist_violation_e(out_pos, dist_pairs[t*2], dist_pairs[t*2+1],
@@ -273,58 +465,7 @@ _MSL_DG_BODY = """
     shared[tid] = local_energy;
     float energy = tg_reduce_sum(shared, tid, tpm);
 
-#if PARALLEL_GRAD
-    // All threads compute gradient via gather — each thread owns a stripe of vars
-    for (int v = (int)tid; v < n_vars; v += (int)tpm) {
-        int my_atom = v / dim; int my_coord = v % dim; float g = 0.0f;
-        for (int t = dist_start; t < dist_end; t++) {
-            int a = dist_pairs[t*2], b = dist_pairs[t*2+1];
-            if (my_atom != a && my_atom != b) continue;
-            float d2 = 0.0f; float dif[4];
-            for (int d = 0; d < dim; d++) { dif[d] = out_pos[(atom_off+a)*dim+d] - out_pos[(atom_off+b)*dim+d]; d2 += dif[d]*dif[d]; }
-            float lb2 = dist_bounds[t*3], ub2 = dist_bounds[t*3+1], wt = dist_bounds[t*3+2]; float pf = 0.0f;
-            if (d2 > ub2) pf = wt*4.0f*(d2/ub2-1.0f)/ub2;
-            else if (d2 < lb2) { float l = d2+lb2; pf = wt*8.0f*lb2*(1.0f-2.0f*lb2/l)/(l*l); }
-            if (pf != 0.0f) g += ((my_atom==a)?1.0f:-1.0f) * pf * dif[my_coord];
-        }
-        if (my_coord < 3) {
-            for (int t = chiral_start_t; t < chiral_end_t; t++) {
-                int i1=chiral_quads[t*4],i2=chiral_quads[t*4+1],i3=chiral_quads[t*4+2],i4=chiral_quads[t*4+3];
-                if (my_atom!=i1&&my_atom!=i2&&my_atom!=i3&&my_atom!=i4) continue;
-                float v1[3],v2[3],v3[3];
-                for (int d=0;d<3;d++){v1[d]=out_pos[(atom_off+i1)*dim+d]-out_pos[(atom_off+i4)*dim+d];v2[d]=out_pos[(atom_off+i2)*dim+d]-out_pos[(atom_off+i4)*dim+d];v3[d]=out_pos[(atom_off+i3)*dim+d]-out_pos[(atom_off+i4)*dim+d];}
-                float cx=v2[1]*v3[2]-v2[2]*v3[1],cy=v2[2]*v3[0]-v2[0]*v3[2],cz=v2[0]*v3[1]-v2[1]*v3[0];
-                float vol=v1[0]*cx+v1[1]*cy+v1[2]*cz;
-                float vl=chiral_bounds[t*2],vu=chiral_bounds[t*2+1];float pf=0.0f;
-                if(vol<vl)pf=2.0f*chiral_weight*(vol-vl);else if(vol>vu)pf=2.0f*chiral_weight*(vol-vu);
-                if(pf!=0.0f){
-                    float gc[4][3];gc[0][0]=pf*cx;gc[0][1]=pf*cy;gc[0][2]=pf*cz;
-                    gc[1][0]=pf*(v3[1]*v1[2]-v3[2]*v1[1]);gc[1][1]=pf*(v3[2]*v1[0]-v3[0]*v1[2]);gc[1][2]=pf*(v3[0]*v1[1]-v3[1]*v1[0]);
-                    gc[2][0]=pf*(v2[2]*v1[1]-v2[1]*v1[2]);gc[2][1]=pf*(v2[0]*v1[2]-v2[2]*v1[0]);gc[2][2]=pf*(v2[1]*v1[0]-v2[0]*v1[1]);
-                    gc[3][0]=-(gc[0][0]+gc[1][0]+gc[2][0]);gc[3][1]=-(gc[0][1]+gc[1][1]+gc[2][1]);gc[3][2]=-(gc[0][2]+gc[1][2]+gc[2][2]);
-                    int at4[4]={i1,i2,i3,i4};for(int k=0;k<4;k++){if(my_atom==at4[k])g+=gc[k][my_coord];}
-                }
-            }
-        }
-        if (dim==4&&my_coord==3) { for (int t=fourth_start_t;t<fourth_end_t;t++) { if(my_atom==fourth_idx_arr[t]) g+=2.0f*fourth_dim_weight*out_pos[(atom_off+my_atom)*dim+3]; } }
-        my_grad[v] = g;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-#else
-    // Thread 0 computes gradient serially (no atomics)
-    if (tid == 0) {
-        for (int t = dist_start; t < dist_end; t++)
-            dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1],
-                dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off);
-        for (int t = chiral_start_t; t < chiral_end_t; t++)
-            chiral_violation_g(out_pos, work_grad,
-                chiral_quads[t*4], chiral_quads[t*4+1], chiral_quads[t*4+2], chiral_quads[t*4+3],
-                chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off);
-        for (int t = fourth_start_t; t < fourth_end_t; t++)
-            fourth_dim_g(out_pos, work_grad, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-#endif
+    DG_GRADIENT();
 
     // ---- nvMolKit gradient scaling: 0.1x, halve while max > 10 ----
     parallel_scale(my_grad, 0.1f, n_vars, tid, tpm);
@@ -439,7 +580,6 @@ _MSL_DG_BODY = """
         if (tg_reduce_max(shared, tid, tpm) < TOLX) { status = 0; break; }
 
         parallel_copy(my_old_grad, my_grad, n_vars, tid, tpm);
-        parallel_set(my_grad, 0.0f, n_vars, tid, tpm);
 
         float local_new_e = 0.0f;
         for (int t = dist_start + (int)tid; t < dist_end; t += (int)tpm)
@@ -454,50 +594,7 @@ _MSL_DG_BODY = """
         shared[tid] = local_new_e;
         energy = tg_reduce_sum(shared, tid, tpm);
 
-#if PARALLEL_GRAD
-        for (int v = (int)tid; v < n_vars; v += (int)tpm) {
-            int my_a2 = v / dim; int my_c2 = v % dim; float g2 = 0.0f;
-            for (int t = dist_start; t < dist_end; t++) {
-                int a = dist_pairs[t*2], b = dist_pairs[t*2+1];
-                if (my_a2 != a && my_a2 != b) continue;
-                float d2 = 0.0f; float df[4];
-                for (int d = 0; d < dim; d++) { df[d] = out_pos[(atom_off+a)*dim+d] - out_pos[(atom_off+b)*dim+d]; d2 += df[d]*df[d]; }
-                float lb2 = dist_bounds[t*3], ub2 = dist_bounds[t*3+1], wt = dist_bounds[t*3+2]; float pf = 0.0f;
-                if (d2 > ub2) pf = wt*4.0f*(d2/ub2-1.0f)/ub2;
-                else if (d2 < lb2) { float l = d2+lb2; pf = wt*8.0f*lb2*(1.0f-2.0f*lb2/l)/(l*l); }
-                if (pf != 0.0f) g2 += ((my_a2==a)?1.0f:-1.0f) * pf * df[my_c2];
-            }
-            if (my_c2 < 3) {
-                for (int t = chiral_start_t; t < chiral_end_t; t++) {
-                    int i1=chiral_quads[t*4],i2=chiral_quads[t*4+1],i3=chiral_quads[t*4+2],i4=chiral_quads[t*4+3];
-                    if (my_a2!=i1&&my_a2!=i2&&my_a2!=i3&&my_a2!=i4) continue;
-                    float u1[3],u2[3],u3[3];
-                    for (int d=0;d<3;d++){u1[d]=out_pos[(atom_off+i1)*dim+d]-out_pos[(atom_off+i4)*dim+d];u2[d]=out_pos[(atom_off+i2)*dim+d]-out_pos[(atom_off+i4)*dim+d];u3[d]=out_pos[(atom_off+i3)*dim+d]-out_pos[(atom_off+i4)*dim+d];}
-                    float cx=u2[1]*u3[2]-u2[2]*u3[1],cy=u2[2]*u3[0]-u2[0]*u3[2],cz=u2[0]*u3[1]-u2[1]*u3[0];
-                    float vol=u1[0]*cx+u1[1]*cy+u1[2]*cz;
-                    float vl=chiral_bounds[t*2],vu=chiral_bounds[t*2+1];float pf=0.0f;
-                    if(vol<vl)pf=2.0f*chiral_weight*(vol-vl);else if(vol>vu)pf=2.0f*chiral_weight*(vol-vu);
-                    if(pf!=0.0f){float gc[4][3];gc[0][0]=pf*cx;gc[0][1]=pf*cy;gc[0][2]=pf*cz;gc[1][0]=pf*(u3[1]*u1[2]-u3[2]*u1[1]);gc[1][1]=pf*(u3[2]*u1[0]-u3[0]*u1[2]);gc[1][2]=pf*(u3[0]*u1[1]-u3[1]*u1[0]);gc[2][0]=pf*(u2[2]*u1[1]-u2[1]*u1[2]);gc[2][1]=pf*(u2[0]*u1[2]-u2[2]*u1[0]);gc[2][2]=pf*(u2[1]*u1[0]-u2[0]*u1[1]);gc[3][0]=-(gc[0][0]+gc[1][0]+gc[2][0]);gc[3][1]=-(gc[0][1]+gc[1][1]+gc[2][1]);gc[3][2]=-(gc[0][2]+gc[1][2]+gc[2][2]);int at4[4]={i1,i2,i3,i4};for(int k=0;k<4;k++){if(my_a2==at4[k])g2+=gc[k][my_c2];}}
-                }
-            }
-            if (dim==4&&my_c2==3){for(int t=fourth_start_t;t<fourth_end_t;t++){if(my_a2==fourth_idx_arr[t])g2+=2.0f*fourth_dim_weight*out_pos[(atom_off+my_a2)*dim+3];}}
-            my_grad[v] = g2;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-#else
-        if (tid == 0) {
-            for (int t = dist_start; t < dist_end; t++)
-                dist_violation_g(out_pos, work_grad, dist_pairs[t*2], dist_pairs[t*2+1],
-                    dist_bounds[t*3], dist_bounds[t*3+1], dist_bounds[t*3+2], dim, atom_off);
-            for (int t = chiral_start_t; t < chiral_end_t; t++)
-                chiral_violation_g(out_pos, work_grad,
-                    chiral_quads[t*4], chiral_quads[t*4+1], chiral_quads[t*4+2], chiral_quads[t*4+3],
-                    chiral_bounds[t*2], chiral_bounds[t*2+1], chiral_weight, dim, atom_off);
-            for (int t = fourth_start_t; t < fourth_end_t; t++)
-                fourth_dim_g(out_pos, work_grad, fourth_idx_arr[t], fourth_dim_weight, dim, atom_off);
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-#endif
+        DG_GRADIENT();
 
         float local_grad_test = 0.0f;
         for (int i = (int)tid; i < n_vars; i += (int)tpm) {
@@ -559,32 +656,135 @@ _MSL_DG_BODY = """
     }
 """
 
-# Cache: (tpm, lbfgs_m, parallel_grad) → compiled kernel (cleared on source change)
+# Gradient modes compiled into the kernel (GRAD_MODE):
+#   0 = thread 0 adds every term serially (reference; 31 lanes idle).
+#   1 = every lane gathers the terms of the atoms it owns through a CSR
+#       "terms per atom" index (default; deterministic, same order as 0).
+#   2 = terms strided over lanes, float atomic adds (measurement only:
+#       the order of the adds, hence the low bits, varies run to run).
+GRAD_SERIAL, GRAD_GATHER, GRAD_ATOMIC = 0, 1, 2
+
+# Cache: (tpm, lbfgs_m, grad_mode, dim) -> compiled kernel
 _dg_kernel_cache: dict[tuple, object] = {}
+
+
+def build_atom_term_csr(
+    mol_n_atoms: np.ndarray,
+    term_types: list[tuple[np.ndarray, np.ndarray]],
+    local_terms: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Index, per molecule and term type, the terms that touch each atom.
+
+    Parameters
+    ----------
+    mol_n_atoms : (N,) int
+        Atoms per molecule.
+    term_types : list of (term_starts, atoms)
+        One entry per term type, in the order the serial gradient visits the
+        types. ``term_starts`` is the (N+1,) per-molecule range into the
+        type's term arrays; ``atoms`` is (n_terms, R) LOCAL atom indices, one
+        column per role (column order = order the serial code adds them).
+
+    Returns
+    -------
+    slot_base : (N+1,) int32
+        Slot of (molecule m, type T, local atom a) is
+        ``slot_base[m] + T * mol_n_atoms[m] + a``.
+    offsets : (n_slots+1,) int32
+        Entries of a slot are ``entries[offsets[slot]:offsets[slot+1]]``.
+    entries : (n_incidences,) int32
+        ``term * 4 + role`` with ``term`` the global term index of its type
+        (or, with ``local_terms``, the index within its molecule), ordered by
+        term then role: the order in which a serial loop over the terms
+        accumulates into that atom.
+    partner : (n_incidences,) int32
+        For two-atom terms, the LOCAL index of the other atom (saves the
+        kernel a dependent load); 0 for other term types.
+    """
+    n_atoms = np.asarray(mol_n_atoms, dtype=np.int64)
+    n_mols = len(n_atoms)
+    n_types = len(term_types)
+    slot_base = np.zeros(n_mols + 1, dtype=np.int64)
+    np.cumsum(n_types * n_atoms, out=slot_base[1:])
+    n_slots = int(slot_base[-1])
+    keys, ents, partners = [], [], []
+    for t_type, (starts, atoms) in enumerate(term_types):
+        atoms = np.asarray(atoms, dtype=np.int64)
+        n_terms = int(starts[-1]) if len(starts) else 0
+        if n_terms == 0:
+            continue
+        atoms = atoms.reshape(n_terms, -1)
+        n_roles = atoms.shape[1]
+        mol = np.repeat(np.arange(n_mols), np.diff(np.asarray(starts, dtype=np.int64)))
+        base = slot_base[mol] + t_type * n_atoms[mol]
+        keys.append((base[:, None] + atoms).ravel())
+        term = np.arange(n_terms, dtype=np.int64)
+        if local_terms:
+            term = term - np.asarray(starts, dtype=np.int64)[mol]
+        ents.append((term[:, None] * 4 + np.arange(n_roles, dtype=np.int64)[None, :]).ravel())
+        partners.append(atoms[:, ::-1].ravel() if n_roles == 2 else np.zeros(atoms.size, dtype=np.int64))
+    offsets = np.zeros(n_slots + 1, dtype=np.int32)
+    if not keys:
+        empty = np.zeros(1, dtype=np.int32)
+        return slot_base.astype(np.int32), offsets, empty, empty
+    key = np.concatenate(keys)
+    ent = np.concatenate(ents)
+    if ent.max() >= 2**31:
+        raise ValueError("too many terms for the int32 term*4+role encoding")
+    order = np.argsort(key, kind="stable")
+    np.cumsum(np.bincount(key, minlength=n_slots), out=offsets[1:])
+    return (slot_base.astype(np.int32), offsets, ent[order].astype(np.int32),
+            np.concatenate(partners)[order].astype(np.int32))
+
+
+def _cached_on_batch(batch, name: str, arrays: tuple, build):
+    """Memoise ``build()`` on *batch*, keyed on the identity of *arrays*.
+
+    The pipeline runs three DG minimisations on one batch; the index arrays a
+    CSR is built from are never modified in place, so array identity is the
+    key (the cache holds references, so an id cannot be recycled).
+    """
+    hit = getattr(batch, name, None)
+    if hit is not None and len(hit[0]) == len(arrays) and all(a is b for a, b in zip(hit[0], arrays)):
+        return hit[1]
+    value = build()
+    try:
+        setattr(batch, name, (arrays, value))
+    except AttributeError:
+        pass
+    return value
+
+
+def _dg_grad_csr(batch: SharedConstraintBatch):
+    """CSR of DG terms per atom: types (distance, chiral, fourth-dim)."""
+    arrays = (batch.mol_n_atoms, batch.dist_term_starts, batch.dist_idx1, batch.dist_idx2,
+              batch.chiral_term_starts, batch.chiral_idx1, batch.chiral_idx2, batch.chiral_idx3,
+              batch.chiral_idx4, batch.fourth_term_starts, batch.fourth_idx)
+    return _cached_on_batch(batch, "_dg_grad_csr_cache", arrays, lambda: _build_dg_grad_csr(batch))
+
+
+def _build_dg_grad_csr(batch: SharedConstraintBatch):
+    return build_atom_term_csr(batch.mol_n_atoms, [
+        (batch.dist_term_starts, np.stack([batch.dist_idx1, batch.dist_idx2], axis=1)),
+        (batch.chiral_term_starts, np.stack([
+            batch.chiral_idx1, batch.chiral_idx2, batch.chiral_idx3, batch.chiral_idx4], axis=1)),
+        (batch.fourth_term_starts, np.asarray(batch.fourth_idx).reshape(-1, 1)),
+    ])
 
 
 def _build_dg_kernel(
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
-    parallel_grad: bool = False,
+    grad_mode: int = GRAD_GATHER,
+    dim: int = 4,
 ):
-    """Compile the DG L-BFGS Metal kernel with shared constraints.
-
-    Parameters
-    ----------
-    parallel_grad : bool
-        If True, all TPM threads compute gradient in parallel using
-        atomic scatter-add.  Faster for molecules with many constraints
-        (>500 terms) but adds atomic overhead.  Default False (thread 0
-        serial gradient, zero atomic cost).
-    """
-    pg_flag = "1" if parallel_grad else "0"
+    """Compile the DG L-BFGS Metal kernel with shared constraints."""
     header = _MSL_HEADER.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
-    header = f"#define PARALLEL_GRAD {pg_flag}\n" + header
+    header = f"#define GRAD_MODE {int(grad_mode)}\n#define DIM {int(dim)}\n" + header
     source = _MSL_DG_BODY.replace("TPM", str(tpm)).replace("LBFGS_M", str(lbfgs_m))
 
     return mx.fast.metal_kernel(
-        name=f"dg_lbfgs_shared_pg{pg_flag}",
+        name=f"dg_lbfgs_shared_g{int(grad_mode)}_d{int(dim)}",
         input_names=[
             "pos", "config",
             "conf_to_mol", "conf_atom_starts", "mol_n_atoms",
@@ -592,11 +792,12 @@ def _build_dg_kernel(
             "chiral_term_starts", "chiral_quads", "chiral_bounds",
             "fourth_term_starts_arr", "fourth_idx_arr",
             "lbfgs_history_starts",
+            "csr_slot_base", "csr_off", "csr_ent", "csr_partner", "conf_term_base",
         ],
         output_names=[
             "out_pos", "out_energies", "out_statuses",
             "work_grad", "work_dir", "work_scratch",
-            "work_lbfgs", "work_rho", "work_alpha",
+            "work_lbfgs", "work_rho", "work_alpha", "work_pf",
         ],
         header=header,
         source=source,
@@ -607,11 +808,12 @@ def _build_dg_kernel(
 def _get_dg_kernel(
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
-    parallel_grad: bool = False,
+    grad_mode: int = GRAD_GATHER,
+    dim: int = 4,
 ):
-    key = (tpm, lbfgs_m, parallel_grad)
+    key = (tpm, lbfgs_m, int(grad_mode), int(dim))
     if key not in _dg_kernel_cache:
-        _dg_kernel_cache[key] = _build_dg_kernel(tpm, lbfgs_m, parallel_grad)
+        _dg_kernel_cache[key] = _build_dg_kernel(tpm, lbfgs_m, grad_mode, dim)
     return _dg_kernel_cache[key]
 
 
@@ -625,7 +827,8 @@ def dg_minimize_shared(
     fourth_dim_weight: float = 0.1,
     tpm: int = DEFAULT_TPM,
     lbfgs_m: int = DEFAULT_LBFGS_M,
-    parallel_grad: bool = False,
+    parallel_grad: bool = True,
+    _grad_mode: Optional[int] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run DG L-BFGS on all C conformers in parallel with shared constraints.
 
@@ -636,9 +839,14 @@ def dg_minimize_shared(
     positions : np.ndarray, shape (n_atoms_total * dim,)
         Initial positions (random 4D).
     parallel_grad : bool
-        If True, all TPM threads compute gradient via atomic scatter-add.
-        Useful for large molecules (>500 distance constraints).
-        Default False (thread 0 serial — no atomic overhead).
+        True (default): all TPM lanes compute the gradient. Each lane owns
+        atoms ``tid, tid + TPM, ...`` and gathers the terms that touch them
+        through a per-molecule "terms per atom" CSR index, so no two lanes
+        write the same component and no atomics are needed. Every component
+        is summed in the same term order as the serial loop, so the result
+        is deterministic and agrees with ``parallel_grad=False``.
+        False: thread 0 computes the whole gradient serially while the other
+        lanes wait (the original kernel, kept as a reference).
 
     Returns
     -------
@@ -649,6 +857,7 @@ def dg_minimize_shared(
     statuses : np.ndarray, shape (C,)
         0 = converged, 1 = max_iters reached.
     """
+    grad_mode = _grad_mode if _grad_mode is not None else (GRAD_GATHER if parallel_grad else GRAD_SERIAL)
     C = batch.n_confs_total
     dim = batch.dim
     total_pos_size = int(batch.conf_atom_starts[-1]) * dim
@@ -681,16 +890,24 @@ def dg_minimize_shared(
         chiral_quads = np.zeros(4, dtype=np.int32)
         chiral_bounds = np.zeros(2, dtype=np.float32)
 
+    if grad_mode == GRAD_GATHER:
+        csr_slot_base, csr_off, csr_ent, csr_partner = _dg_grad_csr(batch)
+    else:
+        csr_slot_base = csr_off = csr_ent = csr_partner = np.zeros(1, dtype=np.int32)
+    # Per-conformer slice of the distance-term prefactor scratch (phase 1).
+    n_dist_c = np.diff(batch.dist_term_starts.astype(np.int64))[batch.conf_to_mol]
+    conf_term_base = np.zeros(C + 1, dtype=np.int32)
+    np.cumsum(n_dist_c, out=conf_term_base[1:])
+    total_pf = int(conf_term_base[-1]) if grad_mode == GRAD_GATHER else 0
+
     # L-BFGS history starts per conformer
+    n_vars_c = batch.mol_n_atoms[batch.conf_to_mol].astype(np.int64) * dim
     lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
-    for c in range(C):
-        n_atoms = batch.mol_n_atoms[batch.conf_to_mol[c]]
-        n_vars = n_atoms * dim
-        lbfgs_starts[c + 1] = lbfgs_starts[c] + 2 * lbfgs_m * n_vars
+    np.cumsum(2 * lbfgs_m * n_vars_c, out=lbfgs_starts[1:])
     total_lbfgs = int(lbfgs_starts[-1])
 
     # Convert to MLX
-    kernel = _get_dg_kernel(tpm, lbfgs_m, parallel_grad)
+    kernel = _get_dg_kernel(tpm, lbfgs_m, grad_mode, dim)
     results = kernel(
         inputs=[
             mx.array(positions),
@@ -707,6 +924,11 @@ def dg_minimize_shared(
             mx.array(batch.fourth_term_starts),
             mx.array(batch.fourth_idx),
             mx.array(lbfgs_starts),  # (C+1,) — full array to avoid shape aliasing
+            mx.array(csr_slot_base),
+            mx.array(csr_off),
+            mx.array(csr_ent),
+            mx.array(csr_partner),
+            mx.array(conf_term_base),
         ],
         grid=(C * tpm, 1, 1),  # total threads = C threadgroups × TPM
         threadgroup=(tpm, 1, 1),
@@ -720,11 +942,12 @@ def dg_minimize_shared(
             (max(1, total_lbfgs),),  # work_lbfgs (S + Y history)
             (max(1, C * lbfgs_m),),  # work_rho
             (max(1, C * lbfgs_m),),  # work_alpha
+            (max(1, total_pf),),     # work_pf (distance-term prefactors)
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.int32,
             mx.float32, mx.float32, mx.float32,
-            mx.float32, mx.float32, mx.float32,
+            mx.float32, mx.float32, mx.float32, mx.float32,
         ],
     )
     mx.eval(results[0], results[1], results[2])
