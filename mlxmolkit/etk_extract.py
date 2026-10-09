@@ -312,13 +312,17 @@ def extract_etk_params(
     restrained = {(min(q[0], q[3]), max(q[0], q[3])) for q in torsion_idx_list}
 
     # 1-2 (every bond) and 1-3 (every bond angle): RDKit restrains them to the length they
-    # have in the conformer entering ETK, +/- KNOWN_DIST_TOL, with KNOWN_DIST_FORCE_CONSTANT.
+    # have in the conformer entering ETK, +/- KNOWN_DIST_TOL, with KNOWN_DIST_FORCE_CONSTANT --
+    # except an angle whose centre carries an improper, held to its bounds-matrix window.
     # The window stored here is centred on the bounds-matrix midpoint and re-centred on each
     # conformer's own distance by pack_per_conformer_etk_batch.
     KNOWN_DIST_TOL = 0.01  # A
     KNOWN_DIST_FC = 100.0
     d12_i1, d12_i2, d12_lb, d12_ub, d12_w = [], [], [], [], []
     d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
+    # Fixed-window terms (the dist14 family): long-range pairs, and the 1-3 pairs below.
+    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
+    improper_centres = {q[0] for q in improper_idx_list}
     if run_field:
         for bond in mol.GetBonds():
             a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
@@ -333,18 +337,23 @@ def extract_etk_params(
             for i in range(len(neighbors)):
                 for j in range(i + 1, len(neighbors)):
                     a, b = neighbors[i], neighbors[j]
+                    restrained.add((a, b))
+                    if atom.GetIdx() in improper_centres:
+                        # An angle at an improper centre keeps its bounds-matrix window (add13Terms).
+                        unique_i1.append(a); unique_i2.append(b)
+                        unique_lb.append(bounds_mat[b, a]); unique_ub.append(bounds_mat[a, b])
+                        unique_w.append(KNOWN_DIST_FC)
+                        continue
                     mid = (bounds_mat[b, a] + bounds_mat[a, b]) / 2.0
                     d13_i1.append(a); d13_i2.append(b)
                     d13_lb.append(mid - KNOWN_DIST_TOL); d13_ub.append(mid + KNOWN_DIST_TOL)
                     d13_w.append(KNOWN_DIST_FC)
-                    restrained.add((a, b))
     n_d12 = len(d12_i1)
     n_d13 = len(d13_i1)
 
     # Every other pair -- 1-4 pairs that are not a torsion's end atoms included -- at its fixed
     # bounds-matrix window, force constant 10 * boundsMatForceScaling
     # (addLongRangeDistanceConstraints).
-    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
     if run_field:
         na = mol.GetNumAtoms()
         for a in range(na):
