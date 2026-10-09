@@ -403,25 +403,72 @@ inline void ele_g(
 
 // ---- Threadgroup parallel helpers (used by TG kernel) ----
 
+// With MMFF_TG32 (the launcher's TG_SIZE == 32) the threadgroup is exactly
+// one SIMD-group: reductions run in registers with xor-shuffles, no
+// threadgroup memory or barriers. The shuffle distances (16, 8, 4, 2, 1) are
+// the tree's strides, so every partial sum pairs the same operands in the
+// same order and every lane ends with the tree's exact value.
+#ifndef MMFF_TG32
+#define MMFF_TG32 0
+#endif
+
+inline float lane_sum32(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+}
+
+// Reads s[tid], which the calling lane has just written.
 inline float tg_reduce_sum(threadgroup float* s, uint tid, uint n) {
+#if MMFF_TG32
+    return lane_sum32(s[tid]);
+#else
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = n / 2; stride > 0; stride >>= 1) {
         if (tid < stride) s[tid] += s[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     return s[0];
+#endif
 }
 
+inline float tg_reduce_max_v(float v, threadgroup float* s, uint tid, uint n) {
+#if MMFF_TG32
+    v = max(v, simd_shuffle_xor(v, 16));
+    v = max(v, simd_shuffle_xor(v, 8));
+    v = max(v, simd_shuffle_xor(v, 4));
+    v = max(v, simd_shuffle_xor(v, 2));
+    v = max(v, simd_shuffle_xor(v, 1));
+    return v;
+#else
+    s[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = n / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] = max(s[tid], s[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = s[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+#endif
+}
+
+// Element-wise helpers: lane tid only touches elements tid, tid+tg_size, ...,
+// as does every element-wise loop of the kernels, so they need no barrier.
+// Barriers remain where a lane reads what another lane wrote (positions
+// before an energy or gradient evaluation, the gradient after phase 2, the
+// BFGS Hessian and the vectors its products read).
 inline void parallel_copy(device float* dst, const device float* src,
                            int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 inline void parallel_neg_copy(device float* dst, const device float* src,
                                int n, uint tid, uint tpm) {
     for (int i = (int)tid; i < n; i += (int)tpm) dst[i] = -src[i];
-    threadgroup_barrier(mem_flags::mem_device);
 }
 
 inline float parallel_dot(const device float* a, const device float* b,
@@ -451,4 +498,306 @@ inline void scale_grad_serial(device float* grad, int n_terms, thread float& gra
         }
     }
     grad_scale = scale;
+}
+
+// =====================================================================
+// Parallel gradient (GRAD_MODE 1): all lanes of the threadgroup.
+//
+// Phase 1 strides the pair terms (bond, vdW, electrostatic) over the lanes
+// and stores each term's scalar force factor f. Phase 2 gives each lane whole
+// atoms; a lane walks, through a per-molecule CSR "terms per atom" index, the
+// terms touching its atom in the serial loop's order (type, then term, then
+// role) and adds exactly what the serial *_g helper adds to that atom, written
+// with the same expressions (a pair term from its stored f; a bonded term by
+// re-evaluating it and keeping its own role's vector). Every component is the
+// same float sum taken in the same order as SEQ_COMPUTE_EG: deterministic and
+// bit-identical, with no atomics. The serial energy sum SEQ_COMPUTE_EG also
+// computed was discarded by both kernels and is not formed here.
+// =====================================================================
+#ifndef GRAD_MODE
+#define GRAD_MODE 0
+#endif
+
+inline float bond_stretch_f(const device float* pos, int i1, int i2, float kb, float r0) {
+    float dx = pos[i1*3+0] - pos[i2*3+0];
+    float dy = pos[i1*3+1] - pos[i2*3+1];
+    float dz = pos[i1*3+2] - pos[i2*3+2];
+    float d2 = dx*dx + dy*dy + dz*dz;
+    float d = sqrt(max(d2, 1e-16f));
+    float inv_d = (d > 1e-8f) ? 1.0f / d : 0.0f;
+    float dr = d - r0;
+    float de_dr = 143.9325f * kb * dr * (1.0f - 3.0f * dr + (14.0f/3.0f) * dr * dr);
+    float f = de_dr * inv_d;
+    return f;
+}
+
+inline float vdw_f(const device float* pos, int i1, int i2, float R_star, float epsilon) {
+    float dx = pos[i1*3+0]-pos[i2*3+0];
+    float dy = pos[i1*3+1]-pos[i2*3+1];
+    float dz = pos[i1*3+2]-pos[i2*3+2];
+    float d2 = dx*dx+dy*dy+dz*dz;
+    float d = sqrt(max(d2, 1e-16f));
+    float inv_d = (d > 1e-8f) ? 1.0f / d : 0.0f;
+    float inv_R = 1.0f / max(R_star, 1e-8f);
+    float q = d * inv_R;
+    float q2=q*q, q6=q2*q2*q2, q7=q6*q;
+    float q7p = q7 + 0.12f;
+    float inv_q7p = 1.0f / max(q7p, 1e-30f);
+    float t = 1.07f / (q + 0.07f);
+    float t2=t*t, t7=t2*t2*t2*t;
+    float dE_dr = epsilon * inv_R * t7 * (-7.84f*q6*inv_q7p*inv_q7p + (-7.84f*inv_q7p+14.0f)/(q+0.07f));
+    float f = dE_dr * inv_d;
+    return f;
+}
+
+inline float ele_f(const device float* pos, int i1, int i2,
+    float charge_term, int diel_model, bool is_1_4) {
+    float dx = pos[i1*3+0]-pos[i2*3+0];
+    float dy = pos[i1*3+1]-pos[i2*3+1];
+    float dz = pos[i1*3+2]-pos[i2*3+2];
+    float d2 = dx*dx+dy*dy+dz*dz;
+    float d = sqrt(max(d2, 1e-16f));
+    float inv_d = (d > 1e-8f) ? 1.0f / d : 0.0f;
+    float dpd = d + 0.05f;
+    float n = (float)diel_model;
+    float scale = is_1_4 ? 0.75f : 1.0f;
+    float denom_np1 = (diel_model == 2) ? dpd*dpd*dpd : dpd*dpd;
+    float dE_dd = -332.0716f * n * charge_term * scale / max(denom_np1, 1e-30f);
+    float f = dE_dd * inv_d;
+    return f;
+}
+
+// role: 0 = i1, 1 = i2 (apex), 2 = i3
+inline void angle_bend_g_role(const device float* pos, thread float* acc, int role,
+    int i1, int i2, int i3, float ka, float theta0, bool is_linear) {
+    AngleData ad = angle_internals(pos, i1, i2, i3);
+    float sinTsq = 1.0f - ad.cosT * ad.cosT;
+    if (sinTsq < 1e-16f) return;
+    float inv_neg_sinT = -rsqrt(max(sinTsq, 1e-16f));
+    float dtheta = ad.theta_deg - theta0;
+    float de;
+    if (is_linear) {
+        float sinT = sqrt(max(sinTsq, 0.0f));
+        de = -143.9325f * ka * sinT;
+    } else {
+        float c1 = 143.9325f * DEG_TO_RAD;
+        float cbf = -0.4f * DEG_TO_RAD * 1.5f;
+        de = c1 * ka * dtheta * (1.0f + cbf * dtheta);
+    }
+    float cf = de * inv_neg_sinT;
+    float r1h[3], r2h[3];
+    for (int d = 0; d < 3; d++) { r1h[d] = ad.r1[d] * ad.inv_d1; r2h[d] = ad.r2[d] * ad.inv_d2; }
+    for (int d = 0; d < 3; d++) {
+        float inter1 = ad.inv_d1 * (r2h[d] - ad.cosT * r1h[d]);
+        float inter3 = ad.inv_d2 * (r1h[d] - ad.cosT * r2h[d]);
+        float g1 = cf * inter1;
+        float g3 = cf * inter3;
+        if (role == 0) acc[d] += g1;
+        else if (role == 2) acc[d] += g3;
+        else acc[d] -= (g1 + g3);
+    }
+}
+
+// role: 0 = i1, 1 = i2 (apex), 2 = i3
+inline void stretch_bend_g_role(const device float* pos, thread float* acc, int role,
+    int i1, int i2, int i3,
+    float r0_ij, float r0_kj, float theta0, float kba_ij, float kba_kj) {
+    AngleData ad = angle_internals(pos, i1, i2, i3);
+    float sinTsq = 1.0f - ad.cosT * ad.cosT;
+    if (sinTsq < 1e-16f) return;
+    float d1 = 1.0f / max(ad.inv_d1, 1e-8f);
+    float d2 = 1.0f / max(ad.inv_d2, 1e-8f);
+    float invSinT = min(rsqrt(max(sinTsq, 1e-16f)), 1e8f);
+    float dtheta = ad.theta_deg - theta0;
+    float dr_ij = d1 - r0_ij, dr_kj = d2 - r0_kj;
+    float pf = 143.9325f * DEG_TO_RAD;
+    float beis = RAD_TO_DEG * (kba_ij*dr_ij + kba_kj*dr_kj) * invSinT;
+    float r1h[3], r2h[3];
+    for (int d = 0; d < 3; d++) { r1h[d] = ad.r1[d]*ad.inv_d1; r2h[d] = ad.r2[d]*ad.inv_d2; }
+    for (int d = 0; d < 3; d++) {
+        float inter1 = ad.inv_d1 * (r2h[d] - ad.cosT*r1h[d]);
+        float inter3 = ad.inv_d2 * (r1h[d] - ad.cosT*r2h[d]);
+        if (role == 0) acc[d] += pf * (dtheta*r1h[d]*kba_ij - inter1*beis);
+        else if (role == 2) acc[d] += pf * (dtheta*r2h[d]*kba_kj - inter3*beis);
+        else acc[d] += pf * (-dtheta*(r1h[d]*kba_ij+r2h[d]*kba_kj) + (inter1+inter3)*beis);
+    }
+}
+
+// role: 0 = i1, 1 = i2 (centre), 2 = i3, 3 = i4
+inline void oop_bend_g_role(const device float* pos, thread float* acc, int role,
+    int i1, int i2, int i3, int i4, float koop) {
+    float rJI[3], rJK[3], rJL[3];
+    for (int d = 0; d < 3; d++) {
+        rJI[d] = pos[i1*3+d] - pos[i2*3+d];
+        rJK[d] = pos[i3*3+d] - pos[i2*3+d];
+        rJL[d] = pos[i4*3+d] - pos[i2*3+d];
+    }
+    float idJI = rsqrt(max(rJI[0]*rJI[0]+rJI[1]*rJI[1]+rJI[2]*rJI[2], 1e-16f));
+    float idJK = rsqrt(max(rJK[0]*rJK[0]+rJK[1]*rJK[1]+rJK[2]*rJK[2], 1e-16f));
+    float idJL = rsqrt(max(rJL[0]*rJL[0]+rJL[1]*rJL[1]+rJL[2]*rJL[2], 1e-16f));
+    float dJI[3], dJK[3], dJL[3];
+    for (int d = 0; d < 3; d++) { dJI[d]=rJI[d]*idJI; dJK[d]=rJK[d]*idJK; dJL[d]=rJL[d]*idJL; }
+    float nx = (-dJI[1])*dJK[2] - (-dJI[2])*dJK[1];
+    float ny = (-dJI[2])*dJK[0] - (-dJI[0])*dJK[2];
+    float nz = (-dJI[0])*dJK[1] - (-dJI[1])*dJK[0];
+    float inv_nl = rsqrt(max(nx*nx+ny*ny+nz*nz, 1e-16f));
+    nx *= inv_nl; ny *= inv_nl; nz *= inv_nl;
+    float sinChi = clamp(dJL[0]*nx + dJL[1]*ny + dJL[2]*nz, -1.0f, 1.0f);
+    float cosChiSq = 1.0f - sinChi*sinChi;
+    float invCosChi = cosChiSq > 0 ? rsqrt(max(cosChiSq, 1e-16f)) : 1e8f;
+    float chi_deg = RAD_TO_DEG * asin(sinChi);
+    float cosTheta = clamp(dJI[0]*dJK[0]+dJI[1]*dJK[1]+dJI[2]*dJK[2], -1.0f, 1.0f);
+    float invSinTheta = rsqrt(max(1.0f - cosTheta*cosTheta, 1e-8f));
+    float dE_dChi = 143.9325f * DEG_TO_RAD * koop * chi_deg;
+    float term1 = invCosChi * invSinTheta;
+    float term2 = sinChi * invCosChi * invSinTheta * invSinTheta;
+    float t1[3], t2[3], t3[3];
+    t1[0]=dJL[1]*dJK[2]-dJL[2]*dJK[1]; t1[1]=dJL[2]*dJK[0]-dJL[0]*dJK[2]; t1[2]=dJL[0]*dJK[1]-dJL[1]*dJK[0];
+    t2[0]=dJI[1]*dJL[2]-dJI[2]*dJL[1]; t2[1]=dJI[2]*dJL[0]-dJI[0]*dJL[2]; t2[2]=dJI[0]*dJL[1]-dJI[1]*dJL[0];
+    t3[0]=dJK[1]*dJI[2]-dJK[2]*dJI[1]; t3[1]=dJK[2]*dJI[0]-dJK[0]*dJI[2]; t3[2]=dJK[0]*dJI[1]-dJK[1]*dJI[0];
+    for (int d = 0; d < 3; d++) {
+        float tg1 = (t1[d]*term1 - (dJI[d]-dJK[d]*cosTheta)*term2) * idJI;
+        float tg3 = (t2[d]*term1 - (dJK[d]-dJI[d]*cosTheta)*term2) * idJK;
+        float tg4 = (t3[d]*term1 - dJL[d]*sinChi*invCosChi) * idJL;
+        float g1 = dE_dChi * tg1;
+        float g3 = dE_dChi * tg3;
+        float g4 = dE_dChi * tg4;
+        if (role == 0) acc[d] += g1;
+        else if (role == 2) acc[d] += g3;
+        else if (role == 3) acc[d] += g4;
+        else acc[d] -= (g1 + g3 + g4);
+    }
+}
+
+// role: 0 = i1, 1 = i2, 2 = i3, 3 = i4
+inline void torsion_g_role(const device float* pos, thread float* acc, int role,
+    int i1, int i2, int i3, int i4, float V1, float V2, float V3) {
+    float dx1[3], dx2[3], dx4[3];
+    for (int d = 0; d < 3; d++) {
+        dx1[d] = pos[i1*3+d] - pos[i2*3+d];
+        dx2[d] = pos[i3*3+d] - pos[i2*3+d];
+        dx4[d] = pos[i4*3+d] - pos[i3*3+d];
+    }
+    float c1[3], c2[3];
+    c1[0]=dx1[1]*dx2[2]-dx1[2]*dx2[1]; c1[1]=dx1[2]*dx2[0]-dx1[0]*dx2[2]; c1[2]=dx1[0]*dx2[1]-dx1[1]*dx2[0];
+    c2[0]=(-dx2[1])*dx4[2]-(-dx2[2])*dx4[1]; c2[1]=(-dx2[2])*dx4[0]-(-dx2[0])*dx4[2]; c2[2]=(-dx2[0])*dx4[1]-(-dx2[1])*dx4[0];
+    float n1sq = c1[0]*c1[0]+c1[1]*c1[1]+c1[2]*c1[2];
+    float n2sq = c2[0]*c2[0]+c2[1]*c2[1]+c2[2]*c2[2];
+    if (n1sq < 1e-30f || n2sq < 1e-30f) return;
+    float in1 = min(rsqrt(n1sq), 1e5f);
+    float in2 = min(rsqrt(n2sq), 1e5f);
+    for (int d = 0; d < 3; d++) { c1[d]*=in1; c2[d]*=in2; }
+    float cosPhi = clamp(c1[0]*c2[0]+c1[1]*c2[1]+c1[2]*c2[2], -1.0f, 1.0f);
+    float sinPhiSq = 1.0f - cosPhi*cosPhi;
+    float sinTerm = 0.0f;
+    if (sinPhiSq > 0.0f) {
+        float sin2 = 2.0f * cosPhi;
+        float sin3 = 3.0f - 4.0f * sinPhiSq;
+        sinTerm = 0.5f * (V1 - 2.0f*V2*sin2 + 3.0f*V3*sin3);
+    }
+    float dT0[3], dT1[3];
+    for (int d = 0; d < 3; d++) {
+        dT0[d] = in1 * (c2[d] - cosPhi*c1[d]);
+        dT1[d] = in2 * (c1[d] - cosPhi*c2[d]);
+    }
+    if (role == 0) {
+        acc[0] += sinTerm*(dT0[2]*dx2[1]-dT0[1]*dx2[2]);
+        acc[1] += sinTerm*(dT0[0]*dx2[2]-dT0[2]*dx2[0]);
+        acc[2] += sinTerm*(dT0[1]*dx2[0]-dT0[0]*dx2[1]);
+    } else if (role == 3) {
+        acc[0] += sinTerm*(dT1[1]*(-dx2[2])-dT1[2]*(-dx2[1]));
+        acc[1] += sinTerm*(dT1[2]*(-dx2[0])-dT1[0]*(-dx2[2]));
+        acc[2] += sinTerm*(dT1[0]*(-dx2[1])-dT1[1]*(-dx2[0]));
+    } else if (role == 1) {
+        acc[0] += sinTerm*(dT0[1]*(dx2[2]-dx1[2])+dT0[2]*(dx1[1]-dx2[1])+dT1[1]*(-dx4[2])+dT1[2]*dx4[1]);
+        acc[1] += sinTerm*(dT0[0]*(dx1[2]-dx2[2])+dT0[2]*(dx2[0]-dx1[0])+dT1[0]*dx4[2]+dT1[2]*(-dx4[0]));
+        acc[2] += sinTerm*(dT0[0]*(dx2[1]-dx1[1])+dT0[1]*(dx1[0]-dx2[0])+dT1[0]*(-dx4[1])+dT1[1]*dx4[0]);
+    } else {
+        acc[0] += sinTerm*(dT0[1]*dx1[2]+dT0[2]*(-dx1[1])+dT1[1]*(dx4[2]+dx2[2])+dT1[2]*(-dx4[1]-dx2[1]));
+        acc[1] += sinTerm*(dT0[0]*(-dx1[2])+dT0[2]*dx1[0]+dT1[0]*(-dx4[2]-dx2[2])+dT1[2]*(dx4[0]+dx2[0]));
+        acc[2] += sinTerm*(dT0[0]*dx1[1]+dT0[1]*(-dx1[0])+dT1[0]*(dx4[1]+dx2[1])+dT1[1]*(-dx4[0]-dx2[0]));
+    }
+}
+
+// Expects in scope: tid, tg_size, n_atoms, n_mols_cfg, atom_start, mol_idx,
+// the *_s/*_e term ranges, ts_stride, out_pos, my_grad, the term arrays,
+// csr_meta = [conf_to_mol (C) | slot_base (N+1)], csr_off, csr_ent2 and the
+// pf_bond / pf_vdw / pf_ele scratch slices (indexed by global term).
+#define MMFF_PAR_GRADIENT() \
+    { \
+        for (int t = b_s + (int)tid; t < b_e; t += (int)tg_size) \
+            pf_bond[t] = bond_stretch_f(out_pos, bond_pairs[t*2], bond_pairs[t*2+1], bond_params[t*2], bond_params[t*2+1]); \
+        for (int t = v_s + (int)tid; t < v_e; t += (int)tg_size) \
+            pf_vdw[t] = vdw_f(out_pos, vdw_pairs[t*2], vdw_pairs[t*2+1], vdw_params[t*2], vdw_params[t*2+1]); \
+        for (int t = e_s + (int)tid; t < e_e; t += (int)tg_size) \
+            pf_ele[t] = ele_f(out_pos, ele_pairs[t*2], ele_pairs[t*2+1], ele_params[t*3], (int)ele_params[t*3+1], ele_params[t*3+2]>0.5f); \
+        threadgroup_barrier(mem_flags::mem_device); \
+        const int _slot0 = csr_meta[n_mols_cfg + csr_meta[mol_idx]]; \
+        const int _tstart[7] = {b_s, a_s, sb_s, o_s, t_s, v_s, e_s}; \
+        for (int a = (int)tid; a < n_atoms; a += (int)tg_size) { \
+            float acc[3] = {0.0f, 0.0f, 0.0f}; \
+            float own[3]; \
+            for (int d = 0; d < 3; d++) own[d] = out_pos[(atom_start + a)*3 + d]; \
+            for (int T = 0; T < 7; T++) { \
+                int sl = _slot0 + T * n_atoms + a; \
+                for (int e = csr_off[sl]; e < csr_off[sl + 1]; e++) { \
+                    int en = csr_ent2[2*e]; \
+                    int t = _tstart[T] + (en >> 2); int role = en & 3; \
+                    if (T == 0 || T == 5 || T == 6) { \
+                        int other = atom_start + csr_ent2[2*e + 1]; \
+                        float po[3]; \
+                        for (int d = 0; d < 3; d++) po[d] = out_pos[other*3 + d]; \
+                        float dx = (role == 0) ? (own[0] - po[0]) : (po[0] - own[0]); \
+                        float dy = (role == 0) ? (own[1] - po[1]) : (po[1] - own[1]); \
+                        float dz = (role == 0) ? (own[2] - po[2]) : (po[2] - own[2]); \
+                        if (T == 0) { \
+                            float f = pf_bond[t]; \
+                            float gx = f * dx, gy = f * dy, gz = f * dz; \
+                            if (role == 0) { acc[0] += gx; acc[1] += gy; acc[2] += gz; } \
+                            else { acc[0] -= gx; acc[1] -= gy; acc[2] -= gz; } \
+                        } else { \
+                            float f = (T == 5) ? pf_vdw[t] : pf_ele[t]; \
+                            if (role == 0) { acc[0]+=f*dx; acc[1]+=f*dy; acc[2]+=f*dz; } \
+                            else { acc[0]-=f*dx; acc[1]-=f*dy; acc[2]-=f*dz; } \
+                        } \
+                    } else if (T == 1) { \
+                        angle_bend_g_role(out_pos, acc, role, angle_trips[t*3], angle_trips[t*3+1], angle_trips[t*3+2], \
+                            angle_params[t*3], angle_params[t*3+1], angle_params[t*3+2] > 0.5f); \
+                    } else if (T == 2) { \
+                        stretch_bend_g_role(out_pos, acc, role, sb_trips[t*3], sb_trips[t*3+1], sb_trips[t*3+2], \
+                            sb_params[t*5], sb_params[t*5+1], sb_params[t*5+2], sb_params[t*5+3], sb_params[t*5+4]); \
+                    } else if (T == 3) { \
+                        oop_bend_g_role(out_pos, acc, role, oop_quads[t*4], oop_quads[t*4+1], oop_quads[t*4+2], oop_quads[t*4+3], oop_params[t]); \
+                    } else { \
+                        torsion_g_role(out_pos, acc, role, tor_quads[t*4], tor_quads[t*4+1], tor_quads[t*4+2], tor_quads[t*4+3], \
+                            tor_params[t*3], tor_params[t*3+1], tor_params[t*3+2]); \
+                    } \
+                } \
+            } \
+            for (int d = 0; d < 3; d++) my_grad[a*3 + d] = acc[d]; \
+        } \
+        threadgroup_barrier(mem_flags::mem_device); \
+    }
+
+// scale_grad_serial with the element loop spread over the lanes. Each element
+// is scaled independently and max() does not depend on order, so the result
+// is the serial one. Every lane returns the same scale.
+inline float scale_grad_parallel(device float* grad, int n_terms, float scale,
+    uint tid, uint tg_size, threadgroup float* red) {
+    float lmax = 0.0f;
+    for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
+        grad[i] *= scale;
+        lmax = max(lmax, abs(grad[i]));
+    }
+    float max_grad = tg_reduce_max_v(lmax, red, tid, tg_size);
+    while (max_grad > GRAD_CAP) {
+        scale *= 0.5f;
+        lmax = 0.0f;
+        for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
+            grad[i] *= 0.5f;
+            lmax = max(lmax, abs(grad[i]));
+        }
+        max_grad = tg_reduce_max_v(lmax, red, tid, tg_size);
+    }
+    return scale;
 }

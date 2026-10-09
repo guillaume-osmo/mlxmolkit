@@ -8,6 +8,9 @@
     float grad_tol = config[2];
 
     if ((int)mol_idx >= n_mols_cfg) return;
+    // Total coordinates of the batch, read here rather than templated so the
+    // kernel compiles once instead of once per batch shape.
+    const int total_pos_size = atom_starts[n_mols_cfg] * 3;
 
     int atom_start = atom_starts[mol_idx];
     int atom_end = atom_starts[mol_idx + 1];
@@ -30,6 +33,10 @@
     threadgroup_barrier(mem_flags::mem_device);
 
     device float* my_pos = &out_pos[atom_start * 3];
+    // Parallel gradient: per-term force factors of the pair terms, by global term.
+    device float* pf_bond = &work_scratch[3 * total_pos_size];
+    device float* pf_vdw = pf_bond + all_term_starts[0*ts_stride + n_mols_cfg];
+    device float* pf_ele = pf_vdw + all_term_starts[5*ts_stride + n_mols_cfg];
     device float* my_grad = &work_grad[atom_start * 3];
     device float* my_dir = &work_dir[atom_start * 3];
     device float* my_old_pos = &work_scratch[atom_start * 3];
@@ -37,10 +44,11 @@
     device float* my_hess_dg = &work_scratch[2 * total_pos_size + atom_start * 3];
     device float* my_H = &work_hessian[hess_start];
 
-    // Only tg_reduce (work array) and tg_status_shared remain as threadgroup-shared
+    // Threadgroup memory: tg_reduce (tree reductions when TG != 32) and the
+    // serial reference's gradient scale.
     threadgroup float tg_reduce[TG_SIZE_VAL];
-    threadgroup float tg_grad_scale_shared;
-    threadgroup int tg_status_shared;
+    threadgroup float tg_grad_scale_shared;  // serial reference (GRAD_MODE 0) only
+    float grad_scale_l = 1.0f;  // gradient scale, identical in every lane
 
     // Initialize Hessian to identity (ALL threads)
     int hess_total = n_terms * n_terms;
@@ -113,6 +121,12 @@
         }
 
     // ---- Initial energy + gradient (thread 0 computes the gradient) ----
+#if GRAD_MODE == 1
+    MMFF_PAR_GRADIENT();
+    {
+        grad_scale_l = scale_grad_parallel(my_grad, n_terms, GRAD_SCALE_INIT, tid, tg_size, tg_reduce);
+    }
+#else
     float seq_e_init = 0.0f;
     SEQ_COMPUTE_EG(seq_e_init);
     if (tid == 0) {
@@ -120,9 +134,12 @@
         scale_grad_serial(my_grad, n_terms, grad_scale, true);
         tg_grad_scale_shared = grad_scale;
     }
-    // Fences both spaces: scale_grad_serial writes my_grad (device) and
-    // tg_grad_scale_shared (threadgroup), and all threads read both below.
+#endif
+#if GRAD_MODE != 1
+    // Lane 0 scaled my_grad and set tg_grad_scale_shared; everyone reads both.
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    grad_scale_l = tg_grad_scale_shared;
+#endif
     float energy = 0.0f;
     // Re-sum with the tree reduction the line search uses, discarding the serial
     // sum above. The Armijo test differences this value against trial_e, so both
@@ -144,11 +161,10 @@
     float sum_sq = tg_reduce_sum(tg_reduce, tid, tg_size);
     float max_step = MAX_STEP_FACTOR * max(sqrt(sum_sq), (float)n_terms);
 
-    if (tid == 0) tg_status_shared = 1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int status = 1;  // per lane: every lane takes the same decisions
 
     // ---- Main BFGS loop ----
-    for (int iter = 0; iter < max_iters && tg_status_shared == 1; iter++) {
+    for (int iter = 0; iter < max_iters && status == 1; iter++) {
 
         // === LINE SEARCH ===
         parallel_copy(my_old_pos, my_pos, n_terms, tid, tg_size);
@@ -162,15 +178,12 @@
         if (dir_norm > max_step) {
             float sc = max_step / dir_norm;
             for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dir[i] *= sc;
-            threadgroup_barrier(mem_flags::mem_device);
         }
 
         // Slope = dir . grad (parallel dot — all threads get same result)
         float slope = parallel_dot(my_dir, my_grad, n_terms, tid, tg_size, tg_reduce);
         if (slope >= 0.0f) {
-            if (tid == 0) tg_status_shared = 0;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            break;
+            status = 0; break;
         }
 
         // Lambda min (parallel max reduction)
@@ -181,13 +194,8 @@
             float tv = ad / ap;
             if (tv > local_test_max) local_test_max = tv;
         }
-        tg_reduce[tid] = local_test_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float lambda_min = MOVETOL / max(tg_reduce[0], 1e-30f);
+        float red_max0 = tg_reduce_max_v(local_test_max, tg_reduce, tid, tg_size);
+        float lambda_min = MOVETOL / max(red_max0, 1e-30f);
 
         // Line search — ALL local variables (no threadgroup-shared state)
         // All threads get the same trial_e from PAR_COMPUTE_E reduction,
@@ -258,7 +266,6 @@
         // xi = pos - old_pos (ALL threads)
         for (int i = (int)tid; i < n_terms; i += (int)tg_size)
             my_old_pos[i] = my_pos[i] - my_old_pos[i];
-        threadgroup_barrier(mem_flags::mem_device);
 
         // TOLX check (parallel max)
         float local_tolx = 0.0f;
@@ -266,16 +273,9 @@
             float tv = abs(my_old_pos[i]) / max(abs(my_pos[i]), 1.0f);
             if (tv > local_tolx) local_tolx = tv;
         }
-        tg_reduce[tid] = local_tolx;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tg_reduce[0] < TOLX) {
-            if (tid == 0) tg_status_shared = 0;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            break;
+        float red_max1 = tg_reduce_max_v(local_tolx, tg_reduce, tid, tg_size);
+        if (red_max1 < TOLX) {
+            status = 0; break;
         }
 
         // Save old grad, then recompute the gradient (thread 0). The serial
@@ -284,6 +284,12 @@
         // the next Armijo test compare like with like.
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i];
         threadgroup_barrier(mem_flags::mem_device);
+#if GRAD_MODE == 1
+        MMFF_PAR_GRADIENT();
+        {
+            grad_scale_l = scale_grad_parallel(my_grad, n_terms, grad_scale_l, tid, tg_size, tg_reduce);
+        }
+#else
         float seq_e = 0.0f;
         SEQ_COMPUTE_EG(seq_e);
         if (tid == 0) {
@@ -291,9 +297,10 @@
             scale_grad_serial(my_grad, n_terms, grad_scale, false);
             tg_grad_scale_shared = grad_scale;
         }
-        // Fences both spaces: scale_grad_serial writes my_grad (device) and
-        // tg_grad_scale_shared (threadgroup), and all threads read both below.
+        // Lane 0 scaled my_grad and set tg_grad_scale_shared; everyone reads both.
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        grad_scale_l = tg_grad_scale_shared;
+#endif
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) my_dgrad[i] = my_grad[i] - my_dgrad[i];
         threadgroup_barrier(mem_flags::mem_device);
 
@@ -303,16 +310,9 @@
             float tv = abs(my_grad[i]) * max(abs(my_pos[i]), 1.0f);
             if (tv > local_grad_test) local_grad_test = tv;
         }
-        tg_reduce[tid] = local_grad_test;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) tg_reduce[tid] = max(tg_reduce[tid], tg_reduce[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tg_reduce[0] / max(energy * tg_grad_scale_shared, 1.0f) < grad_tol) {
-            if (tid == 0) tg_status_shared = 0;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            break;
+        float red_max2 = tg_reduce_max_v(local_grad_test, tg_reduce, tid, tg_size);
+        if (red_max2 / max(energy * grad_scale_l, 1.0f) < grad_tol) {
+            status = 0; break;
         }
 
         // BFGS: hessDGrad = H @ dGrad (ALL threads, parallel rows)
@@ -324,6 +324,17 @@
         threadgroup_barrier(mem_flags::mem_device);
 
         // 4 dot products (parallel)
+#if MMFF_TG32
+        float l_fac = 0.0f, l_fae = 0.0f, l_sdg = 0.0f, l_sxi = 0.0f;
+        for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
+            l_fac += my_dgrad[i] * my_old_pos[i];
+            l_fae += my_dgrad[i] * my_hess_dg[i];
+            l_sdg += my_dgrad[i] * my_dgrad[i];
+            l_sxi += my_old_pos[i] * my_old_pos[i];
+        }
+        float fac = lane_sum32(l_fac), fae = lane_sum32(l_fae);
+        float sum_dg = lane_sum32(l_sdg), sum_xi = lane_sum32(l_sxi);
+#else
         threadgroup float tg_fac[TG_SIZE_VAL], tg_fae[TG_SIZE_VAL], tg_sdg[TG_SIZE_VAL], tg_sxi[TG_SIZE_VAL];
         tg_fac[tid] = 0; tg_fae[tid] = 0; tg_sdg[tid] = 0; tg_sxi[tid] = 0;
         for (int i = (int)tid; i < n_terms; i += (int)tg_size) {
@@ -343,6 +354,7 @@
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float fac = tg_fac[0], fae = tg_fae[0], sum_dg = tg_sdg[0], sum_xi = tg_sxi[0];
+#endif
 
         if (fac * fac > EPS_GUARD * sum_dg * sum_xi && fac > 0) {
             float fi = 1.0f / fac, fei = 1.0f / fae;
@@ -363,10 +375,9 @@
             for (int j = 0; j < n_terms; j++) s += my_H[i * n_terms + j] * my_grad[j];
             my_dir[i] = -s;
         }
-        threadgroup_barrier(mem_flags::mem_device);
     }
 
     if (tid == 0) {
         out_energies[mol_idx] = energy;
-        out_statuses[mol_idx] = tg_status_shared;
+        out_statuses[mol_idx] = status;
     }
