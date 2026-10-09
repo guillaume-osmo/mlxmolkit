@@ -13,7 +13,7 @@ preferences from the Cambridge Structural Database (CSD).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
@@ -84,6 +84,14 @@ class ETKParams:
     dist14_lb: np.ndarray        # (n_dist14,) float32 — lower bound distance
     dist14_ub: np.ndarray        # (n_dist14,) float32 — upper bound distance
     dist14_weight: np.ndarray    # (n_dist14,) float32
+
+    # Angle constraints, E = w * (theta_deg - bound)² outside [min, max]: RDKit's 179-180 deg
+    # term in place of the 1-3 distance at a linear centre (a triple bond, or two double bonds
+    # at a degree-2 atom), with basic knowledge only.
+    angle_idx: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.int32))
+    angle_min: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    angle_max: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    angle_weight: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
 
 
 @dataclass
@@ -313,6 +321,8 @@ def extract_etk_params(
     d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
     # Fixed-window terms (the dist14 family): long-range pairs, and the 1-3 pairs below.
     unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
+    ang_idx, ang_min, ang_max, ang_w = [], [], [], []
+    ANGLE_FC = 1.0  # RDKit: angleContribs->addContrib(i, j, k, 179.0, 180.0, 1)
     improper_centres = {q[1] for q in improper_idx_list}
     if run_field:
         for bond in mol.GetBonds():
@@ -329,6 +339,11 @@ def extract_etk_params(
                 for j in range(i + 1, len(neighbors)):
                     a, b = neighbors[i], neighbors[j]
                     restrained.add((a, b))
+                    if use_basic_knowledge and _is_linear_angle(mol, a, atom.GetIdx(), b):
+                        # A linear centre: an angle constraint, not a distance (add13Terms).
+                        ang_idx.append([a, atom.GetIdx(), b])
+                        ang_min.append(179.0); ang_max.append(180.0); ang_w.append(ANGLE_FC)
+                        continue
                     if atom.GetIdx() in improper_centres:
                         # An angle at an improper centre keeps its bounds-matrix window (add13Terms).
                         unique_i1.append(a); unique_i2.append(b)
@@ -375,7 +390,21 @@ def extract_etk_params(
         dist14_idx1=_a(unique_i1), dist14_idx2=_a(unique_i2),
         dist14_lb=_a(unique_lb, np.float32), dist14_ub=_a(unique_ub, np.float32),
         dist14_weight=_a(unique_w, np.float32),
+        angle_idx=(np.array(ang_idx, dtype=np.int32) if ang_idx
+                   else np.zeros((0, 3), dtype=np.int32)),
+        angle_min=_a(ang_min, np.float32), angle_max=_a(ang_max, np.float32),
+        angle_weight=_a(ang_w, np.float32),
     )
+
+
+def _is_linear_angle(mol: Chem.Mol, a: int, centre: int, b: int) -> bool:
+    """RDKit's collectBondsAndAngles flag: either bond triple, or both double at a degree-2 atom."""
+    t1 = mol.GetBondBetweenAtoms(a, centre).GetBondType()
+    t2 = mol.GetBondBetweenAtoms(centre, b).GetBondType()
+    if t1 == Chem.BondType.TRIPLE or t2 == Chem.BondType.TRIPLE:
+        return True
+    return (t1 == Chem.BondType.DOUBLE and t2 == Chem.BondType.DOUBLE
+            and mol.GetAtomWithIdx(centre).GetDegree() == 2)
 
 
 def batch_etk_params(

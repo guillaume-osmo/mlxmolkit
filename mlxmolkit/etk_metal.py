@@ -176,6 +176,52 @@ inline void inversion_g(const device float* pos, device float* grad,
     }
 }
 
+// ---- Angle constraint: RDKit's ForceFields::AngleConstraintContrib ----
+// E = kf * (theta_deg - bound)^2 outside [amin, amax]. ETK uses it at linear
+// centres (179-180 deg, kf = 1). Gradient as RDKit's getGrad, as the three
+// role vectors (i, j = centre, k); inside the window it stores -0.0f.
+constant float RAD2DEG = 57.29577951308232f;
+inline float angle_theta_term(const device float* pos, int i, int j, int k,
+    float amin, float amax, int dim, thread float* r0, thread float* r1,
+    thread float* l0, thread float* l1
+) {
+    for (int d=0;d<3;d++){ r0[d]=pos[i*dim+d]-pos[j*dim+d]; r1[d]=pos[k*dim+d]-pos[j*dim+d]; }
+    *l0=max(1.0e-5f, r0[0]*r0[0]+r0[1]*r0[1]+r0[2]*r0[2]);
+    *l1=max(1.0e-5f, r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2]);
+    float c=clamp((r0[0]*r1[0]+r0[1]*r1[1]+r0[2]*r1[2])*rsqrt((*l0)*(*l1)), -1.0f, 1.0f);
+    float th=RAD2DEG*acos(c);
+    return (th<amin) ? th-amin : ((th>amax) ? th-amax : 0.0f);
+}
+inline float angle_c_e(const device float* pos, int i, int j, int k,
+    float amin, float amax, float kf, int dim
+) {
+    float r0[3], r1[3], l0, l1;
+    float t=angle_theta_term(pos,i,j,k,amin,amax,dim,r0,r1,&l0,&l1);
+    return kf*t*t;
+}
+template <typename OutT>
+inline void angle_c_g_roles(const device float* pos, OutT out, int i, int j, int k,
+    float amin, float amax, float kf, int dim
+) {
+    float r0[3], r1[3], l0, l1;
+    float t=angle_theta_term(pos,i,j,k,amin,amax,dim,r0,r1,&l0,&l1);
+    if (t==0.0f) { for (int q=0;q<9;q++) out[q]=-0.0f; return; }
+    float dE=2.0f*RAD2DEG*kf*t;
+    float rp[3]={r1[1]*r0[2]-r1[2]*r0[1], r1[2]*r0[0]-r1[0]*r0[2], r1[0]*r0[1]-r1[1]*r0[0]};
+    float pf=dE/max(1.0e-5f, sqrt(rp[0]*rp[0]+rp[1]*rp[1]+rp[2]*rp[2]));
+    float t0=-pf/l0, t1=pf/l1;
+    float gi[3]={(r0[1]*rp[2]-r0[2]*rp[1])*t0, (r0[2]*rp[0]-r0[0]*rp[2])*t0, (r0[0]*rp[1]-r0[1]*rp[0])*t0};
+    float gk[3]={(r1[1]*rp[2]-r1[2]*rp[1])*t1, (r1[2]*rp[0]-r1[0]*rp[2])*t1, (r1[0]*rp[1]-r1[1]*rp[0])*t1};
+    for (int d=0;d<3;d++){ out[d]=gi[d]; out[3+d]=-gi[d]-gk[d]; out[6+d]=gk[d]; }
+}
+inline void angle_c_g(const device float* pos, device float* grad, int i, int j, int k,
+    float amin, float amax, float kf, int dim
+) {
+    float r[9];
+    angle_c_g_roles(pos, r, i, j, k, amin, amax, kf, dim);
+    for (int d=0;d<3;d++){ grad[i*dim+d]+=r[d]; grad[j*dim+d]+=r[3+d]; grad[k*dim+d]+=r[6+d]; }
+}
+
 // ---- Distance constraint: flat-bottom harmonic, 0.5 * k * (d - bound)^2 ----
 // RDKit's ForceFields::DistanceConstraintContrib; wt is its force constant k.
 inline float dist14_e(const device float* pos, int a, int b,
@@ -396,6 +442,7 @@ _ETK_BODY = r"""
     int d12_s = term_starts[2*ts+mol_idx], d12_e = term_starts[2*ts+mol_idx+1];
     int d13_s = term_starts[3*ts+mol_idx], d13_e = term_starts[3*ts+mol_idx+1];
     int d14_s = term_starts[4*ts+mol_idx], d14_e = term_starts[4*ts+mol_idx+1];
+    int ang_s = term_starts[5*ts+mol_idx], ang_e = term_starts[5*ts+mol_idx+1];
 
     int lbfgs_start = lbfgs_history_starts[conf_idx];
 
@@ -418,12 +465,13 @@ _ETK_BODY = r"""
 #if GRAD_MODE == 1
     device float* my_scr = &work_scratch[3*total_pos_size + conf_scr_base[conf_idx]];
     const int n_tor = tor_e - tor_s, n_imp = imp_e - imp_s;
-    const int n12 = d12_e - d12_s, n13 = d13_e - d13_s;
+    const int n12 = d12_e - d12_s, n13 = d13_e - d13_s, n14 = d14_e - d14_s;
     device float* scr_tor = my_scr;
     device float* scr_imp = my_scr + 12 * n_tor;
     device float* scr_d12 = scr_imp + 12 * n_imp;
     device float* scr_d13 = scr_d12 + n12;
     device float* scr_d14 = scr_d13 + n13;
+    device float* scr_ang = scr_d14 + n14;
     const int slot0 = csr_slot_base[mol_idx];
     #define ETK_GRADIENT() \
         for (int t=tor_s+(int)tid;t<tor_e;t+=(int)tpm) { \
@@ -449,6 +497,10 @@ _ETK_BODY = r"""
         for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm) \
             scr_d14[t-d14_s]=dist14_pf(out_pos,d14_pairs[t*2]+atom_off,d14_pairs[t*2+1]+atom_off, \
                 d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim); \
+        for (int t=ang_s+(int)tid;t<ang_e;t+=(int)tpm) \
+            angle_c_g_roles(out_pos,&scr_ang[9*(t-ang_s)],angle_triples[t*3]+atom_off, \
+                angle_triples[t*3+1]+atom_off,angle_triples[t*3+2]+atom_off, \
+                angle_params[t*3],angle_params[t*3+1],angle_params[t*3+2],dim); \
         threadgroup_barrier(mem_flags::mem_device); \
         for (int a=(int)tid;a<n_atoms;a+=(int)tpm) { \
             float acc[3]={0.0f,0.0f,0.0f}; \
@@ -466,6 +518,11 @@ _ETK_BODY = r"""
             etk_add_pair_terms(acc,own,out_pos,scr_d12,d12_s,csr_off,csr_ent2,slot0+2*n_atoms+a,atom_off,dim); \
             etk_add_pair_terms(acc,own,out_pos,scr_d13,d13_s,csr_off,csr_ent2,slot0+3*n_atoms+a,atom_off,dim); \
             etk_add_pair_terms(acc,own,out_pos,scr_d14,d14_s,csr_off,csr_ent2,slot0+4*n_atoms+a,atom_off,dim); \
+            sl=slot0+5*n_atoms+a; \
+            for (int e=csr_off[sl];e<csr_off[sl+1];e++) { \
+                int en=csr_ent2[2*e]; const device float* v=&scr_ang[9*((en>>2)-ang_s)+3*(en&3)]; \
+                acc[0]+=v[0]; acc[1]+=v[1]; acc[2]+=v[2]; \
+            } \
             for (int d=0;d<3;d++) my_grad[a*dim+d]=acc[d]; \
         } \
         threadgroup_barrier(mem_flags::mem_device);
@@ -486,6 +543,9 @@ _ETK_BODY = r"""
                 dist14_g(out_pos,work_grad,a,b,d13_bounds[t*3],d13_bounds[t*3+1],d13_bounds[t*3+2],dim);} \
             for (int t=d14_s;t<d14_e;t++){int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off; \
                 dist14_g(out_pos,work_grad,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);} \
+            for (int t=ang_s;t<ang_e;t++) \
+                angle_c_g(out_pos,work_grad,angle_triples[t*3]+atom_off,angle_triples[t*3+1]+atom_off, \
+                    angle_triples[t*3+2]+atom_off,angle_params[t*3],angle_params[t*3+1],angle_params[t*3+2],dim); \
         } \
         threadgroup_barrier(mem_flags::mem_device);
 #endif
@@ -524,6 +584,10 @@ _ETK_BODY = r"""
         int a=d14_pairs[t*2]+atom_off, b=d14_pairs[t*2+1]+atom_off;
         local_e += dist14_e(out_pos, a,b, d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2], dim);
     }
+    // Linear-centre angle constraints
+    for (int t=ang_s+(int)tid; t<ang_e; t+=(int)tpm)
+        local_e += angle_c_e(out_pos, angle_triples[t*3]+atom_off, angle_triples[t*3+1]+atom_off,
+            angle_triples[t*3+2]+atom_off, angle_params[t*3], angle_params[t*3+1], angle_params[t*3+2], dim);
     float energy = reduce_sum(local_e, shared, tid, tpm);
 
     // ---- RDKit's gradient scaling (ForceFieldsHelper::calcGradient) ----
@@ -594,6 +658,9 @@ _ETK_BODY = r"""
             for (int t=d14_s+(int)tid;t<d14_e;t+=(int)tpm){
                 int a=d14_pairs[t*2]+atom_off,b=d14_pairs[t*2+1]+atom_off;
                 lte+=dist14_e(out_pos,a,b,d14_bounds[t*3],d14_bounds[t*3+1],d14_bounds[t*3+2],dim);}
+            for (int t=ang_s+(int)tid;t<ang_e;t+=(int)tpm)
+                lte+=angle_c_e(out_pos,angle_triples[t*3]+atom_off,angle_triples[t*3+1]+atom_off,
+                    angle_triples[t*3+2]+atom_off,angle_params[t*3],angle_params[t*3+1],angle_params[t*3+2],dim);
             float trial_e=reduce_sum(lte, shared, tid, tpm);
 
             if (trial_e-old_energy<=FUNCTOL*lam*slope){energy=trial_e;ls_done=true;}
@@ -675,6 +742,7 @@ def _get_etk_kernel(tpm: int = DEFAULT_TPM, lbfgs_m: int = DEFAULT_LBFGS_M, grad
                 "d12_pairs", "d12_bounds",
                 "d13_pairs", "d13_bounds",
                 "d14_pairs", "d14_bounds",
+                "angle_triples", "angle_params",
                 "lbfgs_history_starts",
                 "csr_slot_base", "csr_off", "csr_ent2", "conf_scr_base",
             ],
@@ -703,6 +771,10 @@ def _pairs(i1, i2):
     return np.stack([i1, i2], axis=1)
 
 
+def _triples(q):
+    return np.zeros((0, 3), dtype=np.int32) if q is None or len(q) == 0 else np.asarray(q).reshape(-1, 3)
+
+
 def _quads(q):
     return np.zeros((0, 4), dtype=np.int32) if q is None or len(q) == 0 else np.asarray(q).reshape(-1, 4)
 
@@ -714,7 +786,8 @@ def _etk_grad_csr(batch: SharedConstraintBatch):
               batch.etk_improper_term_starts, batch.etk_improper_idx,
               batch.etk_dist12_term_starts, batch.etk_dist12_idx1, batch.etk_dist12_idx2,
               batch.etk_dist13_term_starts, batch.etk_dist13_idx1, batch.etk_dist13_idx2,
-              batch.etk_dist14_term_starts, batch.etk_dist14_idx1, batch.etk_dist14_idx2)
+              batch.etk_dist14_term_starts, batch.etk_dist14_idx1, batch.etk_dist14_idx2,
+              batch.etk_angle_term_starts, batch.etk_angle_idx)
     return _cached_on_batch(batch, "_etk_grad_csr_cache", arrays, lambda: build_atom_term_csr(
         batch.mol_n_atoms, [
             (_starts(batch, "etk_torsion_term_starts"), _quads(batch.etk_torsion_idx)),
@@ -722,6 +795,7 @@ def _etk_grad_csr(batch: SharedConstraintBatch):
             (_starts(batch, "etk_dist12_term_starts"), _pairs(batch.etk_dist12_idx1, batch.etk_dist12_idx2)),
             (_starts(batch, "etk_dist13_term_starts"), _pairs(batch.etk_dist13_idx1, batch.etk_dist13_idx2)),
             (_starts(batch, "etk_dist14_term_starts"), _pairs(batch.etk_dist14_idx1, batch.etk_dist14_idx2)),
+            (_starts(batch, "etk_angle_term_starts"), _triples(batch.etk_angle_idx)),
         ]))
 
 
@@ -805,6 +879,16 @@ def etk_minimize_shared(
         batch.etk_dist14_idx1, batch.etk_dist14_idx2,
         batch.etk_dist14_lb, batch.etk_dist14_ub, batch.etk_dist14_weight)
 
+    # Linear-centre angle constraints
+    na_ = len(batch.etk_angle_idx) if batch.etk_angle_idx is not None else 0
+    if na_ > 0:
+        ang_triples = np.asarray(batch.etk_angle_idx).reshape(-1, 3).flatten().astype(np.int32)
+        ang_params = np.stack([batch.etk_angle_min, batch.etk_angle_max, batch.etk_angle_weight],
+                              axis=1).flatten().astype(np.float32)
+    else:
+        ang_triples = np.zeros(3, dtype=np.int32)
+        ang_params = np.zeros(3, dtype=np.float32)
+
     # L-BFGS history
     n_vars_c = batch.mol_n_atoms[batch.conf_to_mol].astype(np.int64) * dim
     lbfgs_starts = np.zeros(C + 1, dtype=np.int32)
@@ -820,7 +904,8 @@ def etk_minimize_shared(
                    + 12 * np.diff(_starts(batch, "etk_improper_term_starts").astype(np.int64))
                    + np.diff(_starts(batch, "etk_dist12_term_starts").astype(np.int64))
                    + np.diff(_starts(batch, "etk_dist13_term_starts").astype(np.int64))
-                   + np.diff(_starts(batch, "etk_dist14_term_starts").astype(np.int64)))
+                   + np.diff(_starts(batch, "etk_dist14_term_starts").astype(np.int64))
+                   + 9 * np.diff(_starts(batch, "etk_angle_term_starts").astype(np.int64)))
     else:
         csr_slot_base = csr_off = np.zeros(1, dtype=np.int32)
         csr_ent2 = np.zeros(2, dtype=np.int32)
@@ -840,7 +925,8 @@ def etk_minimize_shared(
             mx.array(np.concatenate([
                 _starts(batch, "etk_torsion_term_starts"), _starts(batch, "etk_improper_term_starts"),
                 _starts(batch, "etk_dist12_term_starts"), _starts(batch, "etk_dist13_term_starts"),
-                _starts(batch, "etk_dist14_term_starts")]).astype(np.int32)),
+                _starts(batch, "etk_dist14_term_starts"), _starts(batch, "etk_angle_term_starts")]
+                ).astype(np.int32)),
             mx.array(tor_quads),
             mx.array(tor_V),
             mx.array(tor_signs),
@@ -852,6 +938,8 @@ def etk_minimize_shared(
             mx.array(d13_bounds),
             mx.array(d14_pairs),
             mx.array(d14_bounds),
+            mx.array(ang_triples),
+            mx.array(ang_params),
             mx.array(lbfgs_starts[:-1]),
             mx.array(csr_slot_base),
             mx.array(csr_off),

@@ -86,6 +86,12 @@ class SharedConstraintBatch:
     etk_dist14_ub: Optional[np.ndarray] = None
     etk_dist14_weight: Optional[np.ndarray] = None
     etk_dist14_term_starts: Optional[np.ndarray] = None
+    # Angle constraints (linear centres): (n_ang, 3) LOCAL i, centre, k
+    etk_angle_idx: Optional[np.ndarray] = None
+    etk_angle_min: Optional[np.ndarray] = None
+    etk_angle_max: Optional[np.ndarray] = None
+    etk_angle_weight: Optional[np.ndarray] = None
+    etk_angle_term_starts: Optional[np.ndarray] = None
 
     @property
     def n_atoms_total(self) -> int:
@@ -294,6 +300,21 @@ def add_etk_to_batch(
     batch.etk_dist14_weight = _concat_or_empty(d14_w, np.float32)
     batch.etk_dist14_term_starts = d14_starts
 
+    attrs, batch_attrs = _ETK_TERM_FIELDS["angle"]
+    ang_starts = np.zeros(n_mols + 1, dtype=np.int32)
+    parts = {a: [] for a in attrs}
+    for m, p in enumerate(etk_params_list):
+        n_a = len(getattr(p, "angle_idx", ()))
+        ang_starts[m + 1] = ang_starts[m] + n_a
+        if n_a:
+            for a in attrs:
+                parts[a].append(np.asarray(getattr(p, a)))
+    for a, ba in zip(attrs, batch_attrs):
+        dt = np.int32 if a == "angle_idx" else np.float32
+        setattr(batch, ba, np.concatenate(parts[a]).astype(dt) if parts[a]
+                else np.zeros(_ETK_EMPTY_SHAPES.get(a, (0,)), dtype=dt))
+    batch.etk_angle_term_starts = ang_starts
+
 
 _ETK_TERM_FIELDS = {
     # name: (params attribute names, batch attribute names)
@@ -310,10 +331,12 @@ _ETK_TERM_FIELDS = {
     "dist14": (("dist14_idx1", "dist14_idx2", "dist14_lb", "dist14_ub", "dist14_weight"),
                ("etk_dist14_idx1", "etk_dist14_idx2", "etk_dist14_lb", "etk_dist14_ub",
                 "etk_dist14_weight")),
+    "angle": (("angle_idx", "angle_min", "angle_max", "angle_weight"),
+              ("etk_angle_idx", "etk_angle_min", "etk_angle_max", "etk_angle_weight")),
 }
 _ETK_EMPTY_SHAPES = {
     "torsion_idx": (0, 4), "torsion_V": (0, 6), "torsion_signs": (0, 6),
-    "improper_idx": (0, 4),
+    "improper_idx": (0, 4), "angle_idx": (0, 3),
 }
 
 

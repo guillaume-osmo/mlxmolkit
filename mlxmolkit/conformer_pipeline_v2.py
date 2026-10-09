@@ -332,7 +332,7 @@ def _run_attempts(att_mol: np.ndarray, seeds: List[tuple], ctx: _Context) -> dic
     if ctx.etk_concat is not None:
         etk_batch = pack_per_conformer_etk_batch(ctx.etk_concat, ctx.mol_n_atoms, kmol, pos3)
         has_etk = any(int(getattr(etk_batch, f"etk_{t}_term_starts")[-1]) > 0
-                      for t in ("torsion", "improper", "dist12", "dist13", "dist14"))
+                      for t in ("torsion", "improper", "dist12", "dist13", "dist14", "angle"))
         if has_etk:
             pos3, etk_e, etk_s = etk_minimize_shared(etk_batch, pos3, max_iters=ctx.etk_max_iters)
             energy[keep] += etk_e
