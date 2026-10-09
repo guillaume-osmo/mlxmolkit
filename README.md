@@ -9,7 +9,7 @@ quantum chemistry.
 
 | Area | What it does | Entry point |
 |---|---|---|
-| **Conformers** | Drop-in for RDKit `EmbedMolecules`: DG (4D) → ETK (3D) → MMFF94, all on Metal. 8 ETKDG variants. N×k parallel | `generate_conformers_nk` |
+| **Conformers** | ETKDG on Metal: DG (4D) → ETK (3D) → MMFF94, 8 ETKDG variants, N×k parallel. Every returned conformer passed RDKit's embedding checks (chirality, E/Z, tetrahedral centres, linear double bonds) on its final coordinates; rejected attempts are resampled like `EmbedMultipleConfs`. Not bit-identical to RDKit (own random streams, float32 minimisers) | `generate_conformers_nk` |
 | **Clustering** | Morgan FP → Tanimoto → Butina, at 150k+ molecules with divide-and-conquer memory | `butina_tanimoto_mlx` |
 | **NDDO semi-empirical** | MNDO, RM1, AM1, PM3, PM6, PM7 and corrected variants; scalar and batched SCF, gradients/geometry optimization | `mlxmolkit.nddo` |
 | **xTB** | GFN0/1/2 and g-xTB energies, analytical gradients, ANCOPT geometry optimization, ALPB water solvation | `mlxmolkit.xtb` |
@@ -195,9 +195,25 @@ result = generate_conformers_nk(
     run_mmff=True,
     mmff_variant="MMFF94",      # or MMFF94s
     mmff_use_lbfgs=False,       # None = auto-switch at 150+ atoms
-    max_confs_per_batch=500,    # divide-and-conquer; auto-sized by default
+    max_confs_per_batch=500,    # divide-and-conquer; auto-sized by default (result unchanged)
+    seed=42,                    # same seed -> same conformers, whatever the batching
 )
+m = result.molecules[0]
+m.positions_3d                  # up to k accepted conformers; none if the stereo is impossible
+m.n_attempted, m.n_failed_by_cause   # e.g. 4, {"CHECK_TETRAHEDRAL_CENTERS": 1}
+m.mmff_applied, m.mmff_error         # MMFF is skipped per molecule it cannot type
 ```
+
+An attempt is accepted only if it passes RDKit's embedding checks
+(`mlxmolkit.conformer_gate`): after the DG minimisation, after ETK, and again
+after MMFF, which runs after RDKit's last check and can still invert a centre.
+Three checks are added that RDKit does not need: the configuration perceived
+from the 3D coordinates must be the specified one, no bond angle above 175°
+at an sp2/sp3 atom (MMFF cannot move an exactly linear angle), and no bond far
+outside its bounds-matrix window. Molecules short of k get new attempts from
+fresh random starts, in bounded rounds (`max_attempts`, default RDKit's
+10 × atoms per conformer; `max_rounds`). `return_failed=True` also returns the
+rejected attempts with their `fail_cause`, for debugging.
 
 Clustering, low-level:
 
@@ -236,22 +252,31 @@ SMILES x N
 |   L-BFGS in-kernel, GPU-parallel line search         |
 +-------------------------------------------------------+
     |
-[Extract 3D] Drop 4th coordinate
+[Checks] RDKit DG-stage checks (energy, tetrahedral centres, chirality)
+    |
+[Collapse 4D -> 3D] re-minimise with a heavy 4th-dim penalty, drop 4th coordinate
     |
 +-- Stage 2: ETK minimize (3D, Metal TPM=32) ---------+
 |   CSD torsion + improper + 1-2/1-3/1-4 distance      |
+|   1-2/1-3 restrained to each conformer's own DG     |
 +-------------------------------------------------------+
+    |
+[Checks] RDKit final checks + perceived stereo, linear angles, bond lengths
     |
 +-- Stage 3: MMFF94 optimize (Metal, in-kernel) ------+
 |   7 terms: bond, angle, stretch-bend, OOP,           |
 |   torsion, vdW, electrostatic. BFGS or L-BFGS        |
 +-------------------------------------------------------+
     |
-Optimized 3D conformers
+[Checks] final checks again on the MMFF minimum
+    |
+Accepted conformers; molecules still short of k -> new attempts, next round
 ```
 
-Constraints are shared across the conformers of a molecule via `conf_to_mol`
-indirection, which is where the ~50% memory saving comes from.
+DG constraints are shared across the conformers of a molecule via `conf_to_mol`
+indirection, which is where the ~50% memory saving comes from. ETK carries one
+constraint set per conformer, because its 1-2 and 1-3 references are that
+conformer's own DG distances.
 
 ### Clustering (divide-and-conquer for 150k+)
 

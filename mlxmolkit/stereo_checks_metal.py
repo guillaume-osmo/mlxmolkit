@@ -1,13 +1,21 @@
 """
-Stereochemistry validation checks for conformers (pure numpy, no external deps).
+Legacy per-conformer stereo checks on DG output (pure numpy loops).
 
-Checks run after DG stage, rejecting conformers with wrong chirality
-or double-bond geometry. Failed conformers are retried with new seeds.
+These functions only report; nothing here rejects, retries or reseeds a
+conformer. ``run_stereo_checks`` returns one pass/fail flag per conformer.
+Until 2026-10 the conformer pipeline called it once, on the 4D DG output,
+and merely marked failing conformers ``converged=False`` while still
+returning them -- and every inversion the 2026-10-09 audit observed happened
+later, in the 4D->3D collapse, ETK or MMFF, where nothing checked.
 
-Checks:
-  1. Tetrahedral volume — magnitude must be >0.3 (not planar)
-  2. Chiral sign — volume sign must match CW/CCW tag from RDKit
-  3. Double bond planarity — dihedral near 0 or 180 degrees
+``generate_conformers_nk`` no longer uses this module: it applies
+:mod:`mlxmolkit.conformer_gate` (RDKit's embedding checks, vectorised) after
+DG, after ETK and after MMFF, drops failing attempts and resamples them.
+
+Checks implemented here (not RDKit's selections or tolerances):
+  1. Tetrahedral volume — |volume| of every sp3 atom with >= 3 neighbours
+     must exceed 0.3 (unnormalised, first 3 coordinates)
+  2. Chiral sign — the DG chiral volume must lie within its bounds
 """
 from __future__ import annotations
 
