@@ -129,15 +129,16 @@ inline void improper_g(const device float* pos, device float* grad,
         0.0f,wt,0.0f,0.0f,0.0f,0.0f, 0.0f,-1.0f,0.0f,0.0f,0.0f,0.0f, dim);
 }
 
-// ---- 1-4 distance constraint: flat-bottom harmonic ----
+// ---- Distance constraint: flat-bottom harmonic, 0.5 * k * (d - bound)^2 ----
+// RDKit's ForceFields::DistanceConstraintContrib; wt is its force constant k.
 inline float dist14_e(const device float* pos, int a, int b,
     float lb, float ub, float wt, int dim
 ) {
     float d2=0.0f;
     for (int d=0;d<3;d++){float df=pos[a*dim+d]-pos[b*dim+d]; d2+=df*df;}
     float dist=sqrt(d2+1e-12f);
-    if (dist<lb){float v=dist-lb; return wt*v*v;}
-    if (dist>ub){float v=dist-ub; return wt*v*v;}
+    if (dist<lb){float v=dist-lb; return 0.5f*wt*v*v;}
+    if (dist>ub){float v=dist-ub; return 0.5f*wt*v*v;}
     return 0.0f;
 }
 
@@ -148,8 +149,8 @@ inline void dist14_g(const device float* pos, device float* grad,
     for (int d=0;d<3;d++){df[d]=pos[a*dim+d]-pos[b*dim+d]; d2+=df[d]*df[d];}
     float dist=sqrt(d2+1e-12f);
     float pf=0.0f;
-    if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-    else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+    if (dist<lb) pf=wt*(dist-lb)/dist;
+    else if (dist>ub) pf=wt*(dist-ub)/dist;
     if (pf!=0.0f) {
         for (int d=0;d<3;d++){float g=pf*df[d]; grad[a*dim+d]+=g; grad[b*dim+d]-=g;}
     }
@@ -207,8 +208,8 @@ inline float dist14_pf(const device float* pos, int a, int b, float lb, float ub
     for (int d=0;d<3;d++){df[d]=pos[a*dim+d]-pos[b*dim+d]; d2+=df[d]*df[d];}
     float dist=sqrt(d2+1e-12f);
     float pf=0.0f;
-    if (dist<lb) pf=wt*2.0f*(dist-lb)/dist;
-    else if (dist>ub) pf=wt*2.0f*(dist-ub)/dist;
+    if (dist<lb) pf=wt*(dist-lb)/dist;
+    else if (dist>ub) pf=wt*(dist-ub)/dist;
     return pf;
 }
 

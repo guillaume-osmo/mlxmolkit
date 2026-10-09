@@ -75,7 +75,7 @@ class ETKParams:
     dist13_ub: np.ndarray        # (n_dist13,) float32
     dist13_weight: np.ndarray    # (n_dist13,) float32
 
-    # 1-4 distance constraints: E = w * (d - target)² if violated
+    # 1-4 and long-range distance constraints: E = 0.5 * w * (d - bound)² if violated
     dist14_idx1: np.ndarray      # (n_dist14,) int32
     dist14_idx2: np.ndarray      # (n_dist14,) int32
     dist14_lb: np.ndarray        # (n_dist14,) float32 — lower bound distance

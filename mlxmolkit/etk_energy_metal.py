@@ -250,12 +250,12 @@ for (uint di = d12_start; di < d12_end; di++) {{
 
     if (d < lb) {{
         float diff = d - lb;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }} else if (d > ub) {{
         float diff = d - ub;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }}
 }}
 
@@ -288,12 +288,12 @@ for (uint di = d13_start; di < d13_end; di++) {{
 
     if (d < lb) {{
         float diff = d - lb;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }} else if (d > ub) {{
         float diff = d - ub;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }}
 }}
 
@@ -326,12 +326,12 @@ for (uint di = d14_start; di < d14_end; di++) {{
 
     if (d < lb) {{
         float diff = d - lb;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }} else if (d > ub) {{
         float diff = d - ub;
-        if (coord == 0u && is_a) e_contrib += w * diff * diff;
-        grad_val += w * 2.0f * diff * my_diff / d;
+        if (coord == 0u && is_a) e_contrib += 0.5f * w * diff * diff;
+        grad_val += w * diff * my_diff / d;
     }}
 }}
 
