@@ -479,7 +479,26 @@ _ETK_BODY = r"""
     }
     float energy = reduce_sum(local_e, shared, tid, tpm);
 
+    // ---- RDKit's gradient scaling (ForceFieldsHelper::calcGradient) ----
+    // The optimiser sees 0.1 * grad, and, when a component of that still
+    // exceeds 10, grad * 0.1 * gscale with gscale = 0.1 halved until
+    // max * gscale <= 10. gscale enters the convergence test, as in
+    // BFGSOpt::minimize: max |g_i| * max(|x_i|, 1) / max(|E| * gscale, 1).
+    float gscale = 0.1f;
+    #define ETK_SCALE_GRADIENT() { \
+        parallel_scale(my_grad, 0.1f, n_vars, tid, tpm); \
+        float lmg = 0.0f; \
+        for (int i=(int)tid;i<n_vars;i+=(int)tpm) lmg = max(lmg, abs(my_grad[i])); \
+        float mg = reduce_max(lmg, shared, tid, tpm); \
+        gscale = 0.1f; \
+        if (mg > 10.0f) { \
+            while (mg * gscale > 10.0f) gscale *= 0.5f; \
+            parallel_scale(my_grad, gscale, n_vars, tid, tpm); \
+        } \
+    }
+
     ETK_GRADIENT();
+    ETK_SCALE_GRADIENT();
 
     // ---- L-BFGS loop (identical to DG kernel) ----
     parallel_neg_copy(my_dir, my_grad, n_vars, tid, tpm);
@@ -551,9 +570,10 @@ _ETK_BODY = r"""
         // exact positions by the same code: re-evaluating it gave the same bits.
 
         ETK_GRADIENT();
+        ETK_SCALE_GRADIENT();
 
         float lgt=0.0f; for (int i=(int)tid;i<n_vars;i+=(int)tpm){float t=abs(my_grad[i])*max(abs(my_pos[i]),1.0f);if(t>lgt)lgt=t;}
-        if(reduce_max(lgt, shared, tid, tpm)/max(energy,1.0f)<grad_tol_v){status=0;break;}
+        if(reduce_max(lgt, shared, tid, tpm)/max(abs(energy)*gscale,1.0f)<grad_tol_v){status=0;break;}
 
         // L-BFGS update
         for (int i=(int)tid;i<n_vars;i+=(int)tpm) my_q[i]=my_grad[i]-my_old_grad[i];
