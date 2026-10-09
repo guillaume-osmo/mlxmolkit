@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import subprocess
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
@@ -233,6 +234,60 @@ _STAGE_NONE, _STAGE_DG, _STAGE_ETK, _STAGE_MMFF = 0, 1, 2, 3
 _STAGE_NAMES = {_STAGE_DG: "dg", _STAGE_ETK: "etk", _STAGE_MMFF: "mmff"}
 
 
+# RDKit before 2026.03 gives both 1-4 pairs across a stereo double bond in a
+# ring the trans window (BoundsMatrixBuilder's _getAtomStereo ignores the
+# direction a 1-4 path is walked): on humulene-type terpenes the cis pairs get
+# [3.76, 3.88] A instead of [2.76, 2.88]. ETK then twists the bond to the wrong
+# isomer and the E/Z check rejects most attempts -- RDKit 2025.09.4's own
+# srETKDGv3 rejects 40-1048 per 8 conformers of them, 2026.03.6 none.
+_RING_DB_BOUNDS_FIXED = (2026, 3)
+
+
+def _rdkit_version() -> tuple:
+    from rdkit import __version__
+    parts = []
+    for p in __version__.split(".")[:2]:
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _warn_ring_stereo_double_bonds(mols) -> None:
+    """Warn once if this RDKit has the ring double-bond 1-4 bounds bug and it applies."""
+    if _rdkit_version() >= _RING_DB_BOUNDS_FIXED:
+        return
+    from rdkit import Chem
+    for mol in mols:
+        for bond in mol.GetBonds():
+            if (bond.GetBondType() == Chem.BondType.DOUBLE and bond.IsInRing()
+                    and bond.GetStereo() > Chem.BondStereo.STEREOANY):
+                from rdkit import __version__
+                warnings.warn(
+                    f"RDKit {__version__} gives the cis 1-4 pairs across a stereo double bond "
+                    f"in a ring a trans bounds window (fixed in RDKit 2026.03): such "
+                    f"molecules (e.g. {Chem.MolToSmiles(Chem.RemoveHs(mol))}) will mostly embed "
+                    f"with the wrong E/Z and be rejected and resampled. Use RDKit >= 2026.03.",
+                    RuntimeWarning, stacklevel=3)
+                return
+
+
+# Floats of BFGS inverse Hessian one ETK call may hold (512 MB).
+_ETK_HESSIAN_BUDGET = 128 * 1024 * 1024
+
+
+def _etk_slices(conf_n_atoms: np.ndarray, budget: int = _ETK_HESSIAN_BUDGET):
+    """Contiguous [lo, hi) slices of conformers whose (3n)^2 Hessians fit in *budget*."""
+    sizes = (3 * np.asarray(conf_n_atoms, dtype=np.int64)) ** 2
+    out, lo, acc = [], 0, 0
+    for i, sz in enumerate(sizes):
+        if i > lo and acc + sz > budget:
+            out.append((lo, i)); lo, acc = i, 0
+        acc += int(sz)
+    if len(sizes):
+        out.append((lo, len(sizes)))
+    return out
+
+
 def _runs(conf_mol: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Run-length encoding of consecutive equal molecule indices."""
     conf_mol = np.asarray(conf_mol, dtype=np.int64)
@@ -329,14 +384,22 @@ def _run_attempts(att_mol: np.ndarray, seeds: List[tuple], ctx: _Context) -> dic
 
     # ---- Stage 3: ETK minimize (3D), each conformer restrained to its own ----
     # 1-2 / 1-3 distances (RDKit setReferenceValues: d +/- 0.01 A).
+    # The ETK optimiser (RDKit's BFGS) keeps a dense (3n)^2 inverse Hessian per
+    # conformer, so the conformers go through it in slices under a fixed budget.
     if ctx.etk_concat is not None:
-        etk_batch = pack_per_conformer_etk_batch(ctx.etk_concat, ctx.mol_n_atoms, kmol, pos3)
-        has_etk = any(int(getattr(etk_batch, f"etk_{t}_term_starts")[-1]) > 0
-                      for t in ("torsion", "improper", "dist12", "dist13", "dist14"))
-        if has_etk:
-            pos3, etk_e, etk_s = etk_minimize_shared(etk_batch, pos3, max_iters=ctx.etk_max_iters)
-            energy[keep] += etk_e
-            converged[keep] = etk_s == 0
+        conf_n = ctx.mol_n_atoms[kmol].astype(np.int64)
+        out3 = pos3.copy()
+        for lo, hi in _etk_slices(conf_n):
+            p_in = pos3[int(cas3[lo]) * 3:int(cas3[hi]) * 3]
+            etk_batch = pack_per_conformer_etk_batch(ctx.etk_concat, ctx.mol_n_atoms, kmol[lo:hi], p_in)
+            has_etk = any(int(getattr(etk_batch, f"etk_{t}_term_starts")[-1]) > 0
+                          for t in ("torsion", "improper", "dist12", "dist13", "dist14", "angle"))
+            if has_etk:
+                p_out, etk_e, etk_s = etk_minimize_shared(etk_batch, p_in, max_iters=ctx.etk_max_iters)
+                out3[int(cas3[lo]) * 3:int(cas3[hi]) * 3] = p_out
+                energy[keep[lo:hi]] += etk_e
+                converged[keep[lo:hi]] = etk_s == 0
+        pos3 = out3
 
     # ---- Stage 3b: final checks on the ETK output ----
     res = cg.check_final(pos3, cas3, kmol, ctx.gate)
@@ -535,6 +598,8 @@ def generate_conformers_nk(
         # After extract_dg_params: same stereo perception as the DG constraints.
         gate_params.append(cg.build_gate_params(mol, bmat))
         mol_n_atoms.append(dg_params_list[-1].n_atoms)
+
+    _warn_ring_stereo_double_bonds(mols)
 
     result = PipelineResult(molecules=[
         ConformerResult(n_atoms=dg_params_list[i].n_atoms, positions_3d=[], energies=[],

@@ -215,6 +215,12 @@ fresh random starts, in bounded rounds (`max_attempts`, default RDKit's
 10 × atoms per conformer; `max_rounds`). `return_failed=True` also returns the
 rejected attempts with their `fail_cause`, for debugging.
 
+Use RDKit ≥ 2026.03 for conformer generation. Earlier releases give the cis
+1-4 pairs across a stereo double bond in a ring (humulene-type terpenes,
+macrocycles) the trans bounds window, so those molecules embed with the wrong
+E/Z almost every time and are resampled at length — RDKit's own embedder
+included; `generate_conformers_nk` warns when that applies.
+
 Clustering, low-level:
 
 ```python

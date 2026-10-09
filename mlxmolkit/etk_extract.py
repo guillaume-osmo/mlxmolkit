@@ -4,7 +4,8 @@ Extract ETKDG torsion parameters from RDKit molecules.
 Extracts:
   - CSD experimental torsion preferences (6-term Fourier)
   - Improper torsion terms (planarity at sp2 centers)
-  - 1-2, 1-3, and 1-4 distance constraints (from bounds matrix)
+  - 1-2 and 1-3 distance constraints (per-conformer reference lengths) and
+    long-range distance constraints (bounds matrix)
 
 These parameters are used in stage 5 of the ETKDG pipeline, where 3D
 coordinates are refined after 4D→3D collapse to match torsional
@@ -12,7 +13,7 @@ preferences from the Cambridge Structural Database (CSD).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from rdkit import Chem
@@ -57,8 +58,8 @@ class ETKParams:
     torsion_V: np.ndarray        # (n_torsions, 6) float32 — Fourier coefficients
     torsion_signs: np.ndarray    # (n_torsions, 6) int32 — sign multipliers
 
-    # Improper torsions (planarity at sp2): E = w * (1 - cos(2ω))
-    improper_idx: np.ndarray     # (n_improper, 4) int32 — center,n1,n2,n3
+    # Impropers, UFF inversion: E = w * (1 - sin Y), Y the angle of J->L to plane (I, J, K)
+    improper_idx: np.ndarray     # (n_improper, 4) int32 — I, J (sp2 centre), K, L
     improper_weight: np.ndarray  # (n_improper,) float32
 
     # 1-2 distance constraints (bonds): flat-bottom harmonic
@@ -75,12 +76,22 @@ class ETKParams:
     dist13_ub: np.ndarray        # (n_dist13,) float32
     dist13_weight: np.ndarray    # (n_dist13,) float32
 
-    # 1-4 distance constraints: E = w * (d - target)² if violated
+    # Fixed-window distance restraints, E = 0.5 * w * (d - bound)² outside [lb, ub]: every pair
+    # that is not bonded, not a bond angle's ends and not a torsion's ends (RDKit's long-range
+    # terms). The field name is historical.
     dist14_idx1: np.ndarray      # (n_dist14,) int32
     dist14_idx2: np.ndarray      # (n_dist14,) int32
     dist14_lb: np.ndarray        # (n_dist14,) float32 — lower bound distance
     dist14_ub: np.ndarray        # (n_dist14,) float32 — upper bound distance
     dist14_weight: np.ndarray    # (n_dist14,) float32
+
+    # Angle constraints, E = w * (theta_deg - bound)² outside [min, max]: RDKit's 179-180 deg
+    # term in place of the 1-3 distance at a linear centre (a triple bond, or two double bonds
+    # at a degree-2 atom), with basic knowledge only.
+    angle_idx: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.int32))
+    angle_min: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    angle_max: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    angle_weight: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
 
 
 @dataclass
@@ -118,7 +129,7 @@ class BatchedETKSystem:
     dist13_weight: np.ndarray
     dist13_term_starts: np.ndarray   # (n_mols+1,) int32
 
-    # 1-4 distance constraints (global atom indices)
+    # Fixed-window distance restraints (global atom indices)
     dist14_idx1: np.ndarray
     dist14_idx2: np.ndarray
     dist14_lb: np.ndarray
@@ -131,11 +142,9 @@ def extract_etk_params(
     mol: Chem.Mol,
     bounds_mat: np.ndarray,
     improper_weight: float = 10.0,
-    dist14_weight: float = 1.0,
     *,
     use_exp_torsion: bool = True,
     use_basic_knowledge: bool = True,
-    use_long_range: bool = True,
     long_range_weight: float = 10.0,
     ring_planarity_fc: float = 100.0,
     use_small_ring_torsions: bool = False,
@@ -220,17 +229,19 @@ def extract_etk_params(
         except Exception:
             pass
 
-    # Flat-ring planarity torsions. RDKit adds these inside construct3DForceField (NOT via
-    # GetExperimentalTorsions, so the port misses them): for 4 consecutive sp2/aromatic ring atoms
-    # a-b-c-d, a cos2φ term V*(1 - cos2φ) drives the endocyclic dihedral to planar (φ=0). Reuses the
-    # verified torsion energy/gradient (V at index 1, sign -1). Dedup by central bond (b,c).
+    # Flat-ring planarity torsions. RDKit adds these in getExperimentalTorsions (to the
+    # CrystalFFDetails, but not to the list Python's GetExperimentalTorsions returns): for 4
+    # consecutive SP2 atoms a-b-c-d of a 4- to 6-membered ring, V*(1 - cos2φ) drives the
+    # endocyclic dihedral to planar (φ=0), once per central bond (b,c), and not on a bond a CSD
+    # torsion already uses (RDKit's doneBonds). Reuses the torsion energy/gradient (V at index 1,
+    # sign -1).
     if use_basic_knowledge:
         ring_fc = ring_planarity_fc
         ri = mol.GetRingInfo()
-        seen_ring_bonds = set()
+        seen_ring_bonds = {(min(q[1], q[2]), max(q[1], q[2])) for q in torsion_idx_list}
         for ring in ri.AtomRings():
             nring = len(ring)
-            if nring < 4:
+            if nring < 4 or nring > 6:
                 continue
             for k in range(nring):
                 a, b, c, d = ring[k], ring[(k + 1) % nring], ring[(k + 2) % nring], ring[(k + 3) % nring]
@@ -255,19 +266,17 @@ def extract_etk_params(
         torsion_V = np.zeros((0, 6), dtype=np.float32)
         torsion_signs = np.zeros((0, 6), dtype=np.int32)
 
-    # --- Improper torsions (planarity at sp2 centers) ---
-    # Only included when use_basic_knowledge is True (ETKDG/KDG, not ETDG/DG)
+    # --- Impropers: RDKit's UFF inversion terms at sp2 centres ---
+    # Only with basic knowledge (ETKDG/KDG, not ETDG/DG). TorsionPreferences.cpp takes C/N/O
+    # atoms that are SP2 with exactly three neighbours; addImproperTorsionTerms gives each
+    # three UFF::InversionContrib terms (I, J = centre, K, L) over the neighbours n0, n1, n2 in
+    # RDKit's order -- (n0, n1, n2), (n0, n2, n1), (n1, n2, n0) -- each with force constant
+    # oobForceScalingFactor (improper_weight, 10) * K_UFF / 3, K_UFF = 50 for a carbon bound
+    # to an SP2 oxygen (isBoundToSP2O, any degree), else 6.
     improper_idx_list = []
     improper_w_list = []
-
-    # RDKit's ETKDG expands each sp2 center into THREE UFF out-of-plane inversion terms (the 3
-    # cyclic neighbour permutations), giving ~3x the planarity restraint of a single improper.
-    # With one improper/center sp2 centres are under-restrained (~1/3 the out-of-plane stiffness)
-    # and pucker under torsion refinement, so we emit all three permutations to match RDKit.
     if use_basic_knowledge:
         for atom in mol.GetAtoms():
-            # RDKit restricts inversion/improper centers to C/N/O with EXACTLY 3 neighbours
-            # (TorsionPreferences.cpp); the port previously flattened any sp2 deg>=3 atom (e.g. boron).
             if atom.GetAtomicNum() not in (6, 7, 8):
                 continue
             if atom.GetHybridization() != Chem.HybridizationType.SP2:
@@ -275,21 +284,14 @@ def extract_etk_params(
             neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(neighbors) != 3:
                 continue
-
-            # RDKit boosts the force constant ~50/6x for sp2-C bonded to a terminal sp2 O
-            # (carbonyl/amide/ester/carboxylate) — isBoundToSP2O.
-            w = improper_weight
-            if atom.GetAtomicNum() == 6:
-                for nb in atom.GetNeighbors():
-                    if (nb.GetAtomicNum() == 8 and nb.GetHybridization() == Chem.HybridizationType.SP2
-                            and nb.GetDegree() == 1):
-                        w = improper_weight * (50.0 / 6.0)
-                        break
-
+            bound_to_sp2_o = atom.GetAtomicNum() == 6 and any(
+                nb.GetAtomicNum() == 8 and nb.GetHybridization() == Chem.HybridizationType.SP2
+                for nb in atom.GetNeighbors())
+            w = improper_weight * (50.0 if bound_to_sp2_o else 6.0) / 3.0
             center = atom.GetIdx()
-            n0, n1, n2 = neighbors[0], neighbors[1], neighbors[2]
-            for (a, b, c) in ((n0, n1, n2), (n1, n2, n0), (n2, n0, n1)):
-                improper_idx_list.append([center, a, b, c])
+            n0, n1, n2 = neighbors
+            for (i, k, l) in ((n0, n1, n2), (n0, n2, n1), (n1, n2, n0)):
+                improper_idx_list.append([i, center, k, l])
                 improper_w_list.append(w)
 
     n_improper = len(improper_idx_list)
@@ -300,109 +302,73 @@ def extract_etk_params(
         imp_idx = np.zeros((0, 4), dtype=np.int32)
         imp_w = np.zeros(0, dtype=np.float32)
 
-    # --- 1-2 distance constraints (bonds) ---
-    # Enforce correct bond lengths in 3D. Uses bounds matrix midpoint ± tolerance.
-    BOND_TOL = 0.01  # A
-    BOND_FC = 100.0
+    # --- Distance restraints, RDKit's construct3DForceField / constructPlain3DForceField ---
+    # RDKit tracks the pairs it restrains (atomPairs): the end atoms of every torsion term,
+    # every bond, every bond angle. Each of those has its own term (or, for a torsion's end
+    # atoms, none); every other pair is held to its bounds-matrix window. No ETK stage runs
+    # without experimental torsions or basic knowledge (plain DG).
+    run_field = use_exp_torsion or use_basic_knowledge
+    restrained = {(min(q[0], q[3]), max(q[0], q[3])) for q in torsion_idx_list}
+
+    # 1-2 (every bond) and 1-3 (every bond angle): RDKit restrains them to the length they
+    # have in the conformer entering ETK, +/- KNOWN_DIST_TOL, with KNOWN_DIST_FORCE_CONSTANT --
+    # except an angle whose centre carries an improper, held to its bounds-matrix window.
+    # The window stored here is centred on the bounds-matrix midpoint and re-centred on each
+    # conformer's own distance by pack_per_conformer_etk_batch.
+    KNOWN_DIST_TOL = 0.01  # A
+    KNOWN_DIST_FC = 100.0
     d12_i1, d12_i2, d12_lb, d12_ub, d12_w = [], [], [], [], []
-    if use_basic_knowledge:
+    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
+    # Fixed-window terms (the dist14 family): long-range pairs, and the 1-3 pairs below.
+    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
+    ang_idx, ang_min, ang_max, ang_w = [], [], [], []
+    ANGLE_FC = 1.0  # RDKit: angleContribs->addContrib(i, j, k, 179.0, 180.0, 1)
+    improper_centres = {q[1] for q in improper_idx_list}
+    if run_field:
         for bond in mol.GetBonds():
             a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
             lo, hi = min(a, b), max(a, b)
-            lb_val = bounds_mat[hi, lo]
-            ub_val = bounds_mat[lo, hi]
-            if lb_val > 0 and ub_val > 0:
-                mid = (lb_val + ub_val) / 2.0
-                d12_i1.append(a)
-                d12_i2.append(b)
-                d12_lb.append(mid - BOND_TOL)
-                d12_ub.append(mid + BOND_TOL)
-                d12_w.append(BOND_FC)
-
-    n_d12 = len(d12_i1)
-
-    # --- 1-3 distance constraints (angles) ---
-    # Enforce correct angles via 1-3 distance bounds. Critical for geometry quality.
-    ANGLE_FC = 100.0
-    d13_i1, d13_i2, d13_lb, d13_ub, d13_w = [], [], [], [], []
-    if use_basic_knowledge:
+            mid = (bounds_mat[hi, lo] + bounds_mat[lo, hi]) / 2.0
+            d12_i1.append(a); d12_i2.append(b)
+            d12_lb.append(mid - KNOWN_DIST_TOL); d12_ub.append(mid + KNOWN_DIST_TOL)
+            d12_w.append(KNOWN_DIST_FC)
+            restrained.add((lo, hi))
         for atom in mol.GetAtoms():
-            center = atom.GetIdx()
             neighbors = sorted([n.GetIdx() for n in atom.GetNeighbors()])
             for i in range(len(neighbors)):
                 for j in range(i + 1, len(neighbors)):
                     a, b = neighbors[i], neighbors[j]
-                    lo, hi = min(a, b), max(a, b)
-                    lb_val = bounds_mat[hi, lo]
-                    ub_val = bounds_mat[lo, hi]
-                    if lb_val > 0 and ub_val > 0:
-                        mid = (lb_val + ub_val) / 2.0
-                        d13_i1.append(a)
-                        d13_i2.append(b)
-                        d13_lb.append(mid - BOND_TOL)
-                        d13_ub.append(mid + BOND_TOL)
-                        d13_w.append(ANGLE_FC)
-
+                    restrained.add((a, b))
+                    if use_basic_knowledge and _is_linear_angle(mol, a, atom.GetIdx(), b):
+                        # A linear centre: an angle constraint, not a distance (add13Terms).
+                        ang_idx.append([a, atom.GetIdx(), b])
+                        ang_min.append(179.0); ang_max.append(180.0); ang_w.append(ANGLE_FC)
+                        continue
+                    if atom.GetIdx() in improper_centres:
+                        # An angle at an improper centre keeps its bounds-matrix window (add13Terms).
+                        unique_i1.append(a); unique_i2.append(b)
+                        unique_lb.append(bounds_mat[b, a]); unique_ub.append(bounds_mat[a, b])
+                        unique_w.append(KNOWN_DIST_FC)
+                        continue
+                    mid = (bounds_mat[b, a] + bounds_mat[a, b]) / 2.0
+                    d13_i1.append(a); d13_i2.append(b)
+                    d13_lb.append(mid - KNOWN_DIST_TOL); d13_ub.append(mid + KNOWN_DIST_TOL)
+                    d13_w.append(KNOWN_DIST_FC)
+    n_d12 = len(d12_i1)
     n_d13 = len(d13_i1)
 
-    # --- 1-4 distance constraints ---
-    d14_i1, d14_i2, d14_lb, d14_ub, d14_w = [], [], [], [], []
-
-    # Collect 1-4 pairs (atoms separated by exactly 3 bonds)
-    for bond in mol.GetBonds():
-        a = bond.GetBeginAtomIdx()
-        b = bond.GetEndAtomIdx()
-        # From atom a, find neighbors of b that aren't a (1-3 from a)
-        for n_b in mol.GetAtomWithIdx(b).GetNeighbors():
-            c = n_b.GetIdx()
-            if c == a:
-                continue
-            # From c, find neighbors that aren't b (1-4 from a)
-            for n_c in mol.GetAtomWithIdx(c).GetNeighbors():
-                d = n_c.GetIdx()
-                if d == b or d == a:
-                    continue
-                if a < d:
-                    ub = bounds_mat[a, d]
-                    lb = bounds_mat[d, a]
-                    if ub > 0 and lb > 0:
-                        d14_i1.append(a)
-                        d14_i2.append(d)
-                        d14_lb.append(lb)
-                        d14_ub.append(ub)
-                        d14_w.append(dist14_weight)
-
-    # Long-range distance constraints (RDKit's addLongRangeDistanceConstraints): EVERY pair beyond
-    # 1-3 held at its FIXED smoothed-bounds range during the ET stage, so torsion rotation cannot
-    # distort the overall shape. The port stops at 1-4, leaving the long-range structure unconstrained
-    # -> torsions inflate strain. This adds all topological-distance>=4 pairs at fixed bounds.
-    if use_basic_knowledge and use_long_range:
-        lr_w = long_range_weight
-        from rdkit.Chem import GetDistanceMatrix
-        topo = GetDistanceMatrix(mol)
+    # Every other pair -- 1-4 pairs that are not a torsion's end atoms included -- at its fixed
+    # bounds-matrix window, force constant 10 * boundsMatForceScaling
+    # (addLongRangeDistanceConstraints).
+    if run_field:
         na = mol.GetNumAtoms()
         for a in range(na):
             for d in range(a + 1, na):
-                if topo[a, d] < 4:  # 1-2/1-3/1-4 already handled above
+                if (a, d) in restrained:
                     continue
-                ub = bounds_mat[a, d]; lb = bounds_mat[d, a]
-                if ub > 0 and lb > 0:
-                    d14_i1.append(a); d14_i2.append(d)
-                    d14_lb.append(lb); d14_ub.append(ub); d14_w.append(lr_w)
-
-    # Deduplicate
-    seen = set()
-    unique_i1, unique_i2, unique_lb, unique_ub, unique_w = [], [], [], [], []
-    for i in range(len(d14_i1)):
-        key = (d14_i1[i], d14_i2[i])
-        if key not in seen:
-            seen.add(key)
-            unique_i1.append(d14_i1[i])
-            unique_i2.append(d14_i2[i])
-            unique_lb.append(d14_lb[i])
-            unique_ub.append(d14_ub[i])
-            unique_w.append(d14_w[i])
-
+                unique_i1.append(a); unique_i2.append(d)
+                unique_lb.append(bounds_mat[d, a]); unique_ub.append(bounds_mat[a, d])
+                unique_w.append(long_range_weight)
     n_d14 = len(unique_i1)
 
     def _a(lst, dt=np.int32):
@@ -424,7 +390,21 @@ def extract_etk_params(
         dist14_idx1=_a(unique_i1), dist14_idx2=_a(unique_i2),
         dist14_lb=_a(unique_lb, np.float32), dist14_ub=_a(unique_ub, np.float32),
         dist14_weight=_a(unique_w, np.float32),
+        angle_idx=(np.array(ang_idx, dtype=np.int32) if ang_idx
+                   else np.zeros((0, 3), dtype=np.int32)),
+        angle_min=_a(ang_min, np.float32), angle_max=_a(ang_max, np.float32),
+        angle_weight=_a(ang_w, np.float32),
     )
+
+
+def _is_linear_angle(mol: Chem.Mol, a: int, centre: int, b: int) -> bool:
+    """RDKit's collectBondsAndAngles flag: either bond triple, or both double at a degree-2 atom."""
+    t1 = mol.GetBondBetweenAtoms(a, centre).GetBondType()
+    t2 = mol.GetBondBetweenAtoms(centre, b).GetBondType()
+    if t1 == Chem.BondType.TRIPLE or t2 == Chem.BondType.TRIPLE:
+        return True
+    return (t1 == Chem.BondType.DOUBLE and t2 == Chem.BondType.DOUBLE
+            and mol.GetAtomWithIdx(centre).GetDegree() == 2)
 
 
 def batch_etk_params(
