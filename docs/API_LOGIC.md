@@ -87,9 +87,18 @@ The conformer path is:
    constraints are shared across all conformers for that molecule.
 6. The 4D DG coordinates are collapsed to 3D.
 7. ET/K torsion terms are applied according to the requested variant.
-8. Stereo and geometry checks reject bad conformers.
+8. RDKit's embedding checks (`mlxmolkit.conformer_gate`) run after the DG
+   minimisation and on the ETK output; failing attempts are dropped, never
+   returned as successes.
 9. Optional MMFF94 cleanup uses the same hydrogenated graph and MMFF variant as
-   the RDKit reference path.
+   the RDKit reference path, per molecule (a molecule MMFF cannot type keeps
+   its ETK geometry and reports `mmff_error`). The final checks run again on
+   the MMFF minimum.
+10. Molecules short of their k accepted conformers get new attempts from fresh
+    random starts, seeded by (seed, molecule, slot, round), in bounded rounds,
+    until k are accepted or the attempt budget (`max_attempts`, RDKit's
+    10 x atoms per conformer by default) is spent. The result reports
+    `n_attempted` and `n_failed_by_cause` per molecule.
 
 Variant names are not cosmetic. They select different constraint families:
 

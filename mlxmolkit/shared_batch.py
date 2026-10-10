@@ -295,6 +295,151 @@ def add_etk_to_batch(
     batch.etk_dist14_term_starts = d14_starts
 
 
+_ETK_TERM_FIELDS = {
+    # name: (params attribute names, batch attribute names)
+    "torsion": (("torsion_idx", "torsion_V", "torsion_signs"),
+                ("etk_torsion_idx", "etk_torsion_V", "etk_torsion_signs")),
+    "improper": (("improper_idx", "improper_weight"),
+                 ("etk_improper_idx", "etk_improper_weight")),
+    "dist12": (("dist12_idx1", "dist12_idx2", "dist12_lb", "dist12_ub", "dist12_weight"),
+               ("etk_dist12_idx1", "etk_dist12_idx2", "etk_dist12_lb", "etk_dist12_ub",
+                "etk_dist12_weight")),
+    "dist13": (("dist13_idx1", "dist13_idx2", "dist13_lb", "dist13_ub", "dist13_weight"),
+               ("etk_dist13_idx1", "etk_dist13_idx2", "etk_dist13_lb", "etk_dist13_ub",
+                "etk_dist13_weight")),
+    "dist14": (("dist14_idx1", "dist14_idx2", "dist14_lb", "dist14_ub", "dist14_weight"),
+               ("etk_dist14_idx1", "etk_dist14_idx2", "etk_dist14_lb", "etk_dist14_ub",
+                "etk_dist14_weight")),
+}
+_ETK_EMPTY_SHAPES = {
+    "torsion_idx": (0, 4), "torsion_V": (0, 6), "torsion_signs": (0, 6),
+    "improper_idx": (0, 4),
+}
+
+
+def expand_terms_per_conformer(
+    term_starts: np.ndarray, conf_mol: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Gather map that replicates per-molecule term blocks once per conformer.
+
+    ``term_starts`` is the (n_mols+1,) CSR offset of a per-molecule term table;
+    ``conf_mol`` gives each conformer's molecule. Returns ``(conf_of_term,
+    src_term, conf_term_starts)``: for every replicated term, the conformer it
+    belongs to and the row of the per-molecule table it copies, plus the new
+    (C+1,) CSR offsets with one block per conformer.
+    """
+    conf_mol = np.asarray(conf_mol, dtype=np.int64)
+    counts = (term_starts[conf_mol + 1] - term_starts[conf_mol]).astype(np.int64)
+    conf_term_starts = np.zeros(len(conf_mol) + 1, dtype=np.int64)
+    np.cumsum(counts, out=conf_term_starts[1:])
+    total = int(conf_term_starts[-1])
+    conf_of_term = np.repeat(np.arange(len(conf_mol), dtype=np.int64), counts)
+    src_term = (np.arange(total, dtype=np.int64)
+                - np.repeat(conf_term_starts[:-1], counts)
+                + np.repeat(term_starts[conf_mol].astype(np.int64), counts))
+    return conf_of_term, src_term, conf_term_starts
+
+
+def concat_etk_params(etk_params_list: List[ETKParams]) -> dict:
+    """Concatenate per-molecule ETK tables once (LOCAL atom indices).
+
+    Returns ``{term: (starts, {param_attr: array})}`` for every ETK term type,
+    the input of :func:`pack_per_conformer_etk_batch`.
+    """
+    out = {}
+    for term, (attrs, _) in _ETK_TERM_FIELDS.items():
+        starts = np.zeros(len(etk_params_list) + 1, dtype=np.int64)
+        parts = {a: [] for a in attrs}
+        for m, p in enumerate(etk_params_list):
+            first = getattr(p, attrs[0], None)
+            n = 0 if first is None else len(first)
+            starts[m + 1] = starts[m] + n
+            if n:
+                for a in attrs:
+                    parts[a].append(np.asarray(getattr(p, a)))
+        arrays = {}
+        for a in attrs:
+            if parts[a]:
+                arrays[a] = np.concatenate(parts[a])
+            else:
+                arrays[a] = np.zeros(_ETK_EMPTY_SHAPES.get(a, (0,)))
+        out[term] = (starts, arrays)
+    return out
+
+
+def pack_per_conformer_etk_batch(
+    etk_concat: dict,
+    mol_n_atoms: np.ndarray,
+    conf_mol: np.ndarray,
+    positions_3d: np.ndarray,
+) -> SharedConstraintBatch:
+    """ETK batch in which every conformer is its own constraint set.
+
+    RDKit's ETK stage (``construct3DForceField``) restrains each 1-2 and 1-3
+    distance to the value it has in THAT conformer's DG output, +/- 0.01 A.
+    Those reference values therefore differ per conformer, which a table shared
+    by all conformers of a molecule cannot express. This batch holds one
+    "molecule" per conformer (``conf_to_mol = arange(C)``), with the 1-2 and
+    1-3 windows re-centred on the conformer's own distances and every other ETK
+    term copied from its molecule. The ETK kernel reads constraints only
+    through ``conf_to_mol``, so it runs unchanged on this layout.
+
+    Args:
+        etk_concat: output of :func:`concat_etk_params` over all molecules.
+        mol_n_atoms: (N,) atoms per molecule (with hydrogens).
+        conf_mol: (C,) molecule index of each conformer, contiguous per molecule
+            or not, in the order the conformers appear in ``positions_3d``.
+        positions_3d: flat (sum of conformer atoms * 3,) float32 coordinates.
+
+    Returns:
+        A SharedConstraintBatch with dim 3, empty DG terms and per-conformer
+        ETK terms.
+    """
+    conf_mol = np.asarray(conf_mol, dtype=np.int64)
+    n_confs = len(conf_mol)
+    conf_n_atoms = np.asarray(mol_n_atoms, dtype=np.int32)[conf_mol]
+    conf_atom_starts = np.zeros(n_confs + 1, dtype=np.int32)
+    np.cumsum(conf_n_atoms, out=conf_atom_starts[1:])
+    pos = np.asarray(positions_3d, dtype=np.float32).reshape(-1, 3)
+    zero_starts = np.zeros(n_confs + 1, dtype=np.int32)
+    empty_i = np.zeros(0, dtype=np.int32)
+    empty_f = np.zeros(0, dtype=np.float32)
+    batch = SharedConstraintBatch(
+        n_mols=n_confs, n_confs_total=n_confs, n_confs_per_mol=[1] * n_confs, dim=3,
+        conf_atom_starts=conf_atom_starts,
+        conf_to_mol=np.arange(n_confs, dtype=np.int32),
+        mol_n_atoms=conf_n_atoms,
+        dist_idx1=empty_i, dist_idx2=empty_i, dist_lb2=empty_f, dist_ub2=empty_f,
+        dist_weight=empty_f, dist_term_starts=zero_starts,
+        chiral_idx1=empty_i, chiral_idx2=empty_i, chiral_idx3=empty_i, chiral_idx4=empty_i,
+        chiral_vol_lower=empty_f, chiral_vol_upper=empty_f, chiral_term_starts=zero_starts,
+        fourth_idx=empty_i, fourth_term_starts=zero_starts,
+    )
+    for term, (attrs, batch_attrs) in _ETK_TERM_FIELDS.items():
+        starts, arrays = etk_concat[term]
+        conf_of_term, src, conf_starts = expand_terms_per_conformer(starts, conf_mol)
+        gathered = {a: arrays[a][src] for a in attrs}
+        if term in ("dist12", "dist13"):
+            # Re-centre the window on this conformer's own distance, keeping
+            # the molecule's half-width (RDKit: d - 0.01 .. d + 0.01).
+            off = conf_atom_starts[conf_of_term]
+            i1 = gathered[attrs[0]].astype(np.int64) + off
+            i2 = gathered[attrs[1]].astype(np.int64) + off
+            measured = np.linalg.norm(pos[i1] - pos[i2], axis=1)
+            half = (gathered[attrs[3]] - gathered[attrs[2]]) / 2.0
+            gathered[attrs[2]] = measured - half
+            gathered[attrs[3]] = measured + half
+        for a, ba in zip(attrs, batch_attrs):
+            arr = gathered[a]
+            if a.endswith("idx") or a.endswith("idx1") or a.endswith("idx2"):
+                arr = arr.astype(np.int32)
+            else:
+                arr = arr.astype(np.float32)
+            setattr(batch, ba, arr)
+        setattr(batch, f"etk_{term}_term_starts", conf_starts.astype(np.int32))
+    return batch
+
+
 def init_random_positions(
     batch: SharedConstraintBatch,
     seed: int = 42,
