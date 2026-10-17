@@ -1,0 +1,10 @@
+{
+  "gxtb_molecules": 3,
+  "gxtb_atoms": 50,
+  "gxtb_charge_mae_e": 5.614998849193913e-06,
+  "gxtb_charge_max_error_e": 2.6382780272685147e-05,
+  "onecentre_table": true,
+  "d4srev": true,
+  "mndo": true,
+  "pm7": true
+}

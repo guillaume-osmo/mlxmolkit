@@ -1,0 +1,6 @@
+MNDO parameters derived from OpenMOPAC
+Copyright 2021 Virginia Polytechnic Institute and State University
+Licensed under Apache-2.0; see LICENSE_OpenMOPAC.txt.
+Source: https://github.com/openmopac/mopac/blob/1d9d92b0283f197616f1e9e76d1ee09e2bc21e72/src/models/parameters_for_mndo_C.F90
+Extraction: tools/import_mndo_params.py; 11-element sp subset, no d or Gaussian terms.
+Units: energies eV, orbital exponents Bohr^-1, alpha Angstrom^-1.
